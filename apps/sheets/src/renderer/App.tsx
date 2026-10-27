@@ -387,6 +387,7 @@ import { installForceStringMarkGate, installLongTextRender } from './long-text-r
 import { installAutofitWrapBudget } from './autofit-wrap-budget'
 import { installAutofitLinePitch } from './autofit-line-pitch'
 import { installHeaderUnhideDebounce } from './load-perf-patches'
+import { installCopyAnimationIdle } from './copy-animation-idle'
 import { installNumberAsTextAlertSeverity } from './number-as-text-alert'
 import { installFormulaStreamHold } from './formula-stream-hold'
 import { installRichTextBidiFix } from './rich-text-bidi-fix'
@@ -526,6 +527,7 @@ import {
 } from './calc-options'
 import { applyFillSeries, fillSeriesContext } from './fill-series-apply'
 import { solveGoalSeek } from './goal-seek'
+import { applyDataTable } from './data-table'
 import {
   awaitFormulaValues,
   clearVerifiedFormulaValues,
@@ -615,7 +617,7 @@ export function App({
    * alone — so without this a workbook whose only edit is a withheld cell
    * would never autosave, and closing the tab would drop the mark silently.
    */
-  const loadedRedactionStatesRef = useRef<readonly SheetRedactionState[]>([])
+  const loadedRedactionStatesRef = useRef<readonly SheetRedactionState[] | null>(null)
   /**
    * The pending "what does this stand for?" question, or null when no dialog
    * is open. State, not a ref: the dialog renders from it.
@@ -630,7 +632,8 @@ export function App({
    * in the same order, so the comparison is exact.
    */
   function redactionsPendingSave(): boolean {
-    return hasPendingRedactionChange(redactionStatesRef.current, loadedRedactionStatesRef.current)
+    const loaded = loadedRedactionStatesRef.current
+    return loaded !== null && hasPendingRedactionChange(redactionStatesRef.current, loaded)
   }
   /// Univer undo/redo stack occupancy (subscribed at mount): drives the QAT button gray states
   const [univerHist, setUniverHist] = useState({ canUndo: false, canRedo: false })
@@ -1096,7 +1099,9 @@ export function App({
       openLazyWorkbook,
       setPendingEdits,
       readCells: (addresses, sheetId) => readCellsImpl(readContext(), addresses, sheetId),
-      redactionStates: () => redactionStatesRef.current,
+      // null until the part was read: a save in that window must not clear it
+      redactionStates: () =>
+        loadedRedactionStatesRef.current === null ? null : redactionStatesRef.current,
       stashViewRestore: (view) => {
         viewRestoreRef.current = view
       },
@@ -1915,7 +1920,7 @@ export function App({
         try {
           restoreCellFill(
             univerRef.current!,
-            intent.sheetName,
+            request.sheetId,
             workbook.getSheetBySheetId(request.sheetId)!.getRange(a1Of(intent.mark)) as never,
             marked.previousFill,
             workbook.getId(),
@@ -2223,6 +2228,9 @@ export function App({
     // canvas line box (Calibri 10: 12.75 pt per line, not ~10 pt).
     installAutofitLinePitch()
     installHeaderUnhideDebounce()
+    // The dashed border on a copied range is a per-frame animation. It must
+    // not keep repainting the scene while nobody is looking at it.
+    installCopyAnimationIdle()
     installNumberAsTextAlertSeverity()
     installForceStringMarkGate(runtime.univer.__getInjector().get(SheetInterceptorService))
     // Hold the formula engine's per-chunk recalculation while file data streams
@@ -3399,14 +3407,6 @@ export function App({
             event.cancel = true
             setMessage(t('appPivotSheetNoMove'))
             return
-          }
-          if (
-            FILTER_COMMAND_PATTERN.test(event.id) &&
-            subUnitId !== undefined &&
-            state.filterOrigins.get(subUnitId)?.origin === 'table'
-          ) {
-            event.cancel = true
-            setMessage(t('appTableFilterNoEdit'))
           }
           return
         }
@@ -4796,9 +4796,7 @@ export function App({
     // ai/redact-load.ts.
     redactionIndexRef.current = null
     redactionStatesRef.current = []
-    // Reset to the same empty value the current marks hold, so the previous
-    // workbook's pending marks cannot make this one look unsaved on arrival.
-    loadedRedactionStatesRef.current = []
+    loadedRedactionStatesRef.current = null
     void window.desktopApi
       .readWorkbookRedactions({ sessionId: selected.sessionId })
       .then((result) => {
@@ -4808,8 +4806,10 @@ export function App({
         redactionIndexRef.current = session.index
         redactionStatesRef.current = result.status === 'ok' ? result.states : []
         watchStructuralEditsForMarks()
-        // What the file holds is the baseline a later edit is measured against.
-        loadedRedactionStatesRef.current = redactionStatesRef.current
+        // What the file holds is the baseline a later edit is measured against;
+        // an unreadable part has no baseline, and saves leave it in place.
+        loadedRedactionStatesRef.current =
+          result.status === 'unreadable' ? null : redactionStatesRef.current
         const redactionMessage = session.error ?? session.notice
         if (redactionMessage !== null) setMessage(redactionMessage)
       })
@@ -5633,6 +5633,17 @@ export function App({
           const runtime = univerRef.current
           if (!runtime) return Promise.reject(new Error(t('appWorkbookNotReady')))
           return solveGoalSeek(runtime, { setCell, toValue, byCell })
+        }}
+        onDataTable={(input) => {
+          const runtime = univerRef.current
+          if (!runtime) return Promise.reject(new Error(t('appWorkbookNotReady')))
+          return applyDataTable(runtime, input)
+        }}
+        onGetDataTableRange={() => {
+          // Excel's flow starts from the selected table region; a single-cell
+          // selection cannot be a data table, so the field starts empty.
+          const range = univerRef.current?.univerAPI.getActiveWorkbook()?.getActiveRange()
+          return range && range.getHeight() > 1 && range.getWidth() > 1 ? range.getA1Notation() : ''
         }}
         onFillSeries={(options) => {
           const runtime = univerRef.current
