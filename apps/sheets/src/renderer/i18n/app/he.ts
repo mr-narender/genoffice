@@ -314,6 +314,7 @@ export const he = {
   appDialogCancel: 'ביטול',
   appPivotSheetNoMove: 'גיליון זה מכיל טבלת ציר — הזזת טווחים אינה נתמכת עדיין.',
   appMergeOverTable: 'הבחירה חופפת לטבלת Excel — מיזוג תאים בתוך טבלה עדיין אינו נתמך.',
+  appFilterToggleFailed: 'המסנן לא הוחל — בחר תחילה את הטווח שמכיל את הנתונים שלך.',
   appAutofillStreaming: 'מילוי אוטומטי לאזור שעדיין נטען בהזרמה אינו מותר עדיין.',
   appDvNeedsIndexed:
     'עריכת אימות נתונים דורשת שגיליון זה יסיים תחילה את יצירת האינדקס — נסה שוב בעוד רגע.',
@@ -534,8 +535,6 @@ export const he = {
   appSaved: 'נשמר.',
   appSaveFailed: 'לא ניתן לשמור את חוברת העבודה.',
   appCfRuleUnsaveable: 'לא ניתן לשמור כלל עיצוב מותנה זה בקובץ xlsx — השתמשו בסוג כלל אחר.',
-  appSaveErrX14Dv:
-    'בגיליון זה יש אימות נתונים מורחב (x14); עריכת כללי האימות שלו עדיין אינה נתמכת.',
   appSaveErrMultiSelectList:
     'לא ניתן לשמור אימות רשימה מרובת בחירה בקובץ xlsx — מחקו את הכלל לפני השמירה.',
   appSaveErrX14Cf: 'בטווח זה יש עיצוב מותנה מורחב (x14) ולא ניתן לשנותו בשלב זה.',
@@ -654,6 +653,7 @@ export const he = {
   appExportPdfTitle: 'ייצא כ-PDF',
   appSaveTitle: 'שמור (⌘S)',
   appSaveAs: 'שמירה בשם',
+  aiNameFile: 'מתן שם באמצעות AI…',
   appUndo: 'בטל',
   appRedo: 'בצע שוב',
   appUnsavedEditOne: '● {count} עריכה שלא נשמרה',

@@ -338,6 +338,7 @@ export const vi = {
   appPivotSheetNoMove: 'Trang tính này chứa PivotTable — chưa hỗ trợ di chuyển vùng.',
   appMergeOverTable:
     'Vùng chọn chồng chéo với một bảng Excel — chưa hỗ trợ hợp nhất các ô bên trong bảng.',
+  appFilterToggleFailed: 'Bộ lọc chưa được áp dụng — hãy chọn phạm vi chứa dữ liệu trước.',
   appAutofillStreaming: 'Chưa cho phép tự động điền vào khu vực vẫn đang tải theo luồng.',
   appDvNeedsIndexed:
     'Chỉnh sửa xác thực dữ liệu yêu cầu trang tính này phải được lập chỉ mục đầy đủ trước — vui lòng thử lại sau giây lát.',
@@ -573,8 +574,6 @@ export const vi = {
   appSaveFailed: 'Không thể lưu sổ làm việc.',
   appCfRuleUnsaveable:
     'Quy tắc định dạng có điều kiện này không thể lưu vào xlsx — hãy chuyển sang loại quy tắc khác.',
-  appSaveErrX14Dv:
-    'Trang tính này có xác thực dữ liệu mở rộng (x14); chưa hỗ trợ chỉnh sửa quy tắc xác thực của nó.',
   appSaveErrMultiSelectList:
     'Xác thực danh sách đa lựa chọn không thể lưu vào xlsx — hãy xóa quy tắc trước khi lưu.',
   appSaveErrX14Cf: 'Vùng này có định dạng có điều kiện mở rộng (x14) và chưa thể sửa đổi.',
@@ -701,6 +700,7 @@ export const vi = {
   appExportPdfTitle: 'Xuất dưới dạng PDF',
   appSaveTitle: 'Lưu (⌘S)',
   appSaveAs: 'Lưu dưới dạng',
+  aiNameFile: 'Đặt tên bằng AI…',
   appUndo: 'Hoàn tác',
   appRedo: 'Làm lại',
   appUnsavedEditOne: '● {count} chỉnh sửa chưa lưu',

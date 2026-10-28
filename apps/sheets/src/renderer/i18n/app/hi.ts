@@ -344,6 +344,7 @@ export const hi = {
   appPivotSheetNoMove: 'इस शीट में पिवट टेबल है — श्रेणियाँ स्थानांतरित करना अभी समर्थित नहीं है।',
   appMergeOverTable:
     'चयन Excel तालिका से ओवरलैप करता है — तालिका के भीतर सेल मर्ज करना अभी समर्थित नहीं है।',
+  appFilterToggleFailed: 'फ़िल्टर लागू नहीं हुआ — पहले वह रेंज चुनें जिसमें आपका डेटा है।',
   appAutofillStreaming:
     'जो क्षेत्र अभी स्ट्रीम होकर लोड हो रहा है, उसमें स्वतः भरण की अनुमति अभी नहीं है।',
   appDvNeedsIndexed:
@@ -582,8 +583,6 @@ export const hi = {
   appSaveFailed: 'कार्यपुस्तिका सहेजी नहीं जा सकी।',
   appCfRuleUnsaveable:
     'यह सशर्त स्वरूपण नियम xlsx में सहेजा नहीं जा सकता — कृपया दूसरा नियम प्रकार चुनें।',
-  appSaveErrX14Dv:
-    'इस शीट में विस्तारित (x14) डेटा सत्यापन है; इसके सत्यापन नियमों का संपादन अभी समर्थित नहीं है।',
   appSaveErrMultiSelectList:
     'बहु-चयन सूची सत्यापन xlsx में सहेजा नहीं जा सकता — सहेजने से पहले वह नियम हटाएँ।',
   appSaveErrX14Cf: 'इस श्रेणी में विस्तारित (x14) सशर्त स्वरूपण है, इसे अभी बदला नहीं जा सकता।',
@@ -710,6 +709,7 @@ export const hi = {
   appExportPdfTitle: 'PDF के रूप में निर्यात करें',
   appSaveTitle: 'सहेजें (⌘S)',
   appSaveAs: 'इस रूप में सहेजें',
+  aiNameFile: 'AI से नाम दें…',
   appUndo: 'पूर्ववत करें',
   appRedo: 'फिर से करें',
   appUnsavedEditOne: '● {count} असहेजा संपादन',

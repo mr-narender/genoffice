@@ -330,6 +330,7 @@ export const ar = {
   appDialogCancel: 'إلغاء',
   appPivotSheetNoMove: 'تحتوي هذه الورقة على جدول محوري — نقل النطاقات غير مدعوم بعد.',
   appMergeOverTable: 'التحديد يتداخل مع جدول Excel — دمج الخلايا داخل الجدول غير مدعوم حتى الآن.',
+  appFilterToggleFailed: 'لم يتم تطبيق عامل التصفية — حدد أولاً النطاق الذي يحتوي على بياناتك.',
   appAutofillStreaming: 'التعبئة التلقائية في ناحية لا تزال قيد التحميل بالبث غير مسموح بها بعد.',
   appDvNeedsIndexed:
     'يتطلب تحرير التحقق من صحة البيانات فهرسة الورقة بالكامل أولاً — أعد المحاولة لاحقًا.',
@@ -554,8 +555,6 @@ export const ar = {
   appSaved: 'تم الحفظ.',
   appSaveFailed: 'يتعذر حفظ المصنف.',
   appCfRuleUnsaveable: 'لا يمكن حفظ قاعدة التنسيق الشرطي هذه في xlsx — استخدم نوع قاعدة آخر.',
-  appSaveErrX14Dv:
-    'تحتوي هذه الورقة على تحقق موسّع (x14) من صحة البيانات، وتحرير قواعد التحقق الخاصة بها غير مدعوم بعد.',
   appSaveErrMultiSelectList:
     'لا يمكن حفظ التحقق بقائمة متعددة الاختيار في xlsx — احذف القاعدة قبل الحفظ.',
   appSaveErrX14Cf: 'يحتوي هذا النطاق على تنسيق شرطي موسّع (x14) ولا يمكن تعديله حاليًا.',
@@ -676,6 +675,7 @@ export const ar = {
   appExportPdfTitle: 'تصدير إلى PDF',
   appSaveTitle: 'حفظ (⌘S)',
   appSaveAs: 'حفظ باسم',
+  aiNameFile: 'التسمية بالذكاء الاصطناعي…',
   appUndo: 'تراجع',
   appRedo: 'إعادة',
   appUnsavedEditOne: '● {count} تعديل غير محفوظ',

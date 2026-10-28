@@ -332,6 +332,7 @@ export const en = {
   appPivotSheetNoMove: 'This sheet contains a PivotTable — moving ranges is not supported yet.',
   appMergeOverTable:
     'The selection overlaps an Excel table — merging cells inside a table is not supported yet.',
+  appFilterToggleFailed: 'The filter was not applied — select the range with your data first.',
   appAutofillStreaming: 'Autofill into an area that is still streaming in is not allowed yet.',
   appDvNeedsIndexed:
     'Editing data validation needs this sheet fully indexed first — try again in a moment.',
@@ -562,8 +563,6 @@ export const en = {
   appSaveFailed: 'Unable to save the workbook.',
   appCfRuleUnsaveable:
     'This conditional formatting rule cannot be saved to xlsx — switch to another rule type.',
-  appSaveErrX14Dv:
-    'This sheet has extended (x14) data validation; editing its validation rules is not supported yet.',
   appSaveErrMultiSelectList:
     'Multi-select list validation cannot be saved to xlsx — delete the rule before saving.',
   appSaveErrX14Cf:
@@ -687,6 +686,7 @@ export const en = {
   appExportPdfTitle: 'Export as PDF',
   appSaveTitle: 'Save (⌘S)',
   appSaveAs: 'Save As',
+  aiNameFile: 'Name with AI…',
   appUndo: 'Undo',
   appRedo: 'Redo',
   appUnsavedEditOne: '● {count} unsaved edit',
