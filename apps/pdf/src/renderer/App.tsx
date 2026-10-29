@@ -128,6 +128,7 @@ import { OutlinePanel } from './OutlinePanel'
 import { CommentsPanel, type CommentEntry } from './CommentsPanel'
 import { ComparePanel } from './ComparePanel'
 import { compareDocuments, type CompareResult, type PageText } from './compare-text'
+import { AttachmentsPanel, type AttachmentRow } from './AttachmentsPanel'
 import type { OutlineNode } from './OutlinePanel'
 import {
   buildHeadingOutline,
@@ -143,6 +144,8 @@ import { LinkDialog, type LinkDraft } from './LinkDialog'
 import { CertSignDialog } from './CertSignDialog'
 import { BatesDialog } from './BatesDialog'
 import { buildBatesInserts, type BatesConfig } from './bates'
+import { MeasureScaleDialog } from './MeasureScaleDialog'
+import { formatLength, type MeasureScale } from './measure'
 import { SignaturesDialog, overallSignatureStatus } from './SignaturesDialog'
 import { SignatureDialog, fileToCanvas } from './SignatureDialog'
 import type { SignatureData } from './SignatureDialog'
@@ -300,6 +303,7 @@ import {
   IconCertSign,
   IconSignatures,
   IconBates,
+  IconMeasure,
   IconPreviousField,
   IconNextField,
   IconCompleteForm,
@@ -372,6 +376,7 @@ GlobalWorkerOptions.workerSrc = workerUrl
 
 const DRAW_TOOLS = [
   { tool: 'ink' as const, icon: IconInk, key: 'drawInk' as const },
+  { tool: 'measure' as const, icon: IconMeasure, key: 'drawMeasure' as const },
   { tool: 'rect' as const, icon: IconRect, key: 'drawRect' as const },
   { tool: 'ellipse' as const, icon: IconEllipse, key: 'drawEllipse' as const },
   { tool: 'arrow' as const, icon: IconArrow, key: 'drawArrow' as const },
@@ -435,9 +440,9 @@ export default function App() {
   const [scale, setScale] = useState(1)
   const [currentPage, setCurrentPage] = useState(1)
   const [pageInput, setPageInput] = useState('1')
-  const [sidebar, setSidebar] = useState<'thumbs' | 'outline' | 'comments' | 'compare' | null>(
-    'thumbs',
-  )
+  const [sidebar, setSidebar] = useState<
+    'thumbs' | 'outline' | 'comments' | 'compare' | 'attachments' | null
+  >('thumbs')
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null)
   const [compareName, setCompareName] = useState<string | null>(null)
   const [compareBusy, setCompareBusy] = useState(false)
@@ -547,6 +552,32 @@ export default function App() {
   const drawingsRef = useRef(drawings)
   drawingsRef.current = drawings
   const [drawTool, setDrawTool] = useState<DrawTool | null>(null)
+  /** real-world scale for the measure tool; lives in the session only */
+  const measureScaleRef = useRef<MeasureScale | null>(null)
+  const [measureScaleDlg, setMeasureScaleDlg] = useState(false)
+  /** the drawn line waiting for its real length while the scale dialog is open */
+  const pendingMeasureRef = useRef<
+    (Extract<DrawingInput, { kind: 'measure' }> & { pageIndex: number }) | null
+  >(null)
+  /** the drawn line's PDF length, shown as the calibration ruler */
+  const [measureDrawnPts, setMeasureDrawnPts] = useState(0)
+  /** set when the user re-clicks the armed measure tool: the next drawn line
+      re-calibrates instead of measuring */
+  const measureRecalibrateRef = useRef(false)
+  /** one-shot: the deliberate second click disarms the tool while keeping the
+      re-calibration request; the drawTool effect below must not read that
+      transition as a stale flag to clear */
+  const keepMeasureRecalibrateRef = useRef(false)
+  // Any way of leaving the measure tool other than the deliberate second
+  // click — another tool, Esc, entering another edit mode — drops a pending
+  // re-calibration request, so the dialog cannot re-open unexpectedly later.
+  useEffect(() => {
+    if (keepMeasureRecalibrateRef.current) {
+      keepMeasureRecalibrateRef.current = false
+      return
+    }
+    if (drawTool !== 'measure') measureRecalibrateRef.current = false
+  }, [drawTool])
   const [redactions, setRedactions] = useState<LocalRedaction[]>([])
   const redactionApplyConfirmedRef = useRef(false)
   const redactionRequestInFlightRef = useRef(false)
@@ -894,6 +925,13 @@ export default function App() {
   const [formCatalog, setFormCatalog] = useState<FormCatalog | null>(null)
   const [formHasXfa, setFormHasXfa] = useState(false)
   const [documentEncrypted, setDocumentEncrypted] = useState(false)
+  /** embedded files as pdf.js reports them (filename → byte length) */
+  const [savedAttachments, setSavedAttachments] = useState<Map<string, number> | null>(null)
+  const [pendingAttachmentAdds, setPendingAttachmentAdds] = useState<
+    { name: string; bytesBase64: string }[]
+  >([])
+  const [pendingAttachmentRemoves, setPendingAttachmentRemoves] = useState<string[]>([])
+  const savedAttachmentBytesRef = useRef<Map<string, string>>(new Map())
   const [activeFormWidgetId, setActiveFormWidgetId] = useState<string | null>(null)
   const formControlRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [formEdits, setFormEdits] = useState<Map<string, FormValueInput>>(new Map())
@@ -1211,6 +1249,9 @@ export default function App() {
       setFormHasXfa(hasXfaMarker(bytes))
       if (!saved) {
         setFormCatalog(null)
+        setSavedAttachments(null)
+        setPendingAttachmentAdds([])
+        setPendingAttachmentRemoves([])
         setSavedStaticFormFills([])
         setActiveFormWidgetId(null)
         formControlRefs.current.clear()
@@ -1276,6 +1317,30 @@ export default function App() {
         void loaded.loadingTask.destroy()
         throw err
       }
+      void loaded
+        .getAttachments()
+        .then(async (all) => {
+          const map = new Map<string, number>()
+          const bytes = new Map<string, string>()
+          for (const [name, file] of all ?? new Map()) {
+            // v6 ships metadata here and the bytes over getAttachmentContent(id)
+            const content = file.content ?? (await loaded.getAttachmentContent(name))
+            map.set(name, content?.byteLength ?? 0)
+            // String.fromCharCode spread chokes on huge files; chunks keep the stack flat
+            if (content) {
+              let text = ''
+              for (let i = 0; i < content.length; i += 0x8000) {
+                text += String.fromCharCode(...content.subarray(i, i + 0x8000))
+              }
+              bytes.set(name, window.btoa(text))
+            }
+          }
+          savedAttachmentBytesRef.current = bytes
+          setSavedAttachments(map)
+        })
+        .catch(() => setSavedAttachments(new Map()))
+      setPendingAttachmentAdds([])
+      setPendingAttachmentRemoves([])
       try {
         setFormCatalog(await buildFormCatalog(loaded))
       } catch {
@@ -2035,7 +2100,9 @@ export default function App() {
     deleted.size > 0 ||
     order !== null ||
     metadata !== null ||
-    (pendingOutline?.edited ?? false)
+    (pendingOutline?.edited ?? false) ||
+    pendingAttachmentAdds.length > 0 ||
+    pendingAttachmentRemoves.length > 0
   // The pending OCR bake deliberately stays out of dirty: a scan the user only
   // opened to read must not show the modified marker, prompt on close or feed
   // the save-in-flight plumbing. The bake still rides the save request
@@ -4288,6 +4355,58 @@ export default function App() {
     }
   }
 
+  const attachmentRows = (): AttachmentRow[] => {
+    const rows: AttachmentRow[] = []
+    const saved = savedAttachments ?? new Map<string, number>()
+    for (const [name, bytes] of saved) {
+      if (pendingAttachmentRemoves.includes(name)) {
+        rows.push({ name, bytes, saved: true, removing: true })
+        continue
+      }
+      rows.push({ name, bytes, saved: true })
+    }
+    for (const add of pendingAttachmentAdds) {
+      if (!pendingAttachmentRemoves.includes(add.name)) {
+        rows.push({
+          name: add.name,
+          bytes: Math.floor((add.bytesBase64.length * 3) / 4),
+          saved: false,
+        })
+      }
+    }
+    return rows
+  }
+
+  const addAttachment = async () => {
+    const picked = await window.pdfApi.pickAttachmentFile()
+    if (!picked.ok) {
+      if (!('cancelled' in picked)) showNotice(picked.reason)
+      return
+    }
+    setPendingAttachmentAdds((prev) => [
+      ...prev,
+      { name: picked.name, bytesBase64: picked.bytesBase64 },
+    ])
+  }
+
+  const exportAttachment = async (row: AttachmentRow) => {
+    const base64 = savedAttachmentBytesRef.current.get(row.name)
+    if (!filePath || !base64) return
+    const outcome = await window.pdfApi.exportAttachment(filePath, row.name, base64)
+    if ('targetPath' in outcome) showNotice(t('attachmentsExported', { name: row.name }))
+    else if (!('cancelled' in outcome)) showNotice(outcome.reason)
+  }
+
+  const toggleAttachmentRemove = (row: AttachmentRow): void => {
+    if (!row.saved) {
+      setPendingAttachmentAdds((prev) => prev.filter((a) => a.name !== row.name))
+      return
+    }
+    setPendingAttachmentRemoves((prev) =>
+      prev.includes(row.name) ? prev.filter((n) => n !== row.name) : [...prev, row.name],
+    )
+  }
+
   const showNotice = (msg: string) => {
     if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
     setNotice(msg)
@@ -4387,6 +4506,9 @@ export default function App() {
     ...(order ? { pageOrder: visList } : {}),
     ...(metadata ? { metadata } : {}),
     ...(pendingOutline?.edited && pendingOutline.tree ? { outline: pendingOutline.tree } : {}),
+    ...(pendingAttachmentAdds.length > 0 || pendingAttachmentRemoves.length > 0
+      ? { attachments: { add: pendingAttachmentAdds, remove: pendingAttachmentRemoves } }
+      : {}),
   })
 
   /** Resolved when the running save() lands; queued saves and Save As serialize behind it */
@@ -4775,7 +4897,28 @@ export default function App() {
       setLinkDraft({ pageIndex: origIdx, rect: input.rect })
       return
     }
-    applyEditOps([{ op: 'addDrawing', drawing: { ...input, pageIndex: origIdx } }])
+    if (input.kind === 'measure') {
+      const scale = measureScaleRef.current
+      // First draw calibrates, and a re-calibration request turns the next line
+      // into the new reference: the dialog derives the scale from its real
+      // length, and the line itself becomes the first measurement.
+      if (!scale || measureRecalibrateRef.current) {
+        pendingMeasureRef.current = { ...input, pageIndex: origIdx }
+        setMeasureDrawnPts(Math.hypot(input.to[0] - input.from[0], input.to[1] - input.from[1]))
+        setMeasureScaleDlg(true)
+        return
+      }
+      input = {
+        ...input,
+        label: formatLength(
+          Math.hypot(input.to[0] - input.from[0], input.to[1] - input.from[1]),
+          scale,
+        ),
+      }
+    }
+    const plan = applyEditOps([{ op: 'addDrawing', drawing: { ...input, pageIndex: origIdx } }])
+    // a dropped op used to vanish on mouse-up with nothing on screen
+    if (plan.failures.length > 0) showNotice(plan.failures[0]!.error)
   }
 
   /** Render stamps in current page order; page numbers depend on visList, so both preview and save compute fresh */
@@ -6230,6 +6373,20 @@ export default function App() {
     void extractPagesToFile(pages.map((n) => n - 1))
   }
 
+  const reduceFileSize = async (): Promise<void> => {
+    if (!filePath) return
+    const outcome = await window.pdfApi.reduceFileSize(filePath)
+    if (!outcome.ok) {
+      if (!('canceled' in outcome)) showNotice(outcome.reason)
+      return
+    }
+    const savedPct =
+      outcome.bytesBefore > 0 ? Math.round((1 - outcome.bytesAfter / outcome.bytesBefore) * 100) : 0
+    // a run that came out bigger writes nothing and lands here as <= 0%: the
+    // toast says the file is already small instead of inventing a reduction
+    showNotice(savedPct > 0 ? t('reduceDone', { pct: savedPct }) : t('reduceAlreadySmall'))
+  }
+
   const insertPdf = (afterOrigIdx: number) => {
     // the flush bakes the visible order into the file, so the anchor becomes its visible position
     const afterPageIndex = visListOf(orderRef.current).indexOf(afterOrigIdx)
@@ -7682,6 +7839,28 @@ export default function App() {
           </span>
           <span>{t('compare')}</span>
         </button>
+        <button
+          className={`rb-big${sidebar === 'attachments' ? ' active' : ''}`}
+          disabled={status !== 'ready'}
+          onClick={() => setSidebar((v) => (v === 'attachments' ? null : 'attachments'))}
+        >
+          <span className="rb-big-icon">
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M20 11.5 12.3 19.2 a4.6 4.6 0 0 1-6.5-6.5 L13.6 5 a3.1 3.1 0 0 1 4.4 4.4 L10.6 16.8 a1.6 1.6 0 0 1-2.2-2.2 L15 8" />
+            </svg>
+          </span>
+          <span>{t('attachments')}</span>
+        </button>
         {searchBtn}
         <button
           className={`rb-big${spread === 2 ? ' active' : ''}`}
@@ -7977,6 +8156,14 @@ export default function App() {
                         setPendingTextInsert(null)
                         setImagePick(null)
                         setEditImageMode(false)
+                        if (tool === 'measure' && drawTool === 'measure') {
+                          // a second click disarms the tool like every other
+                          // one and asks the next measure line to re-open the
+                          // scale dialog, so a wrong first entry is never
+                          // stuck for the session
+                          measureRecalibrateRef.current = true
+                          keepMeasureRecalibrateRef.current = true
+                        }
                         setDrawTool((v) => (v === tool ? null : tool))
                       }}
                     >
@@ -8515,6 +8702,30 @@ export default function App() {
                   </button>
                   <button
                     className="rb-big"
+                    disabled={status !== 'ready' || readOnly}
+                    data-tip={t('reduceHint')}
+                    onClick={() => void reduceFileSize()}
+                  >
+                    <span className="rb-big-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M15.5 4.5 A 8.5 8.5 0 1 0 19.5 11" />
+                        <path d="M15.5 2.5 L15.5 7.5 L10.5 7.5" />
+                      </svg>
+                    </span>
+                    <span>{t('reduce')}</span>
+                  </button>
+                  <button
+                    className="rb-big"
                     disabled={readOnly}
                     onClick={() => insertBlankPage(curOrigIdx)}
                   >
@@ -8815,6 +9026,28 @@ export default function App() {
                     setCompareResult(null)
                   }}
                   onGoToPage={(pageNo) => scrollToPage(pageNo)}
+                />
+              </div>
+            )}
+            {sidebar === 'attachments' && (
+              <div className="pdf-thumbs" style={{ width: sidebarW }}>
+                <div className="pdf-outline-header">
+                  <span>{t('attachments')}</span>
+                  <button
+                    type="button"
+                    className="rb-icon"
+                    aria-label={t('aiCollapsePanel')}
+                    onClick={() => setSidebar(null)}
+                  >
+                    ×
+                  </button>
+                </div>
+                <AttachmentsPanel
+                  t={t}
+                  rows={attachmentRows()}
+                  onAdd={() => void addAttachment()}
+                  onExport={(row) => void exportAttachment(row)}
+                  onToggleRemove={toggleAttachmentRemove}
                 />
               </div>
             )}
@@ -10825,6 +11058,37 @@ export default function App() {
                 pageCount={sizes.length}
                 onApply={applyBates}
                 onClose={() => setBatesDlg(false)}
+              />
+            )}
+            {measureScaleDlg && (
+              <MeasureScaleDialog
+                t={t}
+                drawnPts={measureDrawnPts}
+                onApply={(unitsPerPt, unit) => {
+                  measureScaleRef.current = { unitsPerPt, unit }
+                  setMeasureScaleDlg(false)
+                  measureRecalibrateRef.current = false
+                  const pending = pendingMeasureRef.current
+                  pendingMeasureRef.current = null
+                  if (pending) {
+                    const pts = Math.hypot(
+                      pending.to[0] - pending.from[0],
+                      pending.to[1] - pending.from[1],
+                    )
+                    commitDrawing(pending.pageIndex, {
+                      ...pending,
+                      label: formatLength(pts, measureScaleRef.current),
+                    })
+                  }
+                  showNotice(t('measureCalibrated', { unit }))
+                }}
+                onClose={() => {
+                  // cancelling drops the reference line: committing it would
+                  // label it with a scale the user just refused to set
+                  pendingMeasureRef.current = null
+                  measureRecalibrateRef.current = false
+                  setMeasureScaleDlg(false)
+                }}
               />
             )}
             {certSignDlg && (
