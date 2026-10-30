@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const ar = {
+  redactMenuLabel: 'إخفاء التحديد عن الذكاء الاصطناعي',
+  redactDialogDesc:
+    'يبقى ما تختاره في المستند وفي الملف؛ يرى النموذج العلامة أدناه. سمِّها ليعرف ما تمثّله.',
+  redactDialogScope:
+    'الإخفاء يشمل الذكاء الاصطناعي في هذا التطبيق فقط. أما CLI وأدوات MCP والتصدير بدون واجهة فيقرأون الملف مباشرة، وما زالوا يرون هذه الكلمات.',
+  redactDialogPlaceholder: 'اسم العنصر، مثال: هاتف العميل',
+  redactCancel: 'إلغاء',
+  redactInsert: 'إخفاء',
+  redactEnable: 'انقر بزر الفأرة الأيمن على النص المحدد لإخفائه عن النموذج.',
+
   appPhPromptTitle: 'انقر لإضافة عنوان',
   appPhPromptSubtitle: 'انقر لإضافة عنوان فرعي',
   appPhPromptBody: 'انقر لإضافة نص',
@@ -51,7 +61,8 @@ export const ar = {
   appStatusVideoInserted: 'تم إدراج الفيديو (مضمّن في ملف pptx؛ يمكن تشغيله في PowerPoint)',
   appStatusAudioInserted: 'تم إدراج الصوت (مضمّن في ملف pptx)',
   appStatusModel3dInserted:
-    'تم تضمين النموذج ثلاثي الأبعاد (تعرض اللوحة عنصرًا نائبًا؛ تم حفظ ملف النموذج في pptx)',
+    'تم إدراج النموذج ثلاثي الأبعاد: حدده لتدويره (يعرضه PowerPoint ثلاثي الأبعاد أيضًا)',
+  appStatusModel3dNoPreview: 'تعذر رسم النموذج ثلاثي الأبعاد هنا؛ تبقى صورته دون تغيير',
   appStatusRecordingEmpty: 'التسجيل فارغ؛ لم يتم إدراج أي شيء',
   appStatusRecordingInserted: 'تم إدراج تسجيل الشاشة في الشريحة الحالية (webm مضمّن)',
   appStatusRecording: 'جارٍ تسجيل الشاشة… انقر فوق «تسجيل الشاشة» مرة أخرى للإيقاف والإدراج',
@@ -207,6 +218,8 @@ export const ar = {
   appMasterFillNone: 'بلا تعبئة',
   appMasterStroke: 'لون الحد…',
   appMasterStrokeNone: 'بلا حد',
+  appMasterInsertTextBox: 'مربع نص',
+  appMasterInsertShape: 'أشكال',
   appStartOpening: 'جارٍ الفتح…',
   appReadingSlideTitle: 'انقر للانتقال إلى الشريحة التالية (اضغط على Esc للخروج من عرض القراءة)',
   appReadingPrev: '‹ السابق',
@@ -233,6 +246,13 @@ export const ar = {
     'المدة الإجمالية للعرض هي {duration}. هل تريد حفظ توقيتات الشرائح للتقدم التلقائي للشرائح؟',
   appRehearseDiscard: 'عدم الحفظ',
   appRehearseSave: 'حفظ',
+  appRecordTitle: 'تسجيل التعليق الصوتي',
+  appRecordSummary: 'مدة التسجيل {duration}. هل تريد حفظ التعليق الصوتي وتوقيت كل شريحة؟',
+  appRecordDiscard: 'عدم الحفظ',
+  appRecordSave: 'حفظ',
+  appStatusRecordSaved: 'تم حفظ التعليق الصوتي في {count} شرائح (يشغّله PowerPoint أيضًا)',
+  appStatusRecordFailed: 'تعذّر حفظ التسجيل',
+  appStatusNarrationCleared: 'تم مسح التعليق الصوتي',
   appSettingsTitle: 'إعدادات الذكاء الاصطناعي',
   appSettingsAccount: 'حساب Genspark',
   appSettingsChecking: 'جارٍ التحقق…',

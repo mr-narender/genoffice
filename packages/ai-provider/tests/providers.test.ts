@@ -35,12 +35,12 @@ describe('defaultAiSettings', () => {
 })
 
 describe('provider model catalog', () => {
-  it('offers DeepSeek V4.1 Flash directly under the same versioned name as the pool', () => {
+  it("offers the vendor's own DeepSeek ids, not the Genspark pool spelling", () => {
     const genspark = AI_PROVIDERS.find((provider) => provider.id === 'genspark')!
     const deepseek = AI_PROVIDERS.find((provider) => provider.id === 'deepseek')!
 
-    expect(deepseek.models).toContain('deep-seek-v4.1-flash')
-    expect(deepseek.models).not.toContain('deepseek-flash')
+    expect(deepseek.models).toContain('deepseek-flash')
+    expect(deepseek.models).not.toContain('deep-seek-v4.1-flash')
     expect(deepseek.models).not.toContain('deepseek-v4-flash')
     expect(deepseek.models).not.toContain('deepseek-v4-flash-vision-exp')
     expect(genspark.models).not.toContain('deep-seek-v4-flash')
@@ -80,6 +80,67 @@ describe('provider model catalog', () => {
     for (const model of opper.models) {
       expect(model).not.toContain('/')
     }
+  })
+
+  it('seeds Atlas Cloud with lab-namespaced model ids', () => {
+    const atlas = AI_PROVIDERS.find((provider) => provider.id === 'atlascloud')!
+    expect(atlas.models).toContain(atlas.defaultModel)
+    expect(atlas.needsBaseUrl).toBeUndefined()
+    for (const model of atlas.models) {
+      expect(model).toMatch(/^[a-z0-9-]+\/[A-Za-z0-9._-]+$/)
+    }
+  })
+
+  it('seeds Runcrate with lab-namespaced model ids', () => {
+    const runcrate = AI_PROVIDERS.find((provider) => provider.id === 'runcrate')!
+    expect(runcrate.models).toContain(runcrate.defaultModel)
+    expect(runcrate.needsBaseUrl).toBeUndefined()
+    for (const model of runcrate.models) {
+      expect(model).toMatch(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/)
+    }
+  })
+
+  it('seeds CloudGPU with bare model ids (no vendor prefix)', () => {
+    const cloudgpu = AI_PROVIDERS.find((provider) => provider.id === 'cloudgpu')!
+    expect(cloudgpu.models).toEqual([
+      'deepseek-v4.1-flash',
+      'deepseek-v4-pro',
+      'glm-5.3-flash',
+      'kimi-k2.6',
+      'minimax-m3',
+    ])
+    expect(cloudgpu.defaultModel).toBe('deepseek-v4.1-flash')
+    expect(cloudgpu.models).toContain(cloudgpu.defaultModel)
+    expect(cloudgpu.needsBaseUrl).toBeUndefined()
+    expect(cloudgpu.keyPlaceholder).toBe('sk-...')
+    for (const model of cloudgpu.models) {
+      expect(model).not.toContain('/')
+    }
+  })
+
+  it('seeds Cheaper Inference with bare model ids (no vendor prefix)', () => {
+    const ci = AI_PROVIDERS.find((provider) => provider.id === 'cheaperinference')!
+    expect(ci.models).toContain(ci.defaultModel)
+    expect(ci.needsBaseUrl).toBeUndefined()
+    for (const model of ci.models) {
+      expect(model).not.toContain('/')
+    }
+  })
+
+  it('seeds Kimi with the K3.1 flagship ahead of the still-sold K3', () => {
+    const kimi = AI_PROVIDERS.find((provider) => provider.id === 'kimi')!
+    expect(kimi.models).toEqual(['kimi-k3.1-pro', 'kimi-k3'])
+    expect(kimi.defaultModel).toBe('kimi-k3.1-pro')
+    expect(kimi.needsBaseUrl).toBeUndefined()
+  })
+
+  it('seeds Claude with Sonnet 5.5 as default and Gemini with 4 Argon ahead of 3.8 Flash', () => {
+    const anthropic = AI_PROVIDERS.find((provider) => provider.id === 'anthropic')!
+    expect(anthropic.models.slice(0, 2)).toEqual(['claude-opus-5-5', 'claude-sonnet-5-5'])
+    expect(anthropic.defaultModel).toBe('claude-sonnet-5-5')
+    const gemini = AI_PROVIDERS.find((provider) => provider.id === 'gemini')!
+    expect(gemini.models.slice(0, 2)).toEqual(['gemini-4-argon', 'gemini-3.8-flash'])
+    expect(gemini.defaultModel).toBe('gemini-3.8-flash')
   })
 })
 
@@ -166,17 +227,23 @@ describe('resolveAiSettings', () => {
     )
     expect(resolved.providers.deepseek).toEqual({
       apiKey: 'sk-user',
-      model: 'deep-seek-v4.1-flash',
+      model: 'deepseek-flash',
     })
   })
 
-  it('rewrites the retired V4 Flash id and the vendor wire id to the listed V4.1 Flash name', () => {
-    for (const model of ['deepseek-v4-flash', 'deepseek-flash']) {
+  it('rewrites retired DeepSeek ids and the old pool spelling to the listed id', () => {
+    for (const model of [
+      'deepseek-v4-flash',
+      'deepseek-v4-flash-vision-exp',
+      'deepseek-chat',
+      'deepseek-reasoner',
+      'deep-seek-v4.1-flash',
+    ]) {
       const resolved = resolveAiSettings(
         { providers: { deepseek: { apiKey: 'sk-user', model } } as never },
         defaultAiSettings(),
       )
-      expect(resolved.providers.deepseek.model).toBe('deep-seek-v4.1-flash')
+      expect(resolved.providers.deepseek.model).toBe('deepseek-flash')
     }
   })
 
@@ -189,7 +256,7 @@ describe('resolveAiSettings', () => {
       },
       defaultAiSettings(),
     )
-    expect(resolved.providers.genspark.model).toBe('claude-opus-4-7')
+    expect(resolved.providers.genspark.model).toBe('claude-opus-5-5')
 
     const gpt = resolveAiSettings(
       {
@@ -200,6 +267,12 @@ describe('resolveAiSettings', () => {
       defaultAiSettings(),
     )
     expect(gpt.providers.genspark.model).toBe('gpt-5.6-terra')
+
+    const glm = resolveAiSettings(
+      { providers: { glm: { apiKey: '', model: 'glm-5-turbo' } } as never },
+      defaultAiSettings(),
+    )
+    expect(glm.providers.glm.model).toBe('glm-5.3-flash')
   })
 
   it('leaves a still-supported model id alone', () => {
@@ -240,7 +313,7 @@ describe('resolveAiSettings', () => {
       },
       defaultAiSettings(),
     )
-    expect(resolved.providers.deepseek.model).toBe('deep-seek-v4.1-flash')
+    expect(resolved.providers.deepseek.model).toBe('deepseek-flash')
   })
 
   it('trims the legacy single-endpoint key and base URL too', () => {

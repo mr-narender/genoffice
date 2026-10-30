@@ -180,6 +180,14 @@ export function buildRenderSlide(
       if (i < bgLeading) node.background = true
       nodes.push(node)
     }
+    // chartUserShapes overlays ride on top of their chart, read-only like decorations
+    for (const us of el.type === 'chart' ? ((el as ChartElement).userShapes ?? []) : []) {
+      const n = buildNode(us, vp, metrics, opts.media, { x: 0, y: 0 })
+      if (n && n.type !== 'placeholder-chip') {
+        n.decoration = true
+        nodes.push(n)
+      }
+    }
   }
   // Hidden-slide flag (<p:sld show="0">). Same logic as the engine's readSlideHiddenXml,
   // inlined here as a small regex so we only depend on pptx-engine types (safe to bundle in the renderer).
@@ -586,7 +594,9 @@ function buildPicture(
   // GDI metafiles play back on an opaque white DC: PowerPoint shows a white panel for
   // an EMF/WMF that never paints its background (PlanS academy banner, measured)
   const isMetafile =
-    typeof dataUrl === 'string' && /^data:image\/(x-)?(emf|wmf|emz|wmz)[;,]/.test(dataUrl)
+    typeof dataUrl === 'string' &&
+    (/^data:image\/(x-)?(emf|wmf|emz|wmz)[;,]/.test(dataUrl) ||
+      /^genoffice-slide-media:.*[?&]mime=image%2F(?:x-)?(emf|wmf)(?:&|$)/i.test(dataUrl))
   const node: PictureRenderNode = {
     id: `r_${el.id}`,
     type: 'picture',
@@ -598,6 +608,8 @@ function buildPicture(
     ...(el.opacity != null ? { opacity: el.opacity } : {}),
     ...(el.softEdge ? { softEdgePx: emuToPx(el.softEdge, vp.scale) } : {}),
     ...(el.media ? { media: el.media.kind } : {}),
+    ...(el.model3d ? { model3d: { ...el.model3d.rot } } : {}),
+    ...(el.redact ? { redact: el.redact } : {}),
     ...(el.name ? { name: el.name } : {}),
     ...(el.descr ? { descr: el.descr } : {}),
     ...(el.fill && el.fill.type !== 'none' ? { fill: resolveFill(el.fill, vp, media) } : {}),
@@ -725,6 +737,35 @@ function buildTable(
       // the line-box sum — with explicit lnSpc the box extends below the ink (18pt probe)
       const needed = (probe.inkBottom ?? probe.contentHeight) + probe.insets.t + probe.insets.b
       if (needed > (rowPx[r] ?? 0)) rowPx[r] = needed
+    })
+  })
+  el.rows.forEach((row, r) => {
+    const gridCols = tableRowGridCols(row)
+    row.forEach((cell, tcIdx) => {
+      const cIdx = gridCols[tcIdx]!
+      const span = cell.rowSpan ?? 1
+      if (cell.merged || span <= 1) return
+      if (!cell.text || !cell.text.paragraphs.length) return
+      const x = colX[cIdx] ?? 0
+      const w = (colX[Math.min(cIdx + (cell.gridSpan ?? 1), colX.length - 1)] ?? x) - x
+      const count = Math.min(span, rowPx.length - r)
+      if (count <= 0) return
+      let cur = 0
+      for (let i = 0; i < count; i++) cur += rowPx[r + i] ?? 0
+      const probe = layoutText({
+        body: cell.text,
+        boxWidthPx: w,
+        boxHeightPx: cur,
+        metrics,
+        vp,
+        media,
+        trimEdgeSpacing: true,
+      })
+      const needed = (probe.inkBottom ?? probe.contentHeight) + probe.insets.t + probe.insets.b
+      if (needed > cur) {
+        const extra = (needed - cur) / count
+        for (let i = 0; i < count; i++) rowPx[r + i] = (rowPx[r + i] ?? 0) + extra
+      }
     })
   })
 

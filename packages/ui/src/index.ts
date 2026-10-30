@@ -1,5 +1,12 @@
 export { AiPanelSideButton } from './AiPanelSideButton'
 export { AiComposer } from './AiComposer'
+export { AiQueueStrip } from './AiQueueStrip'
+export { useChatRunQueue, type ChatRunQueue, type QueuedChatMessage } from './chat-run-queue'
+export { AI_QUEUE_LABELS, type AiQueueStripLabels } from './strings-ai-queue'
+export { AI_SKILLS_LABELS, type AiSkillsLabels } from './strings-ai-skills'
+export { AiSkillsMenu, AiSkillChips, type AiSkillsMenuEntry } from './AiSkillsMenu'
+export { AiUsageChip, addTokenUsage, formatTokenCount, type AiTokenUsageView } from './AiUsageChip'
+export { AI_USAGE_LABELS, type AiUsageLabels } from './strings-ai-usage'
 export { AiScopeQuote, type AiScopeQuoteData } from './AiScopeQuote'
 export {
   AI_CUSTOM_FONT_MAX_PX,
@@ -20,6 +27,7 @@ export {
   aiPanelInitiallyOpen,
   rememberAiPanelOpen,
   useAiPanelPrefs,
+  useAiSidebarEnabled,
   aiPanelWidthAtPointer,
 } from './ai-panel-prefs-store'
 export {
@@ -49,17 +57,28 @@ export {
   useRibbonCollapse,
   RibbonCollapseButton,
   RibbonExpandButton,
+  isRibbonCompactShortcut,
   isRibbonToggleShortcut,
   readRibbonCollapsed,
+  readRibbonDensity,
+  RIBBON_COMPACT_SHORTCUT,
   RIBBON_TOGGLE_SHORTCUT,
   type RibbonCollapse,
   type RibbonCollapseLabels,
+  type RibbonDensity,
 } from './ribbon-collapse'
 export { AiTypingIndicator } from './AiTypingIndicator'
 export { IconSend, IconStop, type IconProps } from './icons'
 export { Markdown, type MarkdownNav } from './Markdown'
+export { FILE_NAV_SCHEME, createFileNav, fileNavHref, parseFileNavHref } from './file-nav'
 export { isSymbolFontFamily } from './symbol-fonts'
-export { BUILTIN_FONT_FAMILIES, fontFamiliesFor } from './font-list'
+export { suggestFileName, type SuggestFileNameOptions } from './ai-naming-client'
+export {
+  BUILTIN_FONT_FAMILIES,
+  fontFamiliesFor,
+  partitionFontFamilies,
+  systemFamiliesBesidesCandidates,
+} from './font-list'
 export {
   WORDART_PRESETS,
   wordArtSolidColor,
@@ -117,3 +136,15 @@ export {
   notchStep,
   type ZoomWheelIntent,
 } from './wheel-zoom'
+export { AiModelPicker, type AiModelPickerBridge } from './AiModelPicker'
+export {
+  aiModelPickerGroups,
+  aiModelPickerSelection,
+  withAiModelSelection,
+  type AiModelPickerGroup,
+  type AiModelPickerSelection,
+} from './ai-model-picker-options'
+export { ProviderLogo } from './provider-logos'
+export { useRedactLabelField } from './use-redact-label'
+export type { RedactLabelField } from './use-redact-label'
+export { useScrollWindow } from './scroll-window'

@@ -100,6 +100,11 @@ export const ru = {
     'Запись исправлений включена: изменения содержимого от ИИ помечаются как исправления (вставки подчеркнуты, удаления зачеркнуты); примите или отклоните их в разделе «Рецензирование»',
   aiTrackOffTitle:
     'Запись исправлений выключена: изменения ИИ применяются сразу (откат по-прежнему возможен через снимки версий)',
+  aiRevisionBarTitle: 'Исправления',
+  aiRevisionCount: 'Изменений: {count}',
+  aiRevisionRejectAll: 'Отклонить все',
+  aiRevisionAcceptAll: 'Принять все',
+  aiRevisionPara: 'Абзац {n}',
   aiTurnLimit:
     '(Достигнут лимит вызовов инструментов для этого запроса; ответ выше основан на уже выполненных шагах и может быть неполным.)',
   aiStopped: '(Остановлено)',
@@ -112,6 +117,8 @@ export const ru = {
   aiUnknownError: 'Неизвестная ошибка',
   aiTimeoutError:
     'Тайм-аут запроса ИИ: сеть не отвечает, выполнение остановлено. Проверьте подключение и повторите попытку',
+  aiRegionError:
+    'Поставщик этой модели не обслуживает ваш текущий регион — выберите другую модель или смените сеть',
   aiOverloadedError: 'Сервис ИИ сейчас перегружен — повторите попытку чуть позже',
   aiNetworkError:
     'Проблема с сетью: не удалось подключиться к сервису ИИ. Проверьте подключение и повторите попытку',
@@ -121,6 +128,9 @@ export const ru = {
   aiSumImageAttachment: 'Вложенное изображение {name}',
   aiSumRead: 'Чтение {name}',
   aiSumReadAttachmentName: 'Чтение вложения {name}',
+  aiSumSkillsList: 'Список установленных навыков',
+  aiSumSkillRead: 'Прочитан навык {name}',
+  aiSumRunCli: 'Выполнено: {args}',
   aiSumWebSearch: 'Поиск в Интернете',
   aiSumWebSearchDone: 'Поиск «{query}» ({count} результатов)',
   aiSumImageSearch: 'Поиск изображений',
@@ -183,4 +193,19 @@ export const ru = {
   aiCmdImages: 'Обновлено изображений: {count}',
   aiCmdToc: 'Вставлено оглавление (элементов: {count})',
   aiCmdSkipped: ' (пропущено защищенных блоков: {count})',
+  aiStarterMindMap: 'Создать ментальную карту документа',
+  aiMindMapBtn: 'ИИ-ментальная карта',
+  aiMindMapPrompt:
+    'Создай ментальную карту этого документа, организовав основные темы и ключевые понятия по структуре разделов',
+  aiSumMindMap: 'Создать ментальную карту',
+  aiMindMapTitle: 'Ментальная карта',
+  aiMindMapNodes: '{count} узлов',
+  aiMindMapAskPrompt: 'Расскажи про «{label}» в этом документе',
+  aiMindMapJump: 'Перейти к цитируемому фрагменту',
+  aiMindMapExport: 'Экспорт PNG',
+  aiMindMapExportSvg: 'Экспорт SVG',
+  aiMindMapInsert: 'Вставить в документ',
+  aiMindMapReset: 'Сбросить вид',
+  aiMindMapExpand: 'Развернуть ветку',
+  aiMindMapCollapse: 'Свернуть ветку',
 } satisfies Record<keyof typeof zh, string>

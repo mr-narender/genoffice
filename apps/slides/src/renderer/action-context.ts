@@ -5,6 +5,7 @@
  * exposes each extracted action as a stable `useCallback(() => impl(ctxRef.current, ...))`
  * wrapper, so module functions always see the latest state without stale closures.
  */
+import type { NarrationTake } from './narration/use-recording'
 import type { PathCmd } from './edit-points'
 import type React from 'react'
 import type { GroupRenderNode, RenderNode, RenderSlide } from '@genoffice/pptx-render'
@@ -54,6 +55,8 @@ export interface SlideShowState {
   startAt: number
   customOrder?: number[]
   rehearse?: boolean
+  /** Slide Show > Record: the show records the narration of each slide */
+  record?: boolean
 }
 
 export type CtxMenuState =
@@ -99,6 +102,21 @@ export interface LinkDialogState {
   initial: LinkTargetOp | null
   /** Apply to the text-edit selection instead of an element (run-level link) */
   run?: boolean
+}
+
+/**
+ * Withholding a span from the model. Opened by the context-menu item in its two
+ * gestures: a picture/video/audio shape (`sourceId` set, applied through the
+ * `setRedaction` op) or a text selection (`run`, applied by marking the editor DOM
+ * so the overlay's own commit carries it).
+ */
+export interface RedactDialogState {
+  /** Element to mark (element mode); null in run mode */
+  sourceId: string | null
+  /** Run-level mark on the saved text-edit selection */
+  run: boolean
+  /** Starting label: the shape's name, or the text the selection covers */
+  seed: string
 }
 
 /**
@@ -191,6 +209,9 @@ export interface ActionCtx {
   setCustomShowDlgOpen: Set<boolean>
   pendingRehearse: number[] | null
   setPendingRehearse: Set<number[] | null>
+  /** A recorded show awaiting "keep the recording?" */
+  pendingRecording: NarrationTake | null
+  setPendingRecording: Set<NarrationTake | null>
 
   // Sections
   sections: SectionInfo[]
@@ -218,6 +239,8 @@ export interface ActionCtx {
   ) => void
   linkDialog: LinkDialogState | null
   setLinkDialog: Set<LinkDialogState | null>
+  redactDialog: RedactDialogState | null
+  setRedactDialog: Set<RedactDialogState | null>
   setHfDialog: Set<HfDialogState | null>
   setEqDialogOpen: Set<boolean>
   setChartDataDialogInit: Set<ChartDataDialogInit | null>
@@ -247,6 +270,8 @@ export interface ActionCtx {
 
   // App-retained helpers (stable or latest-bound in App)
   applySlide: (slideIndex: number, updated: RenderSlide) => void
+  /** Replace the whole deck from a rebuilt result (an op transaction may touch any slide) */
+  applyDeck: (all: RenderSlide[], goTo?: number) => void
   flushNotes: () => Promise<void>
   findNodeCtx: (id: string) => { node: RenderNode; groupId?: string } | null
   groupIdOf: (id: string) => string | undefined

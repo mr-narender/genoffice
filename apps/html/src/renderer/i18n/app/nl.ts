@@ -1,12 +1,27 @@
 import type { zh } from './zh'
 
 export const nl = {
+  redactMenuLabel: 'Selectie verbergen voor de AI',
+  redactDialogDesc:
+    'De woorden blijven in het document en het bestand; het model ziet alleen de placeholder. Geef hem een naam.',
+  redactDialogScope:
+    'Verbergen geldt alleen voor de AI in deze app. De CLI, MCP-tools en de export zonder venster lezen het bestand rechtstreeks en zien deze woorden nog steeds.',
+  redactDialogPlaceholder: 'Naam van placeholder, bv. telefoonnummer klant',
+  redactCancel: 'Annuleren',
+  redactInsert: 'Verbergen',
+  diskChangedMsg: 'Dit bestand is door een ander programma gewijzigd.',
+  diskConflictMsg: 'Dit bestand is op schijf gewijzigd; opslaan overschrijft die wijzigingen.',
+  diskReload: 'Opnieuw laden',
+  diskKeepMine: 'Mijn versie behouden',
+  diskOverwrite: 'Toch overschrijven',
+
   loading: 'Laden…',
   loadFailed: 'Kan het bestand niet openen',
   untitled: 'Naamloos',
   saveFailed: 'Opslaan mislukt: {error}',
   saveFailedStatus: 'Opslaan mislukt',
   exportFailed: 'Exporteren mislukt',
+  printFailed: 'Afdrukken mislukt: {error}',
   exportHtmlSkipped:
     'Geëxporteerd, maar {count} bron(nen) konden niet worden ingesloten (bijv. {first})',
   viewPreview: 'Voorbeeld',
@@ -56,6 +71,7 @@ export const nl = {
   openExternal: 'Link geopend in de browser',
   save: 'Opslaan (⌘S)',
   saveAs: 'Opslaan als…',
+  aiNameFile: 'Naam geven met AI…',
   ribbonCollapse: 'Het lint samenvouwen',
   ribbonExpand: 'Het lint uitvouwen',
   ribbonGroupInsert: 'Invoegen',
@@ -86,6 +102,7 @@ export const nl = {
   alignLeft: 'Links uitlijnen',
   alignCenter: 'Centreren',
   alignRight: 'Rechts uitlijnen',
+  alignJustify: 'Uitvullen',
   fontSizeDec: 'Tekengrootte verkleinen',
   fontSizeInc: 'Tekengrootte vergroten',
   typography: 'Typografie',
@@ -122,6 +139,7 @@ export const nl = {
   insertImageUrl: 'Afbeelding van URL…',
   insertConfirm: 'Invoegen',
   insertMore: 'Meer',
+  insertSkeleton: 'Skelet invoegen',
   insertTableSize: 'Tabel van {r}×{c}',
   insertTablePickSize: 'Tabelgrootte kiezen',
   insertPlaceholderTableHeader: 'Kop {n}',

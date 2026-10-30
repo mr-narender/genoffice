@@ -7,6 +7,7 @@
 import { analyzePage, PAGE_CONFIDENCE_MIN } from './analyze'
 import { classifyPages } from './analyze/canvas'
 import { detectFurniture, type FurnitureHf } from './analyze/furniture'
+import type { ListSeq } from './analyze/lists'
 import {
   extractPage,
   PdfLoadError,
@@ -104,11 +105,12 @@ const GRAPHICS_GUARD_EMIT_SHARE = 0.35
 const GUARD_WHITE_MIN = 0xf2
 
 function isNearWhiteHex(hex: string): boolean {
-  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return false
+  const v = (hex ?? '').trim()
+  if (!/^[0-9a-fA-F]{6}$/.test(v)) return false
   return (
-    parseInt(hex.slice(0, 2), 16) >= GUARD_WHITE_MIN &&
-    parseInt(hex.slice(2, 4), 16) >= GUARD_WHITE_MIN &&
-    parseInt(hex.slice(4, 6), 16) >= GUARD_WHITE_MIN
+    parseInt(v.slice(0, 2), 16) >= GUARD_WHITE_MIN &&
+    parseInt(v.slice(2, 4), 16) >= GUARD_WHITE_MIN &&
+    parseInt(v.slice(4, 6), 16) >= GUARD_WHITE_MIN
   )
 }
 
@@ -341,11 +343,18 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
       }
       furnitureHf = furniture.hf
 
+      // one ordered-list run state for the whole document: a list split by a
+      // page break keeps its numbering when the run continues on the next page
+      const listSeq: ListSeq = { next: 0 }
+
       for (let i = 0; i < total; i++) {
         const extracted = extractedPages[i]!
         const dropSet = furniture.drop[i]!
         if (dropSet.size > 0) extracted.chars = extracted.chars.filter((c) => !dropSet.has(c))
-        let page = analyzePage(extracted, { absoluteLayout: opts.absoluteLayout === true })
+        let page = analyzePage(extracted, {
+          absoluteLayout: opts.absoluteLayout === true,
+          listSeq,
+        })
         let graphicsUnderlay = false
 
         // scanned page + an OCR engine: try to recover editable text; every
@@ -356,7 +365,7 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
         if (page.scanned && opts.ocr) {
           const hiRender =
             renderPageByIndexPng(m, doc, i, Math.max(opts.renderScale ?? 2, 3)) ?? undefined
-          const recovered = tryOcrScannedPage(extracted, opts.ocr, hiRender)
+          const recovered = tryOcrScannedPage(extracted, opts.ocr, hiRender, listSeq)
           if (recovered) {
             page = recovered.page
             ocrConfidence = recovered.confidence

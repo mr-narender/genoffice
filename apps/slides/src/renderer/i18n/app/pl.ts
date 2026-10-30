@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const pl = {
+  redactMenuLabel: 'Ukryj zaznaczenie przed AI',
+  redactDialogDesc:
+    'Zaznaczona zawartość zostaje w dokumencie i w pliku; model widzi tylko symbol. Nadaj mu nazwę, by wiedział, co oznacza.',
+  redactDialogScope:
+    'Ukrywanie dotyczy tylko AI w tej aplikacji. CLI, narzędzia MCP i eksport bez okienka czytują plik bezpośrednio i nadal widzą te słowa.',
+  redactDialogPlaceholder: 'Nazwa symbolu, np. telefon klienta',
+  redactCancel: 'Anuluj',
+  redactInsert: 'Ukryj',
+  redactEnable: 'Kliknij prawym na zaznaczeniu, aby ukryć je przed modelem.',
+
   appPhPromptTitle: 'Kliknij, aby dodać tytuł',
   appPhPromptSubtitle: 'Kliknij, aby dodać podtytuł',
   appPhPromptBody: 'Kliknij, aby dodać tekst',
@@ -56,7 +66,8 @@ export const pl = {
     'Wstawiono wideo (osadzone w pliku .pptx; można je odtwarzać w programie PowerPoint)',
   appStatusAudioInserted: 'Wstawiono dźwięk (osadzony w pliku .pptx)',
   appStatusModel3dInserted:
-    'Osadzono model 3D (na kanwie widoczny jest symbol zastępczy; plik modelu jest zapisany w pliku .pptx)',
+    'Wstawiono model 3D: zaznacz go, aby go obrócić (PowerPoint także pokazuje go w 3D)',
+  appStatusModel3dNoPreview: 'Nie można tutaj narysować modelu 3D; jego obraz pozostaje bez zmian',
   appStatusRecordingEmpty: 'Nagranie jest puste; niczego nie wstawiono',
   appStatusRecordingInserted: 'Wstawiono nagranie ekranu na bieżący slajd (osadzony plik webm)',
   appStatusRecording:
@@ -217,6 +228,8 @@ export const pl = {
   appMasterFillNone: 'Brak wypełnienia',
   appMasterStroke: 'Kolor konturu…',
   appMasterStrokeNone: 'Brak konturu',
+  appMasterInsertTextBox: 'Pole tekstowe',
+  appMasterInsertShape: 'Kształty',
   appStartOpening: 'Otwieranie…',
   appReadingSlideTitle:
     'Kliknij, aby przejść do następnego slajdu (Esc, aby wyjść z widoku do czytania)',
@@ -245,6 +258,13 @@ export const pl = {
     'Łączny czas pokazu wyniósł {duration}. Czy zapisać czasy wyświetlania slajdów do automatycznego przełączania?',
   appRehearseDiscard: 'Nie zapisuj',
   appRehearseSave: 'Zapisz',
+  appRecordTitle: 'Nagraj narrację',
+  appRecordSummary: 'Czas nagrania: {duration}. Zapisać narrację i czas każdego slajdu?',
+  appRecordDiscard: 'Nie zapisuj',
+  appRecordSave: 'Zapisz',
+  appStatusRecordSaved: 'Zapisano narrację na slajdach: {count} (odtwarza ją także PowerPoint)',
+  appStatusRecordFailed: 'Nie udało się zapisać nagrania',
+  appStatusNarrationCleared: 'Wyczyszczono narrację',
   appSettingsTitle: 'Ustawienia AI',
   appSettingsAccount: 'Konto Genspark',
   appSettingsChecking: 'Sprawdzanie…',

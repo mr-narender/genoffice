@@ -1,5 +1,15 @@
 /** app strings, zh: defines the key set every other locale shard must match. */
 export const zh = {
+  redactMenuLabel: '把选中的内容对 AI 隐藏',
+  redactDialogDesc:
+    '选中的内容会留在文档和文件里，AI 读到的却是下面的标记。给它起个名字，AI 才知道它是什么。',
+  redactDialogScope:
+    '这只针对本应用的 AI。命令行、MCP 工具和无界面导出会直接读取文件，仍然看得到这些文字。',
+  redactDialogPlaceholder: '占位名称，例如：客户电话',
+  redactCancel: '取消',
+  redactInsert: '隐藏',
+  redactEnable: '选中文字后右键，即可对 AI 隐藏。',
+
   appPhPromptTitle: '单击此处添加标题',
   appPhPromptSubtitle: '单击此处添加副标题',
   appPhPromptBody: '单击此处添加文本',
@@ -46,7 +56,8 @@ export const zh = {
   appStatusEquationInserted: '已插入公式',
   appStatusVideoInserted: '已插入视频（已嵌入 pptx，PowerPoint 中可播放）',
   appStatusAudioInserted: '已插入音频（已嵌入 pptx）',
-  appStatusModel3dInserted: '已嵌入 3D 模型（画布显示占位图，模型文件已存入 pptx）',
+  appStatusModel3dInserted: '已插入 3D 模型：选中后可旋转（在 PowerPoint 中同样以 3D 显示）',
+  appStatusModel3dNoPreview: '无法在此绘制 3D 模型，其图片保持不变',
   appStatusRecordingEmpty: '录制内容为空，未插入',
   appStatusRecordingInserted: '已把屏幕录制插入当前页（webm 嵌入）',
   appStatusRecording: '屏幕录制中…再次点击「屏幕录制」停止并插入',
@@ -197,6 +208,8 @@ export const zh = {
   appMasterFillNone: '无填充',
   appMasterStroke: '边框颜色…',
   appMasterStrokeNone: '无边框',
+  appMasterInsertTextBox: '文本框',
+  appMasterInsertShape: '形状',
   appStartOpening: '正在打开…',
   appReadingSlideTitle: '单击翻到下一页（Esc 退出阅读视图）',
   appReadingPrev: '‹ 上一页',
@@ -221,6 +234,13 @@ export const zh = {
   appRehearseSummary: '本次放映总时长 {duration}。是否保存每页停留时间作为自动换片时间？',
   appRehearseDiscard: '不保存',
   appRehearseSave: '保存',
+  appRecordTitle: '录制旁白',
+  appRecordSummary: '录制总时长 {duration}。是否保存每页的旁白和停留时间？',
+  appRecordDiscard: '不保存',
+  appRecordSave: '保存',
+  appStatusRecordSaved: '已为 {count} 页保存旁白（PowerPoint 中同样可以播放）',
+  appStatusRecordFailed: '无法保存录制内容',
+  appStatusNarrationCleared: '已清除旁白',
   appSettingsTitle: 'AI 设置',
   appSettingsAccount: 'Genspark 账号',
   appSettingsChecking: '检测中…',

@@ -185,12 +185,125 @@ async function zipText(zip: JSZip, path: string): Promise<string | undefined> {
   return file ? file.async('text') : undefined
 }
 
+interface ZipPrefix {
+  text: string
+  truncated: boolean
+}
+
+/// What nodeStream() wraps; typed here because JSZip's d.ts leaves it out.
+interface JSZipStream {
+  on(event: 'data', cb: (chunk: Uint8Array) => void): JSZipStream
+  on(event: 'end', cb: () => void): JSZipStream
+  on(event: 'error', cb: (err: Error) => void): JSZipStream
+  pause(): void
+  resume(): void
+}
+
+/** Inflate only the first maxBytes of a part; a 232 MB sheet never becomes a string. */
+function zipTextPrefix(zip: JSZip, path: string, maxBytes: number): Promise<ZipPrefix | undefined> {
+  const file = zip.file(path)
+  if (!file) return Promise.resolve(undefined)
+  if (!Number.isFinite(maxBytes))
+    return file.async('text').then((text) => ({ text, truncated: false }))
+  return new Promise((resolve, reject) => {
+    const chunks: Uint8Array[] = []
+    let size = 0
+    let settled = false
+    const finish = (truncated: boolean): void => {
+      if (settled) return
+      settled = true
+      const buf = new Uint8Array(size)
+      let offset = 0
+      for (const chunk of chunks) {
+        buf.set(chunk, offset)
+        offset += chunk.length
+      }
+      resolve({ text: new TextDecoder().decode(buf), truncated })
+    }
+    const stream = (
+      file as unknown as { internalStream(type: 'uint8array'): JSZipStream }
+    ).internalStream('uint8array')
+    stream.on('data', (chunk: Uint8Array) => {
+      if (settled) return
+      chunks.push(chunk)
+      size += chunk.length
+      if (size >= maxBytes) {
+        stream.pause()
+        finish(true)
+      }
+    })
+    stream.on('end', () => finish(false))
+    stream.on('error', (err: Error) => {
+      if (!settled) {
+        settled = true
+        reject(err)
+      }
+    })
+    stream.resume()
+  })
+}
+
 /** Malformed refs (e.g. XXXXXX99) would otherwise grow the cells array by
  *  millions via the padding loop below. */
 export const MAX_XLSX_COLS = 16_384
 
+/** Longest run of empty slots kept verbatim between two filled cells. */
+const MAX_EMPTY_RUN = 8
+
+/// Empty slots carry no text: trailing ones are dropped and long inner runs
+/// collapse to a count, so a lone far-right cell (XFD) costs bytes, not ~49 KB
+/// of separators per row (measured 18 KB -> 94 MB before).
+function joinRowCells(cells: readonly string[]): string {
+  const out: string[] = []
+  let run = 0
+  for (const cell of cells) {
+    if (cell === '') {
+      run += 1
+      continue
+    }
+    if (run > MAX_EMPTY_RUN) out.push(`(${run} empty)`)
+    else for (; run > 0; run -= 1) out.push('')
+    run = 0
+    out.push(cell)
+  }
+  return out.join(' | ')
+}
+
+export interface XlsxTextOptions {
+  /// Sheet XML past this many extracted characters is not even parsed: the DOM
+  /// of a 100k-row sheet costs ~1 GB of heap for text nobody keeps (genoffice#2011).
+  maxChars?: number
+}
+
+const XML_BYTES_PER_TEXT_CHAR = 8
+const XML_CLIP_SLACK = 256 * 1024
+const EMPTY_SHEET_XML = '<worksheet><sheetData/></worksheet>'
+
+export function sheetXmlByteLimit(budgetChars: number): number {
+  return budgetChars * XML_BYTES_PER_TEXT_CHAR + XML_CLIP_SLACK
+}
+
+const ROW_END_RE = /<\/([\w.-]+:)?row>/g
+const SHEET_DATA_RE = /<([\w.-]+:)?sheetData[\s>]/
+
+/** Drop whole rows past the budget, keeping the document well-formed; a
+ *  truncated prefix is always cut back to its last complete row. */
+export function clipSheetXml(xml: string, budgetChars: number, truncated = false): string {
+  const limit = sheetXmlByteLimit(budgetChars)
+  if (!truncated && xml.length <= limit) return xml
+  const head = xml.slice(0, limit)
+  let last: RegExpExecArray | null = null
+  for (const m of head.matchAll(ROW_END_RE)) last = m
+  const dataAt = SHEET_DATA_RE.exec(head)?.index ?? -1
+  if (!last || dataAt < 0 || last.index < dataAt) return truncated ? EMPTY_SHEET_XML : xml
+  const ns = last[1] ?? ''
+  return `${head.slice(0, last.index + last[0].length)}</${ns}sheetData></${ns}worksheet>`
+}
+
 /** extract sheet text from an xlsx: one "# SheetName" section per sheet, cells joined with " | " */
-export async function xlsxToText(bytes: Uint8Array): Promise<string> {
+export async function xlsxToText(bytes: Uint8Array, opts: XlsxTextOptions = {}): Promise<string> {
+  const maxChars = opts.maxChars ?? Infinity
+  let used = 0
   // The declared-size pass below is advisory; this metered gate is the one that
   // holds when a part lies about its size (GH #759).
   await assertZipInflatesWithinLimits(bytes)
@@ -230,42 +343,52 @@ export async function xlsxToText(bytes: Uint8Array): Promise<string> {
   let sheetsWithData = 0
   let imageOnlySheets = 0
   for (const sheet of sheets) {
+    if (used >= maxChars) break
     const path = relTargets.get(relationshipId(sheet))
-    const sheetXml = path ? await zipText(zip, path) : undefined
-    if (!sheetXml) continue
+    const budget = maxChars - used
+    const raw = path ? await zipTextPrefix(zip, path, sheetXmlByteLimit(budget)) : undefined
+    if (!raw?.text) continue
+    const sheetXml =
+      maxChars === Infinity ? raw.text : clipSheetXml(raw.text, budget, raw.truncated)
     const worksheet = parser.parse(sheetXml) as Record<string, any>
     const lines: string[] = [`# ${String(sheet['@_name'] ?? '')}`]
+    let sheetChars = lines[0].length
     const rows = asArray(worksheet.worksheet?.sheetData?.row) as Array<Record<string, unknown>>
     let hasData = false
     const sharedFormulas: SharedFormulas = new Map()
     for (const row of rows) {
-      const cells: string[] = []
+      // Sparse by column; a slot holds several values only when refs collide.
+      const slots: string[][] = []
       for (const cell of asArray(row.c as Cell | Cell[])) {
         const text = cellText(cell, shared, dateStyles, date1904, sharedFormulas)
         const ref = cell['@_r']
         // A malformed ref (no leading column letters) yields -1; append in
-        // document order instead of writing cells[-1] which would drop text.
+        // document order instead of writing slots[-1] which would drop text.
         // Clamp wild columns (e.g. XXXXXX99) to append: padding millions of
         // empty cells would OOM on a hostile file.
-        const col = ref ? columnIndex(ref) : cells.length
-        // A ref landing on a slot an earlier ref-less or malformed cell was
-        // appended to would drop that value silently: push it right instead.
-        // An empty slot (unsorted but valid refs like C1,A1) is just taken.
-        if (col >= 0 && col < MAX_XLSX_COLS && col < cells.length && cells[col] !== '')
-          cells.splice(col, 0, '')
-        const target = col >= 0 && col < MAX_XLSX_COLS ? col : cells.length
-        while (cells.length < target) cells.push('')
-        cells[target] = text
+        const col = ref ? columnIndex(ref) : slots.length
+        const target = col >= 0 && col < MAX_XLSX_COLS ? col : slots.length
+        // A ref landing on a slot an earlier ref-less, malformed or duplicate
+        // cell took would drop that value silently: keep it right after the
+        // claimant instead (push here, read back in reverse when joining).
+        const slot = slots[target]
+        if (!slot) slots[target] = [text]
+        else if (slot[slot.length - 1] === '') slot[slot.length - 1] = text
+        else slot.push(text)
         if (text.trim()) hasData = true
       }
-      // Trailing empty slots carry no information (the leading cells and the
-      // gaps between real cells keep their column positions): one row with a
-      // lone far-right cell used to emit ~49 KB of separators, and rows like
-      // that multiplied into gigabytes of output from a few-KB file
-      // (measured: 18 KB / 2,000 rows -> 94 MB, 5,200x).
-      while (cells.length > 0 && cells[cells.length - 1] === '') cells.pop()
-      lines.push(cells.join(' | '))
+      const cells: string[] = []
+      for (let i = 0; i < slots.length; i++) {
+        const slot = slots[i]
+        if (!slot) cells.push('')
+        else for (let j = slot.length - 1; j >= 0; j--) cells.push(slot[j])
+      }
+      const line = joinRowCells(cells)
+      lines.push(line)
+      sheetChars += line.length + 1
+      if (used + sheetChars >= maxChars) break
     }
+    used += sheetChars
     if (hasData) sheetsWithData += 1
     else if (path && worksheet.worksheet?.drawing) {
       imageOnlySheets += 1

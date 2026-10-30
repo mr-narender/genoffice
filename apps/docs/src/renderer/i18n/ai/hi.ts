@@ -100,6 +100,11 @@ export const hi = {
     'परिवर्तन ट्रैकिंग चालू: AI के सामग्री बदलाव संशोधनों के रूप में चिह्नित होते हैं (सम्मिलन रेखांकित, विलोपन कटे हुए); समीक्षा में स्वीकारें या अस्वीकारें',
   aiTrackOffTitle:
     'परिवर्तन ट्रैकिंग बंद: AI के बदलाव तुरंत लागू होते हैं (संस्करण स्नैपशॉट से अब भी रोलबैक किया जा सकता है)',
+  aiRevisionBarTitle: 'संशोधन',
+  aiRevisionCount: '{count} लंबित परिवर्तन',
+  aiRevisionRejectAll: 'सभी अस्वीकारें',
+  aiRevisionAcceptAll: 'सभी स्वीकारें',
+  aiRevisionPara: 'अनुच्छेद {n}',
   aiTurnLimit:
     '(इस अनुरोध के लिए टूल कॉल की सीमा पूरी हो गई; ऊपर का उत्तर अब तक पूर्ण हुए चरणों पर आधारित है और अधूरा हो सकता है।)',
   aiStopped: '(रोका गया)',
@@ -111,6 +116,8 @@ export const hi = {
   aiUnknownError: 'अज्ञात त्रुटि',
   aiTimeoutError:
     'AI अनुरोध का समय समाप्त: नेटवर्क से कोई प्रतिक्रिया नहीं मिली, इसलिए रोक दिया गया। कनेक्शन जांचें और फिर से प्रयास करें',
+  aiRegionError:
+    'इस मॉडल का प्रदाता आपके वर्तमान क्षेत्र में सेवा नहीं देता — कोई दूसरा मॉडल चुनें या नेटवर्क बदलें',
   aiOverloadedError: 'AI सेवा अभी व्यस्त है — कृपया थोड़ी देर बाद फिर से प्रयास करें',
   aiNetworkError:
     'नेटवर्क समस्या: AI सेवा से कनेक्ट नहीं हो सका। कनेक्शन जांचें और फिर से प्रयास करें',
@@ -120,6 +127,9 @@ export const hi = {
   aiSumImageAttachment: 'चित्र अनुलग्नक {name}',
   aiSumRead: '{name} पढ़ें',
   aiSumReadAttachmentName: 'अनुलग्नक {name} पढ़ें',
+  aiSumSkillsList: 'इंस्टॉल किए गए स्किल सूचीबद्ध',
+  aiSumSkillRead: 'स्किल {name} पढ़ा गया',
+  aiSumRunCli: '{args} चलाया गया',
   aiSumWebSearch: 'वेब खोज',
   aiSumWebSearchDone: '"{query}" खोजा ({count} परिणाम)',
   aiSumImageSearch: 'चित्र खोज',
@@ -181,4 +191,19 @@ export const hi = {
   aiCmdImages: '{count} चित्र अपडेट किए गए',
   aiCmdToc: 'विषय-सूची सम्मिलित की गई ({count} प्रविष्टियाँ)',
   aiCmdSkipped: ' ({count} सुरक्षित ब्लॉक छोड़े गए)',
+  aiStarterMindMap: 'इस दस्तावेज़ का माइंड मैप बनाएँ',
+  aiMindMapBtn: 'AI माइंड मैप',
+  aiMindMapPrompt:
+    'इस दस्तावेज़ का माइंड मैप बनाएँ और मुख्य विषयों तथा प्रमुख अवधारणाओं को अनुभाग संरचना के अनुसार व्यवस्थित करें',
+  aiSumMindMap: 'माइंड मैप बनाएँ',
+  aiMindMapTitle: 'माइंड मैप',
+  aiMindMapNodes: '{count} नोड',
+  aiMindMapAskPrompt: 'इस दस्तावेज़ में «{label}» के बारे में बताएँ',
+  aiMindMapJump: 'उद्धृत अनुच्छेद पर जाएँ',
+  aiMindMapExport: 'PNG निर्यात करें',
+  aiMindMapExportSvg: 'SVG निर्यात करें',
+  aiMindMapInsert: 'दस्तावेज़ में डालें',
+  aiMindMapReset: 'दृश्य रीसेट करें',
+  aiMindMapExpand: 'शाखा खोलें',
+  aiMindMapCollapse: 'शाखा समेटें',
 } satisfies Record<keyof typeof zh, string>

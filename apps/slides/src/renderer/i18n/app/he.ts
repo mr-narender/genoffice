@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const he = {
+  redactMenuLabel: 'הסתרת הבחירה מהמודל',
+  redactDialogDesc:
+    'הבחירה נשארת במסמך ובקובץ; המודל רואה רק את הסימון. תן לו שם כדי שיהיה ברור מה הוא מייצג.',
+  redactDialogScope:
+    'ההסתרה חלה רק על המודל באפליקציה הזו. CLI, כלי MCP וייצוא ללא ממשק קוראים את הקובץ ישירות ועדיין רואים את המילות האלה.',
+  redactDialogPlaceholder: 'שם הסימון, לדוגמה: טלפון הלקוח',
+  redactCancel: 'ביטול',
+  redactInsert: 'הסתר',
+  redactEnable: 'לחיצה ימנית על טקסט נבחר מסתיר אותו מהמודל.',
+
   appPhPromptTitle: 'לחץ כדי להוסיף כותרת',
   appPhPromptSubtitle: 'לחץ כדי להוסיף כותרת משנה',
   appPhPromptBody: 'לחץ כדי להוסיף טקסט',
@@ -48,7 +58,8 @@ export const he = {
   appStatusVideoInserted: 'הווידאו נוסף (מוטבע בקובץ ‎.pptx; ניתן להפעלה ב-PowerPoint)',
   appStatusAudioInserted: 'השמע נוסף (מוטבע בקובץ ‎.pptx)',
   appStatusModel3dInserted:
-    'מודל תלת-ממד הוטבע (הבד מציג מציין מיקום; קובץ המודל נשמר בקובץ ‎.pptx)',
+    'המודל התלת-ממדי נוסף: בחר בו כדי לסובב אותו (גם PowerPoint מציג אותו בתלת-ממד)',
+  appStatusModel3dNoPreview: 'לא ניתן היה לצייר כאן את המודל התלת-ממדי; התמונה שלו לא השתנתה',
   appStatusRecordingEmpty: 'ההקלטה ריקה; לא נוסף דבר',
   appStatusRecordingInserted: 'הקלטת המסך נוספה לשקופית הנוכחית (webm מוטבע)',
   appStatusRecording: 'מקליט את המסך… לחץ שוב על "הקלטת מסך" כדי לעצור ולהוסיף',
@@ -203,6 +214,8 @@ export const he = {
   appMasterFillNone: 'ללא מילוי',
   appMasterStroke: 'צבע קו מתאר…',
   appMasterStrokeNone: 'ללא קו מתאר',
+  appMasterInsertTextBox: 'תיבת טקסט',
+  appMasterInsertShape: 'צורות',
   appStartOpening: 'פותח…',
   appReadingSlideTitle: 'לחץ כדי לעבור לשקופית הבאה (Esc ליציאה מתצוגת הקריאה)',
   appReadingPrev: '‹ הקודמת',
@@ -228,6 +241,13 @@ export const he = {
     'משך ההצגה הכולל היה {duration}. האם לשמור את תזמוני השקופיות למעבר אוטומטי בין שקופיות?',
   appRehearseDiscard: 'אל תשמור',
   appRehearseSave: 'שמור',
+  appRecordTitle: 'הקלטת קריינות',
+  appRecordSummary: 'משך ההקלטה {duration}. לשמור את הקריינות והתזמון של כל שקופית?',
+  appRecordDiscard: 'אל תשמור',
+  appRecordSave: 'שמור',
+  appStatusRecordSaved: 'הקריינות נשמרה ב-{count} שקופיות (גם PowerPoint משמיע אותה)',
+  appStatusRecordFailed: 'לא ניתן לשמור את ההקלטה',
+  appStatusNarrationCleared: 'הקריינות נוקתה',
   appSettingsTitle: 'הגדרות AI',
   appSettingsAccount: 'חשבון Genspark',
   appSettingsChecking: 'בודק…',

@@ -546,6 +546,47 @@ const ANCHOR_PIC = (posH: string, posV: string): string =>
 
 const hdr = (inner: string): string => HEADER_XML.replace(/<w:p>[\s\S]*<\/w:p>/, inner)
 
+describe('inline OLE object (w:object) in a header', () => {
+  const VML_NS =
+    ' xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"'
+  const hdr = (body: string): string =>
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"' +
+    ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"' +
+    VML_NS +
+    `>${body}</w:hdr>`
+  const OLE_RELS =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/>' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>' +
+    '</Relationships>'
+  const object = (shapeStyle: string) =>
+    '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:object w:dxaOrig="6707" w:dyaOrig="1040">' +
+    `<v:shape id="_x0000_i1025" type="#_x0000_t75"${shapeStyle}><v:imagedata r:id="rId1" o:title=""/></v:shape>` +
+    '<o:OLEObject Type="Embed" ProgID="MSDraw" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="rId2"/>' +
+    '</w:object></w:r></w:p>'
+
+  it('paints the preview picture in the strip like a VML picture', async () => {
+    const headerXml = hdr(object(' style="width:335.6pt;height:51.95pt"'))
+    const doc = await parseDocx(await buildHeaderLogoDocx(headerXml, OLE_RELS))
+    expect(doc.headerImages).toHaveLength(1)
+    const img = doc.headerImages![0]
+    expect(img.dataUrl.startsWith('data:image/png;base64,')).toBe(true)
+    expect(img.floating).toBeUndefined()
+    expect(img.align).toBe('center')
+    expect(img.widthPx).toBe(447)
+    expect(img.heightPx).toBe(69)
+  })
+
+  it('falls back to dxaOrig/dyaOrig when the shape has no style', async () => {
+    const doc = await parseDocx(await buildHeaderLogoDocx(hdr(object('')), OLE_RELS))
+    const img = doc.headerImages![0]
+    expect(img.widthPx).toBe(447)
+    expect(img.heightPx).toBe(69)
+  })
+})
+
 describe('anchored header/footer object bands (wp:positionH/V relativeFrom)', () => {
   it('keeps the margin bands as the offset/alignment origin', async () => {
     const xml = hdr(
@@ -618,5 +659,56 @@ describe('anchored header/footer object bands (wp:positionH/V relativeFrom)', ()
     )
     const doc = await parseDocx(await buildHeaderLogoDocx(xml))
     expect(doc.headerImages!.find((i) => i.floating)!.posXPx).toBe(616)
+  })
+})
+
+describe('inline picture sharing a header paragraph with text', () => {
+  const MIXED_XML = HEADER_XML.replace(
+    '<w:p><w:r><w:drawing>',
+    '<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="7074"/></w:tabs></w:pPr>' +
+      '<w:r><w:t>Brand</w:t></w:r><w:r><w:tab/></w:r><w:r><w:drawing>',
+  )
+
+  it('keeps the picture on its run after the tab instead of the part image list', async () => {
+    const doc = await parseDocx(await buildHeaderLogoDocx(MIXED_XML))
+    expect(doc.headerImages ?? []).toHaveLength(0)
+    const para = doc.headerParas![0]
+    expect(para.runs.map((r) => r.text)).toEqual(['Brand\t', ''])
+    const pic = para.runs[1].image!
+    expect(pic.dataUrl.startsWith('data:image/png;base64,')).toBe(true)
+    expect(pic.widthPx).toBe(40)
+    expect(pic.heightPx).toBe(20)
+    expect(pic.xml).toContain('<wp:inline')
+  })
+
+  it('leaves a picture-only paragraph on the part image list', async () => {
+    const doc = await parseDocx(await buildHeaderLogoDocx())
+    expect(doc.headerImages).toHaveLength(1)
+    expect(doc.headerParas!.every((p) => p.runs.every((r) => !r.image))).toBe(true)
+  })
+})
+
+describe('saving a header whose paragraph mixes text and an inline picture', () => {
+  const MIXED_XML = HEADER_XML.replace(
+    '<w:p><w:r><w:drawing>',
+    '<w:p><w:r><w:t>Brand</w:t></w:r><w:r><w:tab/></w:r><w:r><w:drawing>',
+  )
+
+  it('regenerates the paragraph once, picture included', async () => {
+    const parsed = await parseDocx(await buildHeaderLogoDocx(MIXED_XML))
+    const paras = parsed.headerParas!
+    const edited = paras.map((p, i) =>
+      i === 0 ? { ...p, runs: p.runs.map((r) => (r.text ? { ...r, text: 'Changed\t' } : r)) } : p,
+    )
+    const saved = await saveDocx(parsed, [{ kind: 'original', docxIndex: 0 }], {
+      header: { text: 'Changed', paras: edited },
+    })
+    const hdr = await (await JSZip.loadAsync(saved)).file('word/header1.xml')!.async('string')
+    expect(hdr.match(/<w:p[\s>]/g)).toHaveLength(2)
+    expect(hdr.match(/<w:drawing[\s>]/g)).toHaveLength(1)
+    expect(hdr).toContain('Changed')
+    expect(hdr).not.toContain('Brand')
+    expect(hdr.indexOf('Changed')).toBeLessThan(hdr.indexOf('<w:drawing'))
+    expect(hdr).toContain('Confidential')
   })
 })

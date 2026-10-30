@@ -203,6 +203,15 @@ const LABELS: Record<string, ContextMenuLabels> = {
     copyImage: 'Sao chép ảnh',
     saveImageAs: 'Lưu ảnh thành…',
   },
+  tr: {
+    cut: 'Kes',
+    copy: 'Kopyala',
+    paste: 'Yapıştır',
+    selectAll: 'Tümünü Seç',
+    viewImage: 'Görüntüyü Görüntüle',
+    copyImage: 'Görüntüyü Kopyala',
+    saveImageAs: 'Görüntüyü Farklı Kaydet…',
+  },
   'zh-TW': {
     cut: '剪下',
     copy: '複製',
@@ -214,8 +223,10 @@ const LABELS: Record<string, ContextMenuLabels> = {
   },
 }
 
+export const baseLang = (lang: string): string => lang.split('-')[0] ?? lang
+
 export function contextMenuLabels(lang: string): ContextMenuLabels {
-  return LABELS[lang] ?? EN
+  return LABELS[lang] ?? LABELS[baseLang(lang)] ?? EN
 }
 
 export type ContextMenuItem =

@@ -56,6 +56,7 @@ export const AI_MEDIA_PROVIDERS: AiMediaProviderMeta[] = [
     defaultImageModel: 'gpt-image-2',
     analysisProtocol: 'openai-chat',
     analysisModels: [
+      'gpt-6.1-terra',
       'gpt-6-sol',
       'gpt-6-luna',
       'gpt-5.6-sol',
@@ -84,6 +85,7 @@ export const AI_MEDIA_PROVIDERS: AiMediaProviderMeta[] = [
     defaultImageModel: 'gemini-3.1-flash-image',
     analysisProtocol: 'gemini',
     analysisModels: [
+      'gemini-4-argon',
       'gemini-3.8-flash',
       'gemini-3.7-flash',
       'gemini-3.1-pro-preview',
@@ -99,12 +101,17 @@ export const AI_MEDIA_PROVIDERS: AiMediaProviderMeta[] = [
     keyPlaceholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
     defaultBaseUrl: ARK_BASE_URL,
     imageProtocol: 'openai-images',
+    // per the Ark model list 2026-10-12: Seedream 5.0 split into a pro cut
+    // (layer split, interactive editing, 14-language text) and a flash cut
+    // (same feature set, cheaper and faster), so 5.0 is no longer one model.
+    // The 4.5 and 4.0 IDs are both flagged for retirement there and come out.
+    // 5-0-260128 stays — only its lite alias is on the way out.
     imageModels: [
+      'doubao-seedream-5-0-pro-260628',
+      'doubao-seedream-5-0-flash-260915',
       'doubao-seedream-5-0-260128',
-      'doubao-seedream-4-5-251128',
-      'doubao-seedream-4-0-250828',
     ],
-    defaultImageModel: 'doubao-seedream-5-0-260128',
+    defaultImageModel: 'doubao-seedream-5-0-pro-260628',
     analysisProtocol: 'openai-chat',
     analysisModels: ['doubao-seed-2-1-pro-260628', 'doubao-seed-2-1-turbo-260628'],
     defaultAnalysisModel: 'doubao-seed-2-1-pro-260628',
@@ -156,15 +163,16 @@ export const AI_MEDIA_PROVIDERS: AiMediaProviderMeta[] = [
     id: 'minimax',
     label: 'MiniMax',
     description:
-      'image-01 image generation (api.minimax.io; use api.minimaxi.com/v1 for the CN region)',
+      'Image generation; MiniMax-M3 reads images and video (use api.minimaxi.com/v1 for CN)',
     keyPlaceholder: 'eyJ...',
     defaultBaseUrl: MINIMAX_BASE_URL,
     imageProtocol: 'minimax',
     imageModels: ['image-01'],
     defaultImageModel: 'image-01',
-    analysisModels: [],
-    defaultAnalysisModel: '',
-    videoAnalysis: false,
+    analysisProtocol: 'openai-chat',
+    analysisModels: ['MiniMax-M3'],
+    defaultAnalysisModel: 'MiniMax-M3',
+    videoAnalysis: true,
   },
   {
     id: 'deepseek',

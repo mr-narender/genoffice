@@ -61,6 +61,46 @@ describe('readSections enumerates all sections', () => {
     expect(sections[1].firstBlockIndex).toBe(sections[0].lastBlockIndex + 1)
   })
 
+  it('fractional pgMar / pgSz / cols values round to whole twips instead of falling back', () => {
+    const settings = sectionSettingsFromXml(
+      '<w:sectPr><w:pgSz w:w="12240.4" w:h="15840.6"/>' +
+        '<w:pgMar w:top="686.39404296875" w:right="1344.12" w:bottom="769.61" w:left="1987.19970703125" w:header="708.5" w:footer="707.4" w:gutter="0"/>' +
+        '<w:cols w:num="3" w:space="0.5" w:equalWidth="0"><w:col w:w="2140.2" w:space="0"/><w:col w:w="2140.2" w:space="0"/><w:col w:w="2140.2"/></w:cols></w:sectPr>',
+    )
+    expect(settings.pageWidth).toBe(12240)
+    expect(settings.pageHeight).toBe(15841)
+    expect(settings.marginTop).toBe(686)
+    expect(settings.marginRight).toBe(1344)
+    expect(settings.marginBottom).toBe(770)
+    expect(settings.marginLeft).toBe(1987)
+    expect(settings.headerDist).toBe(709)
+    expect(settings.footerDist).toBe(707)
+    expect(settings.colSpace).toBe(1)
+    expect(settings.colWidths).toEqual([2140, 2140, 2140])
+  })
+
+  it('applySectionSettings rewrites fractional pgMar / cols attributes in place', () => {
+    const sectPr =
+      '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' +
+      '<w:pgMar w:top="686.39" w:right="1344.12" w:bottom="769.61" w:left="1987.2" w:header="708.5" w:footer="707.4" w:gutter="0"/>' +
+      '<w:cols w:num="2.0" w:space="425.6"/></w:sectPr>'
+    const settings = sectionSettingsFromXml(sectPr)
+    const out = applySectionSettings(sectPr, { ...settings, marginLeft: 1800, colSpace: 300 })
+    expect(out).toContain(
+      '<w:pgMar w:top="686" w:right="1344" w:bottom="770" w:left="1800" w:header="709" w:footer="707" w:gutter="0"/>',
+    )
+    expect(out).toContain('<w:cols w:num="2" w:space="300"/>')
+    expect(out.match(/w:space=/g)).toHaveLength(1)
+
+    const paired =
+      '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="708" w:footer="708" w:gutter="0"/>' +
+      '<w:cols w:num="3.0" w:space="0.4" w:equalWidth="0"><w:col w:w="2140.2" w:space="0"/><w:col w:w="2140.2" w:space="0"/><w:col w:w="2140.2"/></w:cols></w:sectPr>'
+    const kept = applySectionSettings(paired, sectionSettingsFromXml(paired))
+    expect(kept).toContain(
+      '<w:cols w:num="3" w:space="0" w:equalWidth="0"><w:col w:w="2140" w:space="0"/><w:col w:w="2140" w:space="0"/><w:col w:w="2140"/></w:cols>',
+    )
+  })
+
   it('negative pgMar top/bottom: absolute value, marked fixed, sign restored on save; gutter widens the left margin', () => {
     const sectPr =
       '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="-1530" w:right="1710" w:bottom="-1710" w:left="4003" w:header="720" w:footer="720" w:gutter="245"/></w:sectPr>'
@@ -275,7 +315,11 @@ describe('readSections enumerates all sections', () => {
       .map((b) => ({ kind: 'original', docxIndex: b.docxIndex! }))
     const saved = await saveDocx(parsed, visible, {
       sectionHf: [
-        { lastBlockIndex: sections[0].lastBlockIndex, kind: 'header', hf: { text: '第一节页眉' } },
+        {
+          lastBlockIndex: sections[0].lastBlockIndex,
+          kind: 'header',
+          hf: { text: '\u7b2c\u4e00\u8282\u9875\u7709' },
+        },
       ],
     })
     const zip = await (await import('jszip')).default.loadAsync(saved)
@@ -368,7 +412,11 @@ describe('sectionHf per-section headers/footers', () => {
 
     const saved = await saveDocx(parsed, visibleBlocks(parsed), {
       sectionHf: [
-        { lastBlockIndex: sections[0].lastBlockIndex, kind: 'header', hf: { text: '第一节页眉' } },
+        {
+          lastBlockIndex: sections[0].lastBlockIndex,
+          kind: 'header',
+          hf: { text: '\u7b2c\u4e00\u8282\u9875\u7709' },
+        },
       ],
     })
     const reparsed = await parseDocx(saved)
@@ -427,14 +475,14 @@ describe('sectionHf per-section headers/footers', () => {
     // reference read as absent and a second footerReference was written
     const FTR =
       '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-      '<w:p><w:r><w:t>旧页脚</w:t></w:r></w:p></w:ftr>'
+      '<w:p><w:r><w:t>\u65e7\u9875\u811a</w:t></w:r></w:p></w:ftr>'
     const bytes = await buildDocx({
       bodyXml:
-        P('第一节') +
+        P('\u7b2c\u4e00\u8282') +
         sectBreakPara({
           extra: '<w:footerReference w:type="default" r:id="rId61"></w:footerReference>',
         }) +
-        P('第二节'),
+        P('\u7b2c\u4e8c\u8282'),
       extraRels:
         '<Relationship Id="rId61" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>',
       extraParts: [
@@ -451,11 +499,15 @@ describe('sectionHf per-section headers/footers', () => {
 
     const saved = await saveDocx(parsed, visibleBlocks(parsed), {
       sectionHf: [
-        { lastBlockIndex: sections[0].lastBlockIndex, kind: 'footer', hf: { text: '新页脚' } },
+        {
+          lastBlockIndex: sections[0].lastBlockIndex,
+          kind: 'footer',
+          hf: { text: '\u65b0\u9875\u811a' },
+        },
       ],
     })
     const zip = await (await import('jszip')).default.loadAsync(saved)
-    expect(await zip.file('word/footer1.xml')!.async('string')).toContain('新页脚')
+    expect(await zip.file('word/footer1.xml')!.async('string')).toContain('\u65b0\u9875\u811a')
     expect(zip.file('word/footer2.xml')).toBeNull()
     const docXml = await zip.file('word/document.xml')!.async('string')
     expect(docXml.match(/<w:footerReference/g)).toHaveLength(1)
@@ -690,6 +742,22 @@ describe('column widths + section bidi (P3 pdf2docx support)', () => {
     expect(applySectionSettings(paired, parsed)).toContain(cols)
   })
 
+  it('vAlign and bidi are read from the empty element pair spelling', async () => {
+    const { sectionSettingsFromXml } = await import('../src/index')
+    // both flags were matched self-closing only, so a paired spelling was read as
+    // "not set": the page lost its vertical alignment and an RTL section came back LTR
+    const paired =
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+      '<w:bidi></w:bidi><w:vAlign w:val="center"></w:vAlign></w:sectPr>'
+    expect(sectionSettingsFromXml(paired)).toMatchObject({ vAlign: 'center', bidi: true })
+    // the self-closing spelling still reads, and w:bidiVisual is not w:bidi
+    const selfClosing =
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+      '<w:bidiVisual/><w:vAlign w:val="both"/></w:sectPr>'
+    expect(sectionSettingsFromXml(selfClosing)).toMatchObject({ vAlign: 'both' })
+    expect(sectionSettingsFromXml(selfClosing).bidi).toBeUndefined()
+  })
+
   it('undefined bidi leaves an existing w:bidi untouched; false removes it', async () => {
     const { sectionSettingsFromXml } = await import('../src/index')
     const withBidi = BASE.replace('</w:sectPr>', '<w:bidi/></w:sectPr>')
@@ -698,6 +766,15 @@ describe('column widths + section bidi (P3 pdf2docx support)', () => {
     expect(kept).toContain('<w:bidi/>')
     const removed = applySectionSettings(withBidi, { ...base, bidi: false })
     expect(removed).not.toContain('<w:bidi/>')
+  })
+
+  it('bidi: true over an explicit w:val="0" turns the section RTL', async () => {
+    const { sectionSettingsFromXml } = await import('../src/index')
+    const off = BASE.replace('</w:sectPr>', '<w:bidi w:val="0"/></w:sectPr>')
+    const base = sectionSettingsFromXml(BASE)
+    const out = applySectionSettings(off, { ...base, bidi: true })
+    expect(out.match(/<w:bidi/g)).toHaveLength(1)
+    expect(sectionSettingsFromXml(out).bidi).toBe(true)
   })
 
   it('NewImage posOffsetEmu positions a floating image numerically', async () => {
@@ -787,6 +864,38 @@ describe('sectPr tags written as empty element pairs', () => {
     expect(applyPageNumType(base, undefined, undefined)).not.toContain('pgNumType')
     expect(applySectionStartType(base, 'nextPage')).not.toContain('<w:type')
     expect(applyTitlePg(base, false)).not.toContain('titlePg')
+  })
+
+  it('section bidi round-trips a paired element once and honours an explicit w:val', async () => {
+    const { applySectionSettings, sectionSettingsFromXml } = await import('../src/index')
+    const base =
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+      '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>' +
+      '<w:cols w:space="425"/></w:sectPr>'
+
+    // the reader learned the pair but the writer still probed for <w:bidi/>, so
+    // re-applying parsed settings wrote a second w:bidi into the same sectPr
+    const paired = base.replace('</w:sectPr>', '<w:bidi></w:bidi></w:sectPr>')
+    const once = applySectionSettings(paired, { ...sectionSettingsFromXml(paired), bidi: true })
+    expect(once.match(/<w:bidi/g)).toHaveLength(1)
+    // and the off path has to take the pair with it, not only a self-closing tag
+    const off = applySectionSettings(paired, { ...sectionSettingsFromXml(paired), bidi: false })
+    expect(off).not.toContain('bidi')
+
+    // ST_OnOff: an explicit off value is off, whichever quote style wrote it
+    for (const tag of ['<w:bidi w:val="0"/>', "<w:bidi w:val='0'/>", '<w:bidi w:val="false"/>']) {
+      expect(
+        sectionSettingsFromXml(base.replace('</w:sectPr>', tag + '</w:sectPr>')).bidi,
+      ).toBeUndefined()
+    }
+    expect(
+      sectionSettingsFromXml(base.replace('</w:sectPr>', '<w:bidi w:val="1"/></w:sectPr>')).bidi,
+    ).toBe(true)
+
+    // w:vAlign is read off its start tag, so it follows the same quote rule
+    expect(
+      sectionSettingsFromXml(base.replace('</w:sectPr>', "<w:vAlign w:val='bottom'/></w:sectPr>")),
+    ).toMatchObject({ vAlign: 'bottom' })
   })
 })
 

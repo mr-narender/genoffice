@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const ru = {
+  redactMenuLabel: 'Скрыть выделение от ИИ',
+  redactDialogDesc:
+    'Выбранное остается в документе и в файле, а модель видит только метку. Дайте ей имя, чтобы было понятно, что она обозначает.',
+  redactDialogScope:
+    'Это касается только ИИ в этом приложении. CLI, инструменты MCP и экспорт без интерфейса читают файл напрямую и по-прежнему видят эти слова.',
+  redactDialogPlaceholder: 'Имя метки, напр. телефон клиента',
+  redactCancel: 'Отмена',
+  redactInsert: 'Скрыть',
+  redactEnable: 'Правый клик по выделению скрывает его от модели.',
+
   appPhPromptTitle: 'Щелкните, чтобы добавить заголовок',
   appPhPromptSubtitle: 'Щелкните, чтобы добавить подзаголовок',
   appPhPromptBody: 'Щелкните, чтобы добавить текст',
@@ -54,7 +64,8 @@ export const ru = {
   appStatusVideoInserted: 'Видео вставлено (внедрено в .pptx; воспроизводится в PowerPoint)',
   appStatusAudioInserted: 'Звук вставлен (внедрен в .pptx)',
   appStatusModel3dInserted:
-    'Трехмерная модель внедрена (на холсте отображается заполнитель; файл модели сохранен в .pptx)',
+    '3D-модель вставлена: выделите ее, чтобы повернуть (PowerPoint тоже показывает ее в 3D)',
+  appStatusModel3dNoPreview: 'Не удалось отрисовать 3D-модель здесь; ее изображение не изменилось',
   appStatusRecordingEmpty: 'Запись пуста; ничего не вставлено',
   appStatusRecordingInserted: 'Запись экрана вставлена на текущий слайд (внедрен webm)',
   appStatusRecording:
@@ -213,6 +224,8 @@ export const ru = {
   appMasterFillNone: 'Без заливки',
   appMasterStroke: 'Цвет контура…',
   appMasterStrokeNone: 'Без контура',
+  appMasterInsertTextBox: 'Надпись',
+  appMasterInsertShape: 'Фигуры',
   appStartOpening: 'Открытие…',
   appReadingSlideTitle:
     'Щелкните, чтобы перейти к следующему слайду (Esc — выйти из режима чтения)',
@@ -241,6 +254,15 @@ export const ru = {
     'Общая продолжительность показа: {duration}. Сохранить время показа слайдов для автоматической смены?',
   appRehearseDiscard: 'Не сохранять',
   appRehearseSave: 'Сохранить',
+  appRecordTitle: 'Записать речевое сопровождение',
+  appRecordSummary:
+    'Длительность записи: {duration}. Сохранить речевое сопровождение и время каждого слайда?',
+  appRecordDiscard: 'Не сохранять',
+  appRecordSave: 'Сохранить',
+  appStatusRecordSaved:
+    'Речевое сопровождение сохранено, слайдов: {count} (PowerPoint его тоже воспроизводит)',
+  appStatusRecordFailed: 'Не удалось сохранить запись',
+  appStatusNarrationCleared: 'Речевое сопровождение очищено',
   appSettingsTitle: 'Настройки ИИ',
   appSettingsAccount: 'Учетная запись Genspark',
   appSettingsChecking: 'Проверка…',

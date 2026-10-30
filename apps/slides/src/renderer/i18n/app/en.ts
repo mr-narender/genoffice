@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const en = {
+  redactMenuLabel: 'Hide the selection from AI',
+  redactDialogDesc:
+    'The selection stays in the document and in the file; the model sees the placeholder below instead. Name it so the model knows what it stands for.',
+  redactDialogScope:
+    "Hiding covers this app's AI. The CLI, MCP tools and headless export read the file directly, and they still see these words.",
+  redactDialogPlaceholder: 'Placeholder name, e.g. client phone',
+  redactCancel: 'Cancel',
+  redactInsert: 'Hide',
+  redactEnable: 'Right-click a selection to hide it from the model.',
+
   appPhPromptTitle: 'Click to add title',
   appPhPromptSubtitle: 'Click to add subtitle',
   appPhPromptBody: 'Click to add text',
@@ -50,7 +60,8 @@ export const en = {
   appStatusVideoInserted: 'Video inserted (embedded in the .pptx; plays in PowerPoint)',
   appStatusAudioInserted: 'Audio inserted (embedded in the .pptx)',
   appStatusModel3dInserted:
-    '3D model embedded (canvas shows a placeholder; the model file is stored in the .pptx)',
+    '3D model inserted: select it to turn it (PowerPoint shows it in 3D too)',
+  appStatusModel3dNoPreview: 'The 3D model could not be drawn here; its picture is unchanged',
   appStatusRecordingEmpty: 'Recording is empty; nothing was inserted',
   appStatusRecordingInserted: 'Screen recording inserted on the current slide (embedded webm)',
   appStatusRecording: 'Recording… click "Screen Recording" again to stop and insert',
@@ -208,6 +219,8 @@ export const en = {
   appMasterFillNone: 'No Fill',
   appMasterStroke: 'Outline Color…',
   appMasterStrokeNone: 'No Outline',
+  appMasterInsertTextBox: 'Text Box',
+  appMasterInsertShape: 'Shapes',
   appStartOpening: 'Opening…',
   appReadingSlideTitle: 'Click to go to the next slide (Esc to exit Reading View)',
   appReadingPrev: '‹ Previous',
@@ -234,6 +247,13 @@ export const en = {
     'The total time for the slide show was {duration}. Do you want to save the slide timings for automatic slide advance?',
   appRehearseDiscard: "Don't Save",
   appRehearseSave: 'Save',
+  appRecordTitle: 'Record Narration',
+  appRecordSummary: "Recording length {duration}. Save each slide's narration and timing?",
+  appRecordDiscard: "Don't Save",
+  appRecordSave: 'Save',
+  appStatusRecordSaved: 'Narration saved on {count} slides (PowerPoint plays it too)',
+  appStatusRecordFailed: 'The recording could not be saved',
+  appStatusNarrationCleared: 'Narration cleared',
   appSettingsTitle: 'AI Settings',
   appSettingsAccount: 'Genspark Account',
   appSettingsChecking: 'Checking…',

@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const fr = {
+  redactMenuLabel: 'Masquer la sélection à l’IA',
+  redactDialogDesc:
+    'La sélection reste dans le document et dans le fichier ; le modèle ne voit que le marqueur ci-dessous. Donnez-lui un nom pour qu’il sache ce qu’il désigne.',
+  redactDialogScope:
+    'Le masquage ne concerne que l’IA de cette application. La CLI, les outils MCP et l’exportation sans interface lisent le fichier directement et voient toujours ces mots.',
+  redactDialogPlaceholder: 'Nom du placeholder, ex. : téléphone du client',
+  redactCancel: 'Annuler',
+  redactInsert: 'Masquer',
+  redactEnable: 'Clic droit sur une sélection pour la masquer au modèle.',
+
   appPhPromptTitle: 'Cliquez pour ajouter un titre',
   appPhPromptSubtitle: 'Cliquez pour ajouter un sous-titre',
   appPhPromptBody: 'Cliquez pour ajouter du texte',
@@ -55,7 +65,8 @@ export const fr = {
   appStatusVideoInserted: 'Vidéo insérée (incorporée dans le .pptx ; lisible dans PowerPoint)',
   appStatusAudioInserted: 'Audio inséré (incorporé dans le .pptx)',
   appStatusModel3dInserted:
-    'Modèle 3D incorporé (le canevas affiche un espace réservé ; le fichier du modèle est stocké dans le .pptx)',
+    'Modèle 3D inséré : sélectionnez-le pour le faire pivoter (PowerPoint l’affiche aussi en 3D)',
+  appStatusModel3dNoPreview: 'Le modèle 3D n’a pas pu être dessiné ici ; son image reste inchangée',
   appStatusRecordingEmpty: 'L’enregistrement est vide ; rien n’a été inséré',
   appStatusRecordingInserted:
     'Enregistrement d’écran inséré dans la diapositive actuelle (webm incorporé)',
@@ -219,6 +230,8 @@ export const fr = {
   appMasterFillNone: 'Aucun remplissage',
   appMasterStroke: 'Couleur du contour…',
   appMasterStrokeNone: 'Aucun contour',
+  appMasterInsertTextBox: 'Zone de texte',
+  appMasterInsertShape: 'Formes',
   appStartOpening: 'Ouverture…',
   appReadingSlideTitle:
     'Cliquez pour passer à la diapositive suivante (Échap pour quitter le mode Lecture)',
@@ -247,6 +260,14 @@ export const fr = {
     'La durée totale du diaporama était de {duration}. Voulez-vous enregistrer le minutage des diapositives pour le défilement automatique ?',
   appRehearseDiscard: 'Ne pas enregistrer',
   appRehearseSave: 'Enregistrer',
+  appRecordTitle: 'Enregistrer la narration',
+  appRecordSummary:
+    'Durée de l’enregistrement : {duration}. Enregistrer la narration et le minutage de chaque diapositive ?',
+  appRecordDiscard: 'Ne pas enregistrer',
+  appRecordSave: 'Enregistrer',
+  appStatusRecordSaved: 'Narration enregistrée sur {count} diapositives (PowerPoint la lit aussi)',
+  appStatusRecordFailed: 'L’enregistrement n’a pas pu être sauvegardé',
+  appStatusNarrationCleared: 'Narration effacée',
   appSettingsTitle: 'Paramètres IA',
   appSettingsAccount: 'Compte Genspark',
   appSettingsChecking: 'Vérification…',

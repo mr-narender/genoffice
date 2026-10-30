@@ -1,12 +1,27 @@
 import type { zh } from './zh'
 
 export const hi = {
+  redactMenuLabel: 'चयन को AI से छिपाएँ',
+  redactDialogDesc:
+    'शब्द दस्तावेज़ और फ़ाइल में बने रहते हैं; मॉडल को केवल नीचे वाला प्लेसहोल्डर दिखता है। नाम दें ताकि उसे पता चले कि यह किसका स्थान है।',
+  redactDialogScope:
+    'यह छिपाना केवल इस ऐप के AI पर लागू होता है। CLI, MCP टूल और बिना इंटरफ़ेस वाला निर्यात फ़ाइल को सीधे पढ़ते हैं, इसलिए ये शब्द उन्हें अब भी दिखते हैं।',
+  redactDialogPlaceholder: 'प्लेसहोल्डर का नाम, जैसे ग्राहक का फ़ोन',
+  redactCancel: 'रद्द करें',
+  redactInsert: 'छिपाएँ',
+  diskChangedMsg: 'यह फ़ाइल किसी अन्य प्रोग्राम द्वारा बदली गई।',
+  diskConflictMsg: 'यह फ़ाइल डिस्क पर बदल गई है; सहेजने से वे बदलाव मिट जाएँगे।',
+  diskReload: 'फिर से लोड करें',
+  diskKeepMine: 'मेरा रखें',
+  diskOverwrite: 'फिर भी अधिलेखित करें',
+
   loading: 'लोड हो रहा है…',
   loadFailed: 'फ़ाइल नहीं खोली जा सकी',
   untitled: 'शीर्षकहीन',
   saveFailed: 'सहेजना विफल: {error}',
   saveFailedStatus: 'सहेजना विफल',
   exportFailed: 'निर्यात विफल',
+  printFailed: 'प्रिंट विफल: {error}',
   exportHtmlSkipped: 'निर्यात हो गया, लेकिन {count} संसाधन एम्बेड नहीं हो सके (जैसे {first})',
   viewPreview: 'पूर्वावलोकन',
   viewSplit: 'विभाजित',
@@ -54,6 +69,7 @@ export const hi = {
   openExternal: 'लिंक ब्राउज़र में खोला गया',
   save: 'सहेजें (⌘S)',
   saveAs: 'इस रूप में सहेजें…',
+  aiNameFile: 'AI से नाम दें…',
   ribbonCollapse: 'रिबन संक्षिप्त करें',
   ribbonExpand: 'रिबन विस्तृत करें',
   ribbonGroupInsert: 'सम्मिलित करें',
@@ -84,6 +100,7 @@ export const hi = {
   alignLeft: 'बाएँ संरेखित करें',
   alignCenter: 'केंद्र में',
   alignRight: 'दाएँ संरेखित करें',
+  alignJustify: 'जस्टिफ़ाई',
   fontSizeDec: 'फ़ॉन्ट आकार घटाएँ',
   fontSizeInc: 'फ़ॉन्ट आकार बढ़ाएँ',
   typography: 'टाइपोग्राफी',
@@ -120,6 +137,7 @@ export const hi = {
   insertImageUrl: 'URL से छवि…',
   insertConfirm: 'सम्मिलित करें',
   insertMore: 'और',
+  insertSkeleton: 'कंकाल सम्मिलित करें',
   insertTableSize: '{r}×{c} तालिका',
   insertTablePickSize: 'तालिका का आकार चुनें',
   insertPlaceholderTableHeader: 'शीर्षक {n}',

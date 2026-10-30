@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const id = {
+  redactMenuLabel: 'Sembunyikan pilihan dari AI',
+  redactDialogDesc:
+    'Konten yang dipilih tetap ada di dokumen dan berkas; model hanya melihat placeholder di bawah. Beri nama agar model tahu apa yang diwakili.',
+  redactDialogScope:
+    'Penyembunyian ini hanya berlaku untuk AI di aplikasi ini. CLI, alat MCP, dan ekspor tanpa antarmuka membaca berkas secara langsung, sehingga kata-kata ini tetap terlihat olehnya.',
+  redactDialogPlaceholder: 'Nama placeholder, mis. telepon pelanggan',
+  redactCancel: 'Batal',
+  redactInsert: 'Sembunyikan',
+  redactEnable: 'Klik kanan pada teks yang dipilih untuk menyembunyikannya dari model.',
+
   appPhPromptTitle: 'Klik untuk menambahkan judul',
   appPhPromptSubtitle: 'Klik untuk menambahkan subjudul',
   appPhPromptBody: 'Klik untuk menambahkan teks',
@@ -53,7 +63,8 @@ export const id = {
   appStatusVideoInserted: 'Video disisipkan (disematkan dalam .pptx; dapat diputar di PowerPoint)',
   appStatusAudioInserted: 'Audio disisipkan (disematkan dalam .pptx)',
   appStatusModel3dInserted:
-    'Model 3D disematkan (kanvas menampilkan placeholder; file model disimpan dalam .pptx)',
+    'Model 3D disisipkan: pilih untuk memutarnya (PowerPoint juga menampilkannya dalam 3D)',
+  appStatusModel3dNoPreview: 'Model 3D tidak dapat digambar di sini; gambarnya tidak berubah',
   appStatusRecordingEmpty: 'Rekaman kosong; tidak ada yang disisipkan',
   appStatusRecordingInserted: 'Rekaman layar disisipkan pada slide saat ini (webm disematkan)',
   appStatusRecording: 'Merekam… klik "Rekaman Layar" lagi untuk berhenti dan menyisipkan',
@@ -213,6 +224,8 @@ export const id = {
   appMasterFillNone: 'Tanpa isian',
   appMasterStroke: 'Warna garis luar…',
   appMasterStrokeNone: 'Tanpa garis luar',
+  appMasterInsertTextBox: 'Kotak Teks',
+  appMasterInsertShape: 'Bentuk',
   appStartOpening: 'Membuka…',
   appReadingSlideTitle: 'Klik untuk ke slide berikutnya (Esc untuk keluar dari Tampilan Baca)',
   appReadingPrev: '‹ Sebelumnya',
@@ -239,6 +252,13 @@ export const id = {
     'Total waktu peragaan slide adalah {duration}. Simpan waktu setiap slide untuk perpindahan slide otomatis?',
   appRehearseDiscard: 'Jangan Simpan',
   appRehearseSave: 'Simpan',
+  appRecordTitle: 'Rekam Narasi',
+  appRecordSummary: 'Durasi rekaman {duration}. Simpan narasi dan waktu setiap slide?',
+  appRecordDiscard: 'Jangan Simpan',
+  appRecordSave: 'Simpan',
+  appStatusRecordSaved: 'Narasi disimpan di {count} slide (PowerPoint juga memutarnya)',
+  appStatusRecordFailed: 'Rekaman tidak dapat disimpan',
+  appStatusNarrationCleared: 'Narasi dihapus',
   appSettingsTitle: 'Pengaturan AI',
   appSettingsAccount: 'Akun Genspark',
   appSettingsChecking: 'Memeriksa…',
