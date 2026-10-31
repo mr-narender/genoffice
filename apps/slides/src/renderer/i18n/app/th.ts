@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const th = {
+  redactMenuLabel: 'ซ่อนส่วนที่เลือกจาก AI',
+  redactDialogDesc:
+    'เนื้อหาที่เลือกยังอยู่ในเอกสารและไฟล์ แต่ AI จะเห็นเพียงตัวแทนด้านล่าง ตั้งชื่อเพื่อให้ AI รู้ว่าแทนอะไร',
+  redactDialogScope:
+    'การซ่อนครอบคลุมเฉพาะ AI ในแอปนี้ CLI เครื่องมือ MCP และการส่งออกแบบไม่มีหน้าต่างอ่านไฟล์โดยตรง และยังเห็นคำเหล่านี้อยู่',
+  redactDialogPlaceholder: 'ชื่อตัวแทน เช่น เบอร์โทรศัพท์ลูกค้า',
+  redactCancel: 'ยกเลิก',
+  redactInsert: 'ซ่อน',
+  redactEnable: 'คลิกขวาที่ข้อความที่เลือกเพื่อซ่อนจาก AI',
+
   appPhPromptTitle: 'คลิกเพื่อเพิ่มชื่อเรื่อง',
   appPhPromptSubtitle: 'คลิกเพื่อเพิ่มชื่อเรื่องรอง',
   appPhPromptBody: 'คลิกเพื่อเพิ่มข้อความ',
@@ -49,8 +59,8 @@ export const th = {
   appStatusEquationInserted: 'แทรกสมการแล้ว',
   appStatusVideoInserted: 'แทรกวิดีโอแล้ว (ฝังใน pptx เล่นได้ใน PowerPoint)',
   appStatusAudioInserted: 'แทรกเสียงแล้ว (ฝังใน pptx)',
-  appStatusModel3dInserted:
-    'ฝังโมเดล 3D แล้ว (พื้นที่วาดแสดงตัวแทนชั่วคราว ไฟล์โมเดลถูกเก็บไว้ใน pptx)',
+  appStatusModel3dInserted: 'แทรกโมเดล 3 มิติแล้ว: เลือกเพื่อหมุน (PowerPoint แสดงเป็น 3 มิติด้วย)',
+  appStatusModel3dNoPreview: 'ไม่สามารถวาดโมเดล 3 มิติที่นี่ได้ รูปภาพของโมเดลไม่เปลี่ยนแปลง',
   appStatusRecordingEmpty: 'การบันทึกว่างเปล่า จึงไม่มีการแทรก',
   appStatusRecordingInserted: 'แทรกการบันทึกหน้าจอลงในสไลด์ปัจจุบันแล้ว (ฝังเป็น webm)',
   appStatusRecording: 'กำลังบันทึกหน้าจอ… คลิก "บันทึกหน้าจอ" อีกครั้งเพื่อหยุดและแทรก',
@@ -205,6 +215,8 @@ export const th = {
   appMasterFillNone: 'ไม่เติมสี',
   appMasterStroke: 'สีเส้นกรอบ…',
   appMasterStrokeNone: 'ไม่มีเส้นกรอบ',
+  appMasterInsertTextBox: 'กล่องข้อความ',
+  appMasterInsertShape: 'รูปร่าง',
   appStartOpening: 'กำลังเปิด…',
   appReadingSlideTitle: 'คลิกเพื่อไปยังสไลด์ถัดไป (กด Esc เพื่อออกจากมุมมองการอ่าน)',
   appReadingPrev: '‹ ก่อนหน้า',
@@ -230,6 +242,13 @@ export const th = {
     'เวลารวมของการนำเสนอคือ {duration} ต้องการบันทึกเวลาของแต่ละสไลด์เพื่อใช้เปลี่ยนสไลด์อัตโนมัติหรือไม่',
   appRehearseDiscard: 'ไม่บันทึก',
   appRehearseSave: 'บันทึก',
+  appRecordTitle: 'บันทึกคำบรรยาย',
+  appRecordSummary: 'ความยาวการบันทึก {duration} ต้องการบันทึกคำบรรยายและเวลาของแต่ละสไลด์หรือไม่',
+  appRecordDiscard: 'ไม่บันทึก',
+  appRecordSave: 'บันทึก',
+  appStatusRecordSaved: 'บันทึกคำบรรยายใน {count} สไลด์แล้ว (PowerPoint เล่นได้เช่นกัน)',
+  appStatusRecordFailed: 'ไม่สามารถบันทึกการบันทึกเสียงได้',
+  appStatusNarrationCleared: 'ล้างคำบรรยายแล้ว',
   appSettingsTitle: 'การตั้งค่า AI',
   appSettingsAccount: 'บัญชี Genspark',
   appSettingsChecking: 'กำลังตรวจสอบ…',

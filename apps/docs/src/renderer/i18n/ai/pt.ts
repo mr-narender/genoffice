@@ -101,6 +101,11 @@ export const pt = {
     'Controle de alterações ativado: as edições de conteúdo da IA são marcadas como revisões (inserções sublinhadas, exclusões tachadas); aceite ou rejeite em Revisão',
   aiTrackOffTitle:
     'Controle de alterações desativado: as edições da IA são aplicadas imediatamente (ainda é possível reverter pelos instantâneos de versão)',
+  aiRevisionBarTitle: 'Revisões',
+  aiRevisionCount: '{count} alterações pendentes',
+  aiRevisionRejectAll: 'Rejeitar tudo',
+  aiRevisionAcceptAll: 'Aceitar tudo',
+  aiRevisionPara: 'Parágrafo {n}',
   aiTurnLimit:
     '(Limite de chamadas de ferramentas desta solicitação atingido; a resposta acima reflete as etapas concluídas até agora e pode estar incompleta.)',
   aiStopped: '(Interrompido)',
@@ -113,6 +118,8 @@ export const pt = {
   aiUnknownError: 'Erro desconhecido',
   aiTimeoutError:
     'A solicitação de IA expirou: sem resposta da rede, a execução foi interrompida. Verifique sua conexão e tente novamente',
+  aiRegionError:
+    'O fornecedor deste modelo não atende à sua região atual — escolha outro modelo ou mude de rede',
   aiOverloadedError:
     'O serviço de IA está sobrecarregado no momento — tente novamente em instantes',
   aiNetworkError:
@@ -123,6 +130,9 @@ export const pt = {
   aiSumImageAttachment: 'Imagem anexada {name}',
   aiSumRead: 'Ler {name}',
   aiSumReadAttachmentName: 'Ler anexo {name}',
+  aiSumSkillsList: 'Habilidades instaladas listadas',
+  aiSumSkillRead: 'Skill {name} lida',
+  aiSumRunCli: 'Executou {args}',
   aiSumWebSearch: 'Pesquisa na web',
   aiSumWebSearchDone: 'Pesquisou "{query}" ({count} resultados)',
   aiSumImageSearch: 'Pesquisa de imagens',
@@ -186,4 +196,19 @@ export const pt = {
   aiCmdImages: '{count} imagem(ns) atualizada(s)',
   aiCmdToc: 'Sumário inserido ({count} entradas)',
   aiCmdSkipped: ' ({count} bloco(s) protegido(s) ignorado(s))',
+  aiStarterMindMap: 'Gerar um mapa mental deste documento',
+  aiMindMapBtn: 'Mapa mental IA',
+  aiMindMapPrompt:
+    'Gere um mapa mental deste documento, organizando os temas principais e conceitos-chave pela estrutura de seções',
+  aiSumMindMap: 'Gerar mapa mental',
+  aiMindMapTitle: 'Mapa mental',
+  aiMindMapNodes: '{count} nós',
+  aiMindMapAskPrompt: 'Fale sobre "{label}" neste documento',
+  aiMindMapJump: 'Ir para o trecho citado',
+  aiMindMapExport: 'Exportar PNG',
+  aiMindMapExportSvg: 'Exportar SVG',
+  aiMindMapInsert: 'Inserir no documento',
+  aiMindMapReset: 'Redefinir visualização',
+  aiMindMapExpand: 'Expandir ramo',
+  aiMindMapCollapse: 'Recolher ramo',
 } satisfies Record<keyof typeof zh, string>

@@ -98,6 +98,11 @@ export const th = {
     'เปิดการติดตามการเปลี่ยนแปลง: การแก้ไขเนื้อหาของ AI จะถูกทำเครื่องหมายเป็นการเปลี่ยนแปลง (แทรกขีดเส้นใต้ ลบขีดทับ) ยอมรับหรือปฏิเสธได้ในรีวิว',
   aiTrackOffTitle:
     'ปิดการติดตามการเปลี่ยนแปลง: การแก้ไขของ AI มีผลทันที (ยังย้อนกลับได้ผ่านสแนปช็อตของเวอร์ชัน)',
+  aiRevisionBarTitle: 'การแก้ไข',
+  aiRevisionCount: 'การเปลี่ยนแปลง {count} รายการ',
+  aiRevisionRejectAll: 'ปฏิเสธทั้งหมด',
+  aiRevisionAcceptAll: 'ยอมรับทั้งหมด',
+  aiRevisionPara: 'ย่อหน้า {n}',
   aiTurnLimit:
     '(ถึงขีดจำกัดรอบการเรียกเครื่องมือของคำขอนี้แล้ว คำตอบด้านบนอิงจากขั้นตอนที่เสร็จสิ้นแล้ว อาจไม่สมบูรณ์)',
   aiStopped: '(หยุดแล้ว)',
@@ -109,6 +114,8 @@ export const th = {
   aiUnknownError: 'ข้อผิดพลาดที่ไม่รู้จัก',
   aiTimeoutError:
     'คำขอ AI หมดเวลา: เครือข่ายไม่ตอบสนอง จึงหยุดการทำงาน โปรดตรวจสอบการเชื่อมต่อแล้วลองใหม่',
+  aiRegionError:
+    'ผู้ให้บริการของโมเดลนี้ไม่ให้บริการในภูมิภาคปัจจุบันของคุณ — โปรดเลือกโมเดลอื่นหรือเปลี่ยนเครือข่าย',
   aiOverloadedError: 'บริการ AI มีผู้ใช้งานจำนวนมากในขณะนี้ โปรดลองอีกครั้งในอีกสักครู่',
   aiNetworkError:
     'เครือข่ายมีปัญหา ไม่สามารถเชื่อมต่อบริการ AI ได้ โปรดตรวจสอบการเชื่อมต่อแล้วลองใหม่',
@@ -118,6 +125,9 @@ export const th = {
   aiSumImageAttachment: 'รูปภาพแนบ {name}',
   aiSumRead: 'อ่าน {name}',
   aiSumReadAttachmentName: 'อ่านสิ่งที่แนบ {name}',
+  aiSumSkillsList: 'รายการสกิลที่ติดตั้ง',
+  aiSumSkillRead: 'อ่านสกิล {name}',
+  aiSumRunCli: 'รัน {args} แล้ว',
   aiSumWebSearch: 'ค้นหาเว็บ',
   aiSumWebSearchDone: 'ค้นหา "{query}" ({count} รายการ)',
   aiSumImageSearch: 'ค้นหารูปภาพ',
@@ -179,4 +189,19 @@ export const th = {
   aiCmdImages: 'อัปเดตรูปภาพ {count} รูปแล้ว',
   aiCmdToc: 'แทรกสารบัญแล้ว ({count} รายการ)',
   aiCmdSkipped: ' (ข้ามบล็อกที่ได้รับการป้องกัน {count} บล็อก)',
+  aiStarterMindMap: 'สร้างแผนที่ความคิดของเอกสารนี้',
+  aiMindMapBtn: 'แผนที่ความคิด AI',
+  aiMindMapPrompt:
+    'สร้างแผนที่ความคิดของเอกสารนี้ โดยจัดเรียงหัวข้อหลักและแนวคิดสำคัญตามโครงสร้างส่วนต่างๆ',
+  aiSumMindMap: 'สร้างแผนที่ความคิด',
+  aiMindMapTitle: 'แผนที่ความคิด',
+  aiMindMapNodes: '{count} โหนด',
+  aiMindMapAskPrompt: 'บอกฉันเกี่ยวกับ「{label}」ในเอกสารนี้',
+  aiMindMapJump: 'ไปยังย่อหน้าที่อ้างอิง',
+  aiMindMapExport: 'ส่งออก PNG',
+  aiMindMapExportSvg: 'ส่งออก SVG',
+  aiMindMapInsert: 'แทรกลงในเอกสาร',
+  aiMindMapReset: 'รีเซ็ตมุมมอง',
+  aiMindMapExpand: 'ขยายสาขา',
+  aiMindMapCollapse: 'ย่อสาขา',
 } satisfies Record<keyof typeof zh, string>

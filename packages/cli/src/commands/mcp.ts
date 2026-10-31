@@ -10,7 +10,7 @@ import {
   writeMcpEntry,
   type McpEntryState,
 } from '../agent-mcp'
-import { agentTarget, detectAgents, type AgentId } from '../agent-skills'
+import { agentLabel, agentPresent, type AgentId } from '../agent-skills'
 import { flagBool, flagString } from '../args'
 import type { CommandContext, CommandDef } from '../registry'
 import { CliError, EXIT, type Warning } from '../result'
@@ -140,13 +140,23 @@ async function serve(args: Parameters<CommandDef['run']>[0], ctx: CommandContext
       { reason: 'invalid_argument' },
     )
   }
+  const hostFlag = flagString(args, 'host')
+  // an empty host skips the loopback default and binds every interface
+  if (hostFlag !== undefined && hostFlag.trim() === '') {
+    throw new CliError(
+      EXIT.usage,
+      '--host needs a non-empty value (omit the flag to bind 127.0.0.1)',
+      undefined,
+      { reason: 'invalid_argument' },
+    )
+  }
   const { serveHttp } = await import('../mcp/http')
   await serveHttp({
     cwd: ctx.cwd,
     env: ctx.env,
     log: ctx.log,
     port,
-    host: flagString(args, 'host'),
+    host: hostFlag,
     token: tokenFlag ?? (ctx.env.GENOFFICE_MCP_TOKEN?.trim() || undefined),
     compactSchemas,
   })
@@ -204,7 +214,7 @@ function row(t: Target, state: McpEntryState): AgentRow {
 
 function list(ctx: CommandContext) {
   const { launcher: bin, launch } = launcher()
-  const detected = new Set(detectAgents(ctx.env, home(ctx.env)).map((a) => a.id))
+  const detected = mcpDetected(ctx)
   const agents = mcpAgentIds().map((id) => {
     const t = target(id, undefined, detected, ctx)
     const state = readMcpEntry(id, t.file, launch)
@@ -230,10 +240,16 @@ function target(
   const opts = { env: ctx.env, home: home(ctx.env), ...(dir ? { dir: resolve(ctx.cwd, dir) } : {}) }
   return {
     id,
-    label: agentTarget(id, ctx.env, home(ctx.env))!.label,
+    label: agentLabel(id),
     file: mcpConfigFile(id, opts)!,
     detected: dir !== undefined || detected.has(id),
   }
+}
+
+/** MCP detection is its own table: an agent counts when its dotfolder exists, whether or not it installs a skill row. */
+function mcpDetected(ctx: CommandContext): Set<AgentId> {
+  const env = ctx.env
+  return new Set(mcpAgentIds().filter((id) => agentPresent(id, env, home(env))))
 }
 
 function edit(
@@ -269,7 +285,7 @@ function edit(
     )
   }
   const { launcher: bin, launch } = launcher()
-  const detected = new Set(detectAgents(ctx.env, home(ctx.env)).map((a) => a.id))
+  const detected = mcpDetected(ctx)
   const targets = (name === 'all' ? ids : [name as AgentId]).map((id) =>
     target(id, dir, detected, ctx),
   )

@@ -1,12 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type DragEvent,
-  type PointerEvent as ReactPointerEvent,
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import type { Editor } from '@tiptap/core'
 import type { Node as PmNode } from '@tiptap/pm/model'
 import { TextSelection, type Transaction } from '@tiptap/pm/state'
@@ -40,6 +32,7 @@ import {
 import { useI18n } from '../i18n/locale'
 import { NavPageThumbs } from './NavPageThumbs'
 import { IconClose, IconSearch } from './icons'
+import { usePaneWidth } from './pane-width'
 
 export type NavTab = 'headings' | 'pages' | 'results'
 
@@ -51,11 +44,15 @@ interface NavSession {
   query: string
 }
 
+/** mirror the document-scoped half that outlives the document (see NavPrefs) */
+const persistSession = (s: NavSession): void => writePrefs({ tab: s.tab, maxLevel: s.maxLevel })
+
 const sessions = new WeakMap<Editor, NavSession>()
 const sessionOf = (editor: Editor): NavSession => {
   let s = sessions.get(editor)
   if (!s) {
-    s = { tab: 'headings', collapsed: new Set(), maxLevel: MAX_HEADING_LEVEL, query: '' }
+    const prefs = readPrefs()
+    s = { tab: prefs.tab, collapsed: new Set(), maxLevel: prefs.maxLevel, query: '' }
     sessions.set(editor, s)
   }
   return s
@@ -68,9 +65,62 @@ const DEFAULT_WIDTH = 232
 const SCAN_DEBOUNCE_MS = 150
 const SEARCH_OPTIONS: FindOptions = { matchCase: false, wholeWord: false, mode: 'literal' }
 
-const readWidth = (): number => {
-  const n = Number(localStorage.getItem(WIDTH_KEY))
-  return n >= MIN_WIDTH && n <= MAX_WIDTH ? n : DEFAULT_WIDTH
+/**
+ * Pane preferences that outlive the document: which sub-view was last used and
+ * how deep the outline was opened. These seed a NEW editor's session, so
+ * reopening the app lands where you left off instead of resetting to a blank
+ * outline.
+ *
+ * The search query is deliberately NOT here. It would seed every new session, so
+ * opening any other document would land on the Results tab already running the
+ * previous document's search — Word never carries a search string into another
+ * document. For the same reason a stored 'results' reads back as 'headings': a
+ * tab with no query is an empty view.
+ *
+ * The collapsed set is deliberately not here either — it is keyed by heading
+ * text, so another document's folds mean nothing in this one. It stays in the
+ * per-editor session, which already survives closing and reopening the pane.
+ */
+const PREFS_KEY = 'aidocs.navPrefs'
+/** a stored Results tab is meaningless without its query, so it reads back as Headings */
+const PERSISTED_TABS: readonly NavTab[] = ['headings', 'pages']
+
+interface NavPrefs {
+  tab: NavTab
+  maxLevel: number
+}
+
+const readPrefs = (): NavPrefs => {
+  const fallback: NavPrefs = { tab: 'headings', maxLevel: MAX_HEADING_LEVEL }
+  // one guard for both failure modes: storage unavailable (private mode) and a
+  // value that is missing, hand-edited or truncated — none of which may break
+  // the pane
+  try {
+    const raw = localStorage.getItem(PREFS_KEY)
+    if (!raw) return fallback
+    const parsed = JSON.parse(raw) as Partial<NavPrefs>
+    const level = Number(parsed.maxLevel)
+    return {
+      tab: PERSISTED_TABS.includes(parsed.tab as NavTab) ? (parsed.tab as NavTab) : fallback.tab,
+      maxLevel:
+        Number.isInteger(level) && level >= 1 && level <= MAX_HEADING_LEVEL
+          ? level
+          : fallback.maxLevel,
+    }
+  } catch {
+    return fallback
+  }
+}
+
+/** exported for tests: the parsing/validation is the part that must not throw */
+export const readNavPrefs = readPrefs
+
+const writePrefs = (prefs: NavPrefs): void => {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    // quota or storage disabled: the pane still works, it just will not remember
+  }
 }
 
 interface MenuState {
@@ -106,7 +156,7 @@ export function NavPane({
   const [matches, setMatches] = useState<FindMatch[]>([])
   const [index, setIndex] = useState(0)
   const [scanning, setScanning] = useState(false)
-  const [width, setWidth] = useState(readWidth)
+  const { width, onResizeStart } = usePaneWidth(WIDTH_KEY, DEFAULT_WIDTH, MIN_WIDTH, MAX_WIDTH)
   const [caret, setCaret] = useState(() => editor.state.selection.from)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [drag, setDrag] = useState<{ index: number; where: 'before' | 'after' } | null>(null)
@@ -125,12 +175,14 @@ export function NavPane({
   const setTab = useCallback(
     (next: NavTab) => {
       session.tab = next
+      persistSession(session)
       setTabState(next)
     },
     [session],
   )
   const setMaxLevel = (n: number) => {
     session.maxLevel = n
+    persistSession(session)
     setMaxLevelState(n)
   }
   const toggleCollapsed = (ref: HeadingRef) => {
@@ -300,6 +352,7 @@ export function NavPane({
       setTab('results')
     } else if (query && !q) setTab(preSearchTabRef.current)
     session.query = q
+    persistSession(session)
     setQuery(q)
     scheduleRefresh(q, 'reset')
   }
@@ -403,25 +456,6 @@ export function NavPane({
   }
 
   // ---- resize ----
-  const onResizeStart = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const startX = e.clientX
-    const startW = width
-    const el = e.currentTarget
-    el.setPointerCapture(e.pointerId)
-    let next = startW
-    const move = (ev: PointerEvent) => {
-      next = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startW + ev.clientX - startX))
-      setWidth(next)
-    }
-    const up = () => {
-      el.removeEventListener('pointermove', move)
-      el.removeEventListener('pointerup', up)
-      localStorage.setItem(WIDTH_KEY, String(next))
-    }
-    el.addEventListener('pointermove', move)
-    el.addEventListener('pointerup', up)
-  }
-
   const [layoutVersion, setLayoutVersion] = useState(0)
   useEffect(() => setLayoutVersion((v) => v + 1), [doc, pageInfo.total])
 

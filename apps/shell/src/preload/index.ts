@@ -8,6 +8,7 @@ import {
 } from '@genoffice/ai-provider/browser'
 import type { AiSettings, CodexModelCatalog } from '@genoffice/ai-provider/browser'
 import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
+import type { UpdateUiState } from '../shared/update-api'
 import { normalizeAiPanelPrefs } from '@genoffice/ui/ai-panel-prefs'
 import type {
   AccountLoginEvent,
@@ -17,6 +18,7 @@ import type {
   FolderListing,
   FolderRoot,
   MoveResult,
+  AuthorNameSetting,
   HomeApi,
   RecentEntry,
   RecentPage,
@@ -26,13 +28,16 @@ import type {
   FileSearchRerank,
   FileSearchSettings,
 } from '../shared/home-api'
+import type { ProjectApi } from '@genoffice/project-store'
 import { HOME_CHANNELS } from '../shared/home-api'
 import { INTEGRATIONS_CHANNELS } from '../shared/integrations-api'
 import type {
   IntegrationsApi,
   IntegrationsStatus,
+  LegacySweepResult,
   SkillInstallState,
 } from '../shared/integrations-api'
+import type { FoundSkill, RecommendedSkill } from '../shared/found-skill'
 import type { TabsApi, TabSummary } from '../shared/tabs-api'
 import { TABS_CHANNELS } from '../shared/tabs-api'
 
@@ -58,6 +63,7 @@ const UI_LANGUAGES: readonly UiLanguage[] = [
   'hi',
   'zh-TW',
   'vi',
+  'tr',
 ]
 
 function isUiLanguage(value: unknown): value is UiLanguage {
@@ -96,6 +102,20 @@ function normalizeDefaultAppStatus(result: unknown): DefaultAppStatus {
   }
 }
 
+function normalizeAuthorNameSetting(result: unknown): AuthorNameSetting {
+  const r = (result ?? {}) as Partial<AuthorNameSetting>
+  return {
+    value: typeof r.value === 'string' ? r.value : '',
+    fallback: typeof r.fallback === 'string' ? r.fallback : '',
+  }
+}
+
+// a Settings request (menu click, Cmd+,) can land before Home has subscribed
+const pendingOpenSettings: Array<{ section: string }> = []
+ipcRenderer.on(HOME_CHANNELS.openSettings, (_event, target: { section: string }) => {
+  if (ipcRenderer.listenerCount(HOME_CHANNELS.openSettings) === 1) pendingOpenSettings.push(target)
+})
+
 const homeApi: HomeApi = {
   async recents(query) {
     return asRecentPage(await ipcRenderer.invoke(HOME_CHANNELS.recents, query))
@@ -130,6 +150,13 @@ const homeApi: HomeApi = {
   async starred(query) {
     return asRecentPage(await ipcRenderer.invoke(HOME_CHANNELS.starred, query))
   },
+  async starredGroups() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.starredGroups)
+    return Array.isArray(result) ? result.filter((g): g is string => typeof g === 'string') : []
+  },
+  async setStarredGroup(paths, group) {
+    await ipcRenderer.invoke(HOME_CHANNELS.setStarredGroup, paths, group)
+  },
   async statPaths(paths) {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.statPaths, paths)
     return Array.isArray(result) ? (result as RecentEntry[]) : []
@@ -137,6 +164,70 @@ const homeApi: HomeApi = {
   async toggleStar(path) {
     if (typeof path !== 'string' || !path) throw new Error('Invalid path.')
     await ipcRenderer.invoke(HOME_CHANNELS.toggleStar, path)
+  },
+  async openHelp() {
+    await ipcRenderer.invoke(HOME_CHANNELS.openHelp)
+  },
+  // knowledge-base ask panel (handlers live in the shell main, same process
+  // that owns the index and the shared ai:stream registration)
+  async kbList() {
+    return ipcRenderer.invoke('kb:list')
+  },
+  async skillsList() {
+    return ipcRenderer.invoke('ai:skills-list')
+  },
+  async skillText(name) {
+    return ipcRenderer.invoke('ai:skill-text', name)
+  },
+  async openSkillsSettings() {
+    await ipcRenderer.invoke('ai:open-skills-settings')
+  },
+  async kbSearch(query) {
+    return ipcRenderer.invoke('kb:search', query)
+  },
+  async kbRead(path, offset) {
+    return ipcRenderer.invoke('kb:read', { path, offset })
+  },
+  async kbCreateDocument(request) {
+    return ipcRenderer.invoke('kb:create-document', request)
+  },
+  async kbCliContext(sessionId) {
+    return ipcRenderer.invoke('kb:cli-context', sessionId)
+  },
+  async kbRunCli(sessionId, request) {
+    return ipcRenderer.invoke('kb:run-cli', { sessionId, ...request })
+  },
+  async pickAttachments() {
+    return ipcRenderer.invoke('files:pick')
+  },
+  async addAttachmentPaths(paths) {
+    return ipcRenderer.invoke('files:add', paths)
+  },
+  async addPastedImage(data, ext) {
+    return ipcRenderer.invoke('files:add-pasted-image', data, ext)
+  },
+  async readAttachment(path, offset, maxChars) {
+    return ipcRenderer.invoke('files:read', path, offset, maxChars)
+  },
+  async readAttachmentImage(path) {
+    return ipcRenderer.invoke('files:read-image', path)
+  },
+  async aiGetSettings() {
+    return ipcRenderer.invoke('ai:get-settings')
+  },
+  async aiStream(request) {
+    await ipcRenderer.invoke('ai:stream', request)
+  },
+  async aiStreamCancel(requestId) {
+    await ipcRenderer.invoke('ai:stream-cancel', requestId)
+  },
+  onAiStream(handler) {
+    const listener = (_event: Electron.IpcRendererEvent, chunk: unknown) => handler(chunk as never)
+    ipcRenderer.on('ai:stream-chunk', listener)
+    return () => ipcRenderer.removeListener('ai:stream-chunk', listener)
+  },
+  async aiGskStatus() {
+    return ipcRenderer.invoke('ai:gsk-status')
   },
   async openPath(path) {
     if (typeof path !== 'string' || !path) throw new Error('Invalid path.')
@@ -165,6 +256,9 @@ const homeApi: HomeApi = {
   },
   async removeRecent(paths) {
     await ipcRenderer.invoke(HOME_CHANNELS.removeRecent, paths)
+  },
+  async unstarPaths(paths) {
+    await ipcRenderer.invoke(HOME_CHANNELS.unstarPaths, paths)
   },
   async revealPath(path) {
     if (typeof path !== 'string' || !path) throw new Error('Invalid path.')
@@ -247,6 +341,14 @@ const homeApi: HomeApi = {
     if (channel !== 'stable' && channel !== 'beta') throw new Error('Invalid update channel.')
     await ipcRenderer.invoke(HOME_CHANNELS.setUpdateChannel, channel)
   },
+  async getAutoUpdateCheck() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getAutoUpdateCheck)
+    return result !== false
+  },
+  async setAutoUpdateCheck(on) {
+    if (typeof on !== 'boolean') throw new Error('Invalid update check setting.')
+    await ipcRenderer.invoke(HOME_CHANNELS.setAutoUpdateCheck, on)
+  },
   async accountStatus() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.accountStatus)
     return (result ?? { loggedIn: false }) as AccountStatus
@@ -254,6 +356,12 @@ const homeApi: HomeApi = {
   async accountLogin() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.accountLogin)
     return result === true
+  },
+  onOpenSettings(handler) {
+    const listener = (_event: IpcRendererEvent, target: { section: string }) => handler(target)
+    ipcRenderer.on(HOME_CHANNELS.openSettings, listener)
+    for (const target of pendingOpenSettings.splice(0)) handler(target)
+    return () => ipcRenderer.removeListener(HOME_CHANNELS.openSettings, listener)
   },
   onAccountLogin(handler) {
     const listener = (_event: IpcRendererEvent, ev: AccountLoginEvent) => handler(ev)
@@ -269,6 +377,19 @@ const homeApi: HomeApi = {
   async getAppVersion() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getAppVersion)
     return typeof result === 'string' ? result : ''
+  },
+  async getUpdateState() {
+    const result: unknown = await ipcRenderer.invoke('update:get-state')
+    return (result as UpdateUiState | null) ?? null
+  },
+  async openUpdateDialog() {
+    const result: unknown = await ipcRenderer.invoke('update:open-for-update')
+    return result === true
+  },
+  onUpdateStateChanged(handler: (state: UpdateUiState) => void) {
+    const listener = (_e: IpcRendererEvent, state: UpdateUiState) => handler(state)
+    ipcRenderer.on('update:state-changed', listener)
+    return () => ipcRenderer.removeListener('update:state-changed', listener)
   },
   async onboardingSeen() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.onboardingSeen)
@@ -287,6 +408,15 @@ const homeApi: HomeApi = {
       throw new Error('Invalid theme.')
     await ipcRenderer.invoke(HOME_CHANNELS.setTheme, theme)
   },
+  async getDocumentTheme() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getDocumentTheme)
+    return result === 'dark' || result === 'light' ? result : 'follow'
+  },
+  async setDocumentTheme(theme) {
+    if (theme !== 'light' && theme !== 'dark' && theme !== 'follow')
+      throw new Error('Invalid document theme.')
+    await ipcRenderer.invoke(HOME_CHANNELS.setDocumentTheme, theme)
+  },
   async getAutoSaveDefault() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getAutoSaveDefault)
     const r = result as { on?: unknown; updatedAt?: unknown } | null
@@ -294,6 +424,22 @@ const homeApi: HomeApi = {
       on: r?.on === true,
       updatedAt: typeof r?.updatedAt === 'number' ? r.updatedAt : 0,
     }
+  },
+  async getTabSleepEnabled() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getTabSleepEnabled)
+    return result !== false
+  },
+  async setTabSleepEnabled(on) {
+    if (typeof on !== 'boolean') throw new Error('Invalid tab sleep setting.')
+    await ipcRenderer.invoke(HOME_CHANNELS.setTabSleepEnabled, on)
+  },
+  async getRestoreLastSession() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getRestoreLastSession)
+    return result === true
+  },
+  async setRestoreLastSession(on) {
+    if (typeof on !== 'boolean') throw new Error('Invalid restore session setting.')
+    await ipcRenderer.invoke(HOME_CHANNELS.setRestoreLastSession, on)
   },
   async setAutoSaveDefault(on) {
     if (typeof on !== 'boolean') throw new Error('Invalid AutoSave default.')
@@ -373,6 +519,12 @@ const homeApi: HomeApi = {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.setAnalyticsEnabled, enabled)
     return result === true
   },
+  async getAuthorName() {
+    return normalizeAuthorNameSetting(await ipcRenderer.invoke(HOME_CHANNELS.getAuthorName))
+  },
+  async setAuthorName(value) {
+    return normalizeAuthorNameSetting(await ipcRenderer.invoke(HOME_CHANNELS.setAuthorName, value))
+  },
   async getAiPanelPrefs() {
     return normalizeAiPanelPrefs(await ipcRenderer.invoke(HOME_CHANNELS.getAiPanelPrefs))
   },
@@ -399,6 +551,13 @@ const homeApi: HomeApi = {
     }
     ipcRenderer.on('app:theme-changed', listener)
     return () => ipcRenderer.removeListener('app:theme-changed', listener)
+  },
+  onDocumentThemeChanged(handler) {
+    const listener = (_event: Electron.IpcRendererEvent, theme: unknown) => {
+      if (theme === 'light' || theme === 'dark' || theme === 'follow') handler(theme)
+    }
+    ipcRenderer.on('app:document-theme-changed', listener)
+    return () => ipcRenderer.removeListener('app:document-theme-changed', listener)
   },
   async openGenTeam() {
     await ipcRenderer.invoke(HOME_CHANNELS.openGenTeam)
@@ -444,6 +603,11 @@ const homeApi: HomeApi = {
     await ipcRenderer.invoke(HOME_CHANNELS.openCloudProject, projectUrl)
   },
   // AI settings channels are registered once by the shell's aggregated docs handlers
+  onAiSettingsChanged(handler) {
+    const listener = () => handler()
+    ipcRenderer.on('ai:settings-changed', listener)
+    return () => ipcRenderer.removeListener('ai:settings-changed', listener)
+  },
   async getAiSettings() {
     return (await ipcRenderer.invoke('ai:get-settings')) as AiSettings
   },
@@ -466,8 +630,12 @@ const homeApi: HomeApi = {
   async getCodexModels(cliPath) {
     return (await ipcRenderer.invoke('ai:codex-models', cliPath)) as CodexModelCatalog
   },
-  async getCustomModels(baseUrl, apiKey) {
-    return (await ipcRenderer.invoke('ai:custom-models', { baseUrl, apiKey })) as CodexModelCatalog
+  async getCustomModels(baseUrl, apiKey, api) {
+    return (await ipcRenderer.invoke('ai:custom-models', {
+      baseUrl,
+      apiKey,
+      ...(api ? { api } : {}),
+    })) as CodexModelCatalog
   },
   async testAiSettings(settings) {
     const result: unknown = await ipcRenderer.invoke('ai:chat', {
@@ -519,6 +687,38 @@ function asCloudProjectsSnapshot(result: unknown): CloudProjectsSnapshot | null 
 
 contextBridge.exposeInMainWorld('aiOffice', homeApi)
 
+/**
+ * Model file naming.
+ *
+ * The same channel the editor apps expose under this name, so the shared
+ * client (`@genoffice/ui`) finds one bridge wherever it runs.
+ *
+ * A global of its own rather than part of `aiOffice`: `aiOffice` is the
+ * shell's home API, and an editor window that reused the name would shadow it
+ * there — `window.aiOffice.setTheme` would vanish with it.
+ */
+const aiNamingApi = {
+  suggestFileName(input: { content: string }) {
+    return ipcRenderer.invoke('ai:suggest-file-name', input)
+  },
+}
+
+contextBridge.exposeInMainWorld('aiNamingApi', aiNamingApi)
+
+// The same project:* channels the editor preloads use; the home screen's
+// knowledge-base ask panel keeps its thread through them. The handlers are
+// registered once by the docs main process in shell mode (registerProjectIpc).
+const projectApi: ProjectApi = {
+  resolveChat: (args) => ipcRenderer.invoke('project:resolveChat', args),
+  appendChat: (args) => ipcRenderer.invoke('project:appendChat', args),
+  loadChat: (args) => ipcRenderer.invoke('project:loadChat', args),
+  rebindChat: (args) => ipcRenderer.invoke('project:rebindChat', args),
+  listChats: (args) => ipcRenderer.invoke('project:listChats', args),
+  deleteChat: (args) => ipcRenderer.invoke('project:deleteChat', args),
+}
+
+contextBridge.exposeInMainWorld('projectApi', projectApi)
+
 const integrationsApi: IntegrationsApi = {
   async status() {
     return (await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.status)) as IntegrationsStatus
@@ -535,6 +735,11 @@ const integrationsApi: IntegrationsApi = {
       agentId,
     )) as SkillInstallState
   },
+  async sweepLegacySkillCopies() {
+    return (await ipcRenderer.invoke(
+      INTEGRATIONS_CHANNELS.sweepLegacySkillCopies,
+    )) as LegacySweepResult
+  },
   async pickSkillDir(title) {
     const r: unknown = await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.pickSkillDir, title)
     return typeof r === 'string' ? r : null
@@ -545,6 +750,34 @@ const integrationsApi: IntegrationsApi = {
   },
   async copyText(text) {
     await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.copyText, text)
+  },
+  async listSkills() {
+    return (await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.listSkills)) as FoundSkill[]
+  },
+  async skillBody(path) {
+    return (await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.skillBody, path)) as string
+  },
+  async importSkillFolder(title) {
+    const r: unknown = await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.importSkillFolder, title)
+    return (r as FoundSkill | null) ?? null
+  },
+  async importSkillZip(title) {
+    const r: unknown = await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.importSkillZip, title)
+    return (r as FoundSkill | null) ?? null
+  },
+  async listRecommendedSkills() {
+    return (await ipcRenderer.invoke(
+      INTEGRATIONS_CHANNELS.listRecommendedSkills,
+    )) as RecommendedSkill[]
+  },
+  async removeSkill(name) {
+    await ipcRenderer.invoke(INTEGRATIONS_CHANNELS.removeSkill, name)
+  },
+  async installRecommendedSkill(name) {
+    return (await ipcRenderer.invoke(
+      INTEGRATIONS_CHANNELS.installRecommendedSkill,
+      name,
+    )) as FoundSkill
   },
 }
 contextBridge.exposeInMainWorld('aiOfficeIntegrations', integrationsApi)
@@ -612,6 +845,13 @@ const tabsApi: TabsApi = {
     const listener = () => handler()
     ipcRenderer.on('app:chrome-pressed', listener)
     return () => ipcRenderer.removeListener('app:chrome-pressed', listener)
+  },
+  onStartRename(handler) {
+    const listener = (_event: IpcRendererEvent, id: unknown) => {
+      if (typeof id === 'string') handler(id)
+    }
+    ipcRenderer.on(TABS_CHANNELS.startRename, listener)
+    return () => ipcRenderer.removeListener(TABS_CHANNELS.startRename, listener)
   },
 }
 

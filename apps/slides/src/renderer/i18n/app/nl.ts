@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const nl = {
+  redactMenuLabel: 'Selectie verbergen voor de AI',
+  redactDialogDesc:
+    'De selectie blijft in het document en het bestand; het model ziet alleen de placeholder. Geef hem een naam.',
+  redactDialogScope:
+    'Verbergen geldt alleen voor de AI in deze app. De CLI, MCP-tools en de export zonder venster lezen het bestand rechtstreeks en zien deze woorden nog steeds.',
+  redactDialogPlaceholder: 'Naam van placeholder, bv. telefoonnummer klant',
+  redactCancel: 'Annuleren',
+  redactInsert: 'Verbergen',
+  redactEnable: 'Rechtsklik op een selectie om die voor het model te verbergen.',
+
   appPhPromptTitle: 'Klik om een titel toe te voegen',
   appPhPromptSubtitle: 'Klik om een ondertitel toe te voegen',
   appPhPromptBody: 'Klik om tekst toe te voegen',
@@ -57,7 +67,9 @@ export const nl = {
     'Video ingevoegd (ingesloten in het .pptx-bestand; afspeelbaar in PowerPoint)',
   appStatusAudioInserted: 'Audio ingevoegd (ingesloten in het .pptx-bestand)',
   appStatusModel3dInserted:
-    '3D-model ingesloten (het canvas toont een tijdelijke aanduiding; het modelbestand is opgeslagen in het .pptx-bestand)',
+    '3D-model ingevoegd: selecteer het om het te draaien (PowerPoint toont het ook in 3D)',
+  appStatusModel3dNoPreview:
+    'Het 3D-model kan hier niet worden getekend; de afbeelding blijft ongewijzigd',
   appStatusRecordingEmpty: 'De opname is leeg; er is niets ingevoegd',
   appStatusRecordingInserted: 'Schermopname ingevoegd op de huidige dia (ingesloten webm)',
   appStatusRecording:
@@ -221,6 +233,8 @@ export const nl = {
   appMasterFillNone: 'Geen opvulling',
   appMasterStroke: 'Contourkleur…',
   appMasterStrokeNone: 'Geen contour',
+  appMasterInsertTextBox: 'Tekstvak',
+  appMasterInsertShape: 'Vormen',
   appStartOpening: 'Openen…',
   appReadingSlideTitle:
     'Klik om naar de volgende dia te gaan (Esc om de leesweergave af te sluiten)',
@@ -249,6 +263,14 @@ export const nl = {
     'De totale duur van de voorstelling was {duration}. Wilt u de diatijden opslaan voor automatische diadoorloop?',
   appRehearseDiscard: 'Niet opslaan',
   appRehearseSave: 'Opslaan',
+  appRecordTitle: 'Gesproken tekst opnemen',
+  appRecordSummary: 'Opnameduur {duration}. De gesproken tekst en de tijd van elke dia opslaan?',
+  appRecordDiscard: 'Niet opslaan',
+  appRecordSave: 'Opslaan',
+  appStatusRecordSaved:
+    'Gesproken tekst opgeslagen op {count} dia’s (PowerPoint speelt die ook af)',
+  appStatusRecordFailed: 'De opname kan niet worden opgeslagen',
+  appStatusNarrationCleared: 'Gesproken tekst gewist',
   appSettingsTitle: 'AI-instellingen',
   appSettingsAccount: 'Genspark-account',
   appSettingsChecking: 'Controleren…',

@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const zhTW = {
+  redactMenuLabel: '把選中的內容對 AI 隱藏',
+  redactDialogDesc:
+    '選取的內容會留在文件裡，AI 讀到的卻是下面的標記。給它起個名字，AI 才知道它是什麼。',
+  redactDialogScope:
+    '這只針對本應用的 AI。命令列、MCP 工具和無介面匯出會直接讀取文件，仍然看得到這些文字。',
+  redactDialogPlaceholder: '佔位名稱，例如：客戶電話',
+  redactCancel: '取消',
+  redactInsert: '隱藏',
+  redactEnable: '選中文字後右鍵，即可對 AI 隱藏。',
+
   appPhPromptTitle: '按一下此處新增標題',
   appPhPromptSubtitle: '按一下此處新增副標題',
   appPhPromptBody: '按一下此處新增文字',
@@ -47,7 +57,8 @@ export const zhTW = {
   appStatusEquationInserted: '已插入方程式',
   appStatusVideoInserted: '已插入影片（已內嵌至 pptx，可在 PowerPoint 中播放）',
   appStatusAudioInserted: '已插入音訊（已內嵌至 pptx）',
-  appStatusModel3dInserted: '已內嵌 3D 模型（畫布顯示預留位置圖，模型檔案已存入 pptx）',
+  appStatusModel3dInserted: '已插入 3D 模型：選取後可旋轉（在 PowerPoint 中同樣以 3D 顯示）',
+  appStatusModel3dNoPreview: '無法在此繪製 3D 模型，其圖片保持不變',
   appStatusRecordingEmpty: '錄製內容為空，未插入',
   appStatusRecordingInserted: '已將螢幕錄製插入目前頁面（內嵌 webm）',
   appStatusRecording: '螢幕錄製中…再按一下「螢幕錄製」即可停止並插入',
@@ -198,6 +209,8 @@ export const zhTW = {
   appMasterFillNone: '無填滿',
   appMasterStroke: '外框色彩…',
   appMasterStrokeNone: '無外框',
+  appMasterInsertTextBox: '文字方塊',
+  appMasterInsertShape: '圖案',
   appStartOpening: '正在開啟…',
   appReadingSlideTitle: '按一下翻到下一頁（Esc 離開閱讀檢視）',
   appReadingPrev: '‹ 上一頁',
@@ -222,6 +235,13 @@ export const zhTW = {
   appRehearseSummary: '本次放映總時長 {duration}。是否儲存每頁停留時間作為自動換頁時間？',
   appRehearseDiscard: '不儲存',
   appRehearseSave: '儲存',
+  appRecordTitle: '錄製旁白',
+  appRecordSummary: '錄製總時長 {duration}。是否儲存每頁的旁白和停留時間？',
+  appRecordDiscard: '不儲存',
+  appRecordSave: '儲存',
+  appStatusRecordSaved: '已為 {count} 頁儲存旁白（PowerPoint 中同樣可以播放）',
+  appStatusRecordFailed: '無法儲存錄製內容',
+  appStatusNarrationCleared: '已清除旁白',
   appSettingsTitle: 'AI 設定',
   appSettingsAccount: 'Genspark 帳號',
   appSettingsChecking: '偵測中…',

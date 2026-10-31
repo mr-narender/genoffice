@@ -185,6 +185,23 @@ export interface TextRun {
   strikeStyle?: string
   /** Original rPr carried an explicit u="none" — an override of inherited underline the rebuild path must re-emit */
   underlineExplicitNone?: boolean
+  /**
+   * Withheld from the model: `label` is the only part a model ever sees, in
+   * place of this run's words. The words themselves stay in the document and in
+   * the file — a run is a mark over real text, never a replacement for it.
+   *
+   * It is stored on the model rather than left to ride along in the XML because
+   * two save paths discard anything they do not model: the structural rebuild
+   * (`rebuildTxBody`, taken when the run count changes) regenerates `<a:rPr>`
+   * from scratch, and the patch path rewrites `u`/`b`/`i`/`sz` from the model.
+   * Verified against this engine, not assumed: an `<a:extLst>` left in the
+   * original `<a:rPr>` survives an in-place text patch but is lost on rebuild.
+   *
+   * `underline` is the visible half and is NOT free: the patch path writes
+   * `u="none"` for a run whose model does not carry it, so applying a
+   * redaction must also set `underline` or the mark becomes invisible.
+   */
+  redact?: string
   /** Original rPr carried strike="noStrike" (see underlineExplicitNone) */
   strikeExplicitNone?: boolean
   /** Explicit cap attribute verbatim (incl. "none"); `cap` below holds the resolved display value, which may be inherited */
@@ -303,7 +320,7 @@ export interface Paragraph {
   alignSrc?: string
   /** Paragraph base direction (a:pPr rtl): true = RTL base, false = explicit LTR base, absent = inferred from the first strong character */
   rtl?: boolean
-  /** <a:pPr hangingPunct="0"> switches off East Asian hanging punctuation (a trailing closing mark may overhang the margin); absent = PowerPoint's default, on */
+  /** Effective East Asian hanging-punctuation switch (own pPr, else lstStyle/master level); absent = PowerPoint default, on */
   hangingPunct?: boolean
   /** <a:pPr latinLnBrk="1"> ("allow Latin text to wrap in the middle of a word"): Hangul words then break per syllable like CJK; absent = word wrap */
   latinLnBrk?: boolean
@@ -377,6 +394,9 @@ export interface Paragraph {
     indent?: boolean
     tabLst?: boolean
     defTabSz?: boolean
+    hangingPunct?: boolean
+    latinLnBrk?: boolean
+    eaLnBrk?: boolean
   }
 }
 
@@ -477,6 +497,21 @@ interface ElementBase {
    */
   descr?: string
   /**
+   * Withheld from the model, at element granularity. Only a picture can carry
+   * one: images, video and audio have no words to redact, so the point is that
+   * the model is not handed a reference it could fetch.
+   *
+   * Shape-level rather than run-level, because a picture is atomic — there is
+   * no run inside it to mark. `media.target` is the reason this is not merely
+   * cosmetic: for video and audio it can be an **external URL** (`r:link` of
+   * `videoFile`/`audioFile`), so emitting it hands the model a link it can
+   * replay, signed or not.
+   *
+   * The label is what the model sees. The `target`, the duration and the
+   * dimensions must not be.
+   */
+  redact?: string
+  /**
    * <p:cNvPr id>: matching key between group children and slices of the group's
    * originalXml (for in-group editing). parseGroup iterates children grouped by
    * tag, which differs from document order, so index alignment is not possible.
@@ -576,6 +611,11 @@ export interface PictureElement extends ElementBase {
    * frame; target is the media file's zip path or an external URL (external).
    */
   media?: { kind: 'video' | 'audio'; target?: string; external?: boolean }
+  /**
+   * A 3D model (mc:AlternateContent: am3d:model3d in the Choice, this picture in the Fallback):
+   * the .glb zip path and am3d:rot in 60,000ths of a degree.
+   */
+  model3d?: { target?: string; rot: { ax: number; ay: number; az: number } }
   /** Picture outline geometry <a:prstGeom> (ellipse avatars/rounded-corner frames etc. from picture styles; rect omitted) */
   presetGeometry?: string
   adjust?: Record<string, number>
@@ -679,6 +719,8 @@ export interface ChartElement extends ElementBase {
   type: 'chart'
   /** Parsed chart data model (see chart.ts) */
   chart: import('./chart').ChartModel
+  /** c:userShapes text/shape overlays, already in slide coordinates; render-only (never saved back) */
+  userShapes?: TextElement[]
 }
 
 export type SlideElement =

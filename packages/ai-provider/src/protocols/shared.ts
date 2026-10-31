@@ -1,4 +1,5 @@
 import type { AgentToolCall } from '@genoffice/agent-core'
+import type { AiTokenUsage } from '../types'
 
 // ---- endpoint URL composition ----
 
@@ -156,6 +157,75 @@ export async function* sseLines(
  */
 export const MAX_TOOL_JSON_CHARS = 512_000
 
+export interface SseDataEvent {
+  raw: string
+  /** Parsed JSON body, undefined for a non-JSON payload such as `[DONE]` or a keep-alive. */
+  json: unknown
+}
+
+/**
+ * Frames the `data:` payloads of an SSE stream into whole events.
+ *
+ * A server may split one JSON body across several `data:` lines (one event, joined
+ * with a newline), or close every event with a single newline and no blank line at
+ * all. So a value that already parses as JSON is dispatched on its own and only
+ * fragments are held back and joined. The parsed body rides along so callers do
+ * not parse twice. `[DONE]` counts as whole: holding it back as a fragment left a
+ * newline-only stream that keeps its socket open waiting forever.
+ */
+export async function* sseDataEvents(
+  body: NodeJS.ReadableStream | ReadableStream<Uint8Array>,
+  onBytes?: () => void,
+): AsyncGenerator<SseDataEvent> {
+  let parts: string[] = []
+  const flush = (): SseDataEvent | undefined => {
+    if (!parts.length) return undefined
+    const raw = parts.join('\n')
+    parts = []
+    return { raw, json: parseJson(raw) }
+  }
+  for await (const line of sseLines(body, onBytes)) {
+    if (!line.startsWith('data:')) {
+      const held = flush()
+      if (held) yield held
+      continue
+    }
+    const raw = line.slice(5).trim()
+    if (!raw) continue
+    const json = parseJson(raw)
+    if (raw === '[DONE]' || json !== undefined) {
+      const held = flush()
+      if (held) yield held
+      yield { raw, json }
+      continue
+    }
+    // Only a JSON opener starts a fragment; anything else alone is a keep-alive.
+    if (!parts.length && !/^[[{]/.test(raw)) {
+      yield { raw, json }
+      continue
+    }
+    parts.push(raw)
+    // Dispatch as soon as the joined fragments form a body, so a later keep-alive
+    // is not glued onto it.
+    const joined = parts.join('\n')
+    const whole = parseJson(joined)
+    if (whole !== undefined) {
+      parts = []
+      yield { raw: joined, json: whole }
+    }
+  }
+  const held = flush()
+  if (held) yield held
+}
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
+
 export function throwIfToolJsonOverBudget(jsonLength: number, provider: string): void {
   if (jsonLength > MAX_TOOL_JSON_CHARS) {
     throw new Error(
@@ -188,11 +258,19 @@ export interface StreamCallbacks {
   onReasoningDelta?: (text: string) => void
   /** normalized stop reason ('max_tokens' when the output was cut off by the token limit) */
   onStopReason?: (reason: string) => void
+  /** tokens the provider billed for this turn; fires once at stream end when the provider reports usage at all */
+  onUsage?: (usage: AiTokenUsage) => void
   /** bytes arrived on the wire (fires per network chunk, including SSE pings; used for keepalive) */
   onActivity?: () => void
   /** Stable renderer transport id for providers with native sessions. */
   sessionId?: string
   signal: AbortSignal
+}
+
+/** Coerce a provider's usage figure (number on the wire, sometimes a numeric string) to a finite count. */
+export function usageCount(value: unknown): number | undefined {
+  const n = typeof value === 'string' ? Number(value) : value
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined
 }
 
 /**

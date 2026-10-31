@@ -77,6 +77,21 @@ describe('2.3 metrics', () => {
 })
 
 describe('2.3 text layout', () => {
+  it('small caps: lowercase letters set as capitals at 80% of the run size (PowerPoint probe)', () => {
+    const lay = layoutText({
+      body: body({ paragraphs: [{ runs: [{ text: 'Red de', fontSize: 20, cap: 'small' }] }] }),
+      boxWidthPx: 800,
+      boxHeightPx: 200,
+      metrics: new HeuristicMetrics(),
+      vp,
+    })
+    const runs = lay.lines[0]!.runs.filter((r) => r.text.trim())
+    expect(runs.map((r) => r.text)).toEqual(['R', 'ED', 'DE'])
+    expect(runs[1]!.fontSizePx).toBeCloseTo(runs[0]!.fontSizePx * 0.8, 5)
+    expect(runs[2]!.fontSizePx).toBeCloseTo(runs[0]!.fontSizePx * 0.8, 5)
+    expect(runs.every((r) => r.srcRunIdx === 0)).toBe(true)
+  })
+
   it('vertical layout stamps effective rtl on columns (ribbon/editor state parity with horizontal)', () => {
     const lay = (vert: 'eaVert' | 'vert') =>
       layoutText({
@@ -1286,6 +1301,21 @@ describe('buAutoNum startAt', () => {
       .map((l) => l.runs.find((r: any) => r.isBullet))
       .filter(Boolean) as any[]
     expect(runs.map((r) => r.startAt)).toEqual([3, 3, undefined])
+  })
+
+  it('clamps a startAt below 1 to 1', () => {
+    const layout = layoutText({
+      body: body({ paragraphs: [para('first', -2), para('second', -2)] as any }),
+      boxWidthPx: 800,
+      boxHeightPx: 200,
+      metrics: m,
+      vp,
+    })
+    const bullets = layout.lines
+      .map((l) => l.runs.find((r: any) => r.isBullet))
+      .filter(Boolean)
+      .map((r: any) => r.text)
+    expect(bullets).toEqual(['1.', '2.'])
   })
 
   it('defaults to 1 without startAt', () => {

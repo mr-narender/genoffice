@@ -23,16 +23,19 @@ import { runUiOps } from '../ai/ops'
 import { stepDocsZoom } from '../wheel-zoom'
 import { defaultParagraphStyleId, headingStyleId, type StyleMap } from '../style-gallery'
 import { tableModelToPmNode } from '../editor/convert'
+import { wordTableCell, wordTableModel } from '../editor/new-table'
 import { insertPageBreak } from '../editor/page-break'
+import { insertPictureAtSelection } from '../editor/insert-picture'
 import { isStraightLineKind } from '../editor/shape-svg'
 import type { InkTool } from '../editor/ink'
 import { t, useI18n, type StringKey } from '../i18n/locale'
 import iconEditor from '../assets/icon-editor.png'
 import iconTranslate from '../assets/icon-translate.png'
-import type { RevisionDisplayMode } from '../editor/revision-view'
+import type { BalloonMode, RevisionDisplayMode } from '../editor/revision-view'
+import type { RevisionFilter, RevisionScope } from '../editor/revision-filters'
+import { TRANSLATE_LANGS, ribbonLangKey } from './translate-langs'
 import {
   IconAccept,
-  IconAiPanel,
   IconCaret,
   IconComment,
   IconCommentNext,
@@ -63,6 +66,7 @@ import {
   IconUndo,
   IconWebLayout,
   IconWholePage,
+  IconMultiPage,
   IconZoom,
   IconZoom100,
   IconZoomIn,
@@ -79,6 +83,7 @@ export {
 } from './ribbon-insert-tab'
 export { DesignTab } from './ribbon-design-tab'
 export { LayoutTab } from './ribbon-layout-tab'
+export { MailingsTab } from './ribbon-mailings-tab'
 export { ReferencesTab } from './ribbon-references-tab'
 
 /** icon size for the big icon-over-label ribbon buttons (slides ribbon parity) */
@@ -129,6 +134,7 @@ const DIRECT_PARA_ATTRS: Record<string, unknown> = {
   indentLeft: null,
   indentRight: null,
   indentFirstLine: null,
+  indentFirstLineChars: null,
   spaceBefore: null,
   spaceAfter: null,
   spaceBeforeAuto: null,
@@ -328,16 +334,10 @@ export const MAX_TABLE_ROWS = 200
 export function insertTableAt(editor: Editor, rows: number, cols: number): void {
   rows = Math.min(MAX_TABLE_ROWS, Math.max(1, Math.round(rows)))
   cols = Math.min(MAX_TABLE_COLS, Math.max(1, Math.round(cols)))
-  // Word default single 0.5pt borders: also what generateTableModelXml writes on
-  // save — without them the freshly inserted table renders invisible until reload
-  const line = { style: 'single', szEighths: 4, color: 'auto' }
-  const table = {
-    rows: Array.from({ length: rows }, () => Array.from({ length: cols }, () => ({ paras: [''] }))),
-    colWidthsPct: Array.from({ length: cols }, () => 100 / cols),
-    widthPct: 100,
-    autoFit: 'window' as const,
-    borders: { top: line, bottom: line, left: line, right: line, insideH: line, insideV: line },
-  }
+  const table = wordTableModel(
+    Array.from({ length: rows }, () => Array.from({ length: cols }, () => wordTableCell(['']))),
+    cols,
+  )
   // inside a cell a top-level docTable insert would split the outer table
   // — Word semantics is a nested child table at the end of the cell
   const { $from } = editor.state.selection
@@ -385,27 +385,14 @@ export async function insertImageFromDataUrl(
   try {
     const natural = await imageSizeOf(dataUrl)
     const scale = Math.min(1, MAX_IMAGE_WIDTH_PX / natural.width)
-    editor
-      .chain()
-      .focus()
-      .insertContent({
-        type: 'docProtected',
-        attrs: {
-          docxIndex: null,
-          blockType: 'image',
-          label,
-          imageDataUrl: dataUrl,
-          imageWidthPx: Math.round(natural.width * scale),
-          imageHeightPx: Math.round(natural.height * scale),
-          genImage: {
-            base64: m[2],
-            mime,
-            widthPx: Math.round(natural.width * scale),
-            heightPx: Math.round(natural.height * scale),
-          },
-        },
-      })
-      .run()
+    insertPictureAtSelection(editor, {
+      dataUrl,
+      base64: m[2],
+      mime,
+      widthPx: Math.round(natural.width * scale),
+      heightPx: Math.round(natural.height * scale),
+      label,
+    })
     // Pasting into an empty document leaves the image as the ONLY node with a
     // node-selection on it: there is no text position to type at, and the
     // next keystroke REPLACES the picture. Ensure a
@@ -538,11 +525,12 @@ export function insertShapeAt(
   if (prst in LINE_KINDS) return insertLineAt(editor, prst, opts)
   const widthEmu = opts?.widthEmu ?? 1800000
   const heightEmu = opts?.heightEmu ?? 1080000
+  const id = Math.floor(Math.random() * 900000) + 100000
   const xml = buildShapeParagraphXml({
     prst,
     widthEmu,
     heightEmu,
-    id: Math.floor(Math.random() * 900000) + 100000,
+    id,
     // default Office blue fill + slightly darker border
     fillHex: '4472C4',
     borderHex: '2F5496',
@@ -557,6 +545,7 @@ export function insertShapeAt(
     widthPx: Math.round(widthEmu / 9525),
     heightPx: Math.round(heightEmu / 9525),
     prst,
+    shapeId: String(id),
     vAlign: 'center',
     textColor: 'FFFFFF',
     paras: [{ runs: [{ text: '' }], align: 'center' }],
@@ -754,22 +743,10 @@ export interface InsertTabProps extends TabProps {
   onTableInserted: () => void
 }
 
-/** target languages of Word's Translate dropdown that the AI backend can serve;
- *  the localized label is also spliced into the instruction sent to the LLM */
-const TRANSLATE_TARGETS: Array<{ labelKey: StringKey }> = [
-  { labelKey: 'ribbonLangEnglish' },
-  { labelKey: 'ribbonLangSimplifiedChinese' },
-  { labelKey: 'ribbonLangJapanese' },
-  { labelKey: 'ribbonLangKorean' },
-  { labelKey: 'ribbonLangFrench' },
-  { labelKey: 'ribbonLangGerman' },
-  { labelKey: 'ribbonLangSpanish' },
-]
-
 /** One-time "AI rewrites the whole document" acknowledgement */
 export const AI_REWRITE_ACK_KEY = 'docs-ai-rewrite-ack'
 
-export type { RevisionDisplayMode }
+export type { BalloonMode, RevisionDisplayMode }
 
 interface ReviewTabProps extends TabProps {
   onAiPreset: (instruction: string) => void
@@ -793,10 +770,22 @@ interface ReviewTabProps extends TabProps {
   onSpellcheck: (on: boolean) => void
   revisionDisplay: RevisionDisplayMode
   onRevisionDisplay: (mode: RevisionDisplayMode) => void
+  /** Show Markup → Balloons */
+  balloonMode: BalloonMode
+  onBalloonMode: (mode: BalloonMode) => void
+  /** Review ▸ Tracking dialog launcher: Track Changes Options */
+  onTrackChangesOptions: () => void
   revisionCount: number
-  onAcceptRevision: (all: boolean) => void
-  onRejectRevision: (all: boolean) => void
+  onAcceptRevision: (scope: RevisionScope) => void
+  onRejectRevision: (scope: RevisionScope) => void
   onGotoRevision: (dir: 1 | -1) => void
+  /** Show Markup: unticked kinds / reviewers render as accepted */
+  revisionFilter: RevisionFilter
+  onRevisionFilter: (filter: RevisionFilter) => void
+  /** reviewers in first-appearance order (Specific People, Accept All by …) */
+  revisionAuthors: string[]
+  showReviewPane: boolean
+  onToggleReviewPane: () => void
   /** an editing restriction or write lock makes the body read-only */
   isProtected: boolean
   /** comments restriction: adding comments stays allowed although the body is read-only */
@@ -831,10 +820,18 @@ export function ReviewTab({
   onSpellcheck,
   revisionDisplay,
   onRevisionDisplay,
+  balloonMode,
+  onBalloonMode,
+  onTrackChangesOptions,
   revisionCount,
   onAcceptRevision,
   onRejectRevision,
   onGotoRevision,
+  revisionFilter,
+  onRevisionFilter,
+  revisionAuthors,
+  showReviewPane,
+  onToggleReviewPane,
   isProtected,
   commentsAllowed,
   trackChangesForced,
@@ -843,6 +840,40 @@ export function ReviewTab({
   onCompare,
 }: ReviewTabProps) {
   const { t } = useI18n()
+  const unknownAuthor = t('editorUnknownAuthor')
+  const hasSelection = !!editor && !editor.state.selection.empty
+  const toggleAuthor = (author: string) =>
+    onRevisionFilter({
+      ...revisionFilter,
+      hiddenAuthors: revisionFilter.hiddenAuthors.includes(author)
+        ? revisionFilter.hiddenAuthors.filter((a) => a !== author)
+        : [...revisionFilter.hiddenAuthors, author],
+    })
+  const revisionMenu = (action: 'accept' | 'reject', onPick: (scope: RevisionScope) => void) => {
+    const key = (suffix: string) =>
+      `${action === 'accept' ? 'ribbonAccept' : 'ribbonReject'}${suffix}` as StringKey
+    const pick = (scope: RevisionScope) => () => {
+      onPick(scope)
+      setDropdown(() => null)
+    }
+    return (
+      <div data-rb-panel="" className="layout-menu">
+        <button onClick={pick('next')}>{t(key('Next'))}</button>
+        <button onClick={pick('all')}>{t(key('All'))}</button>
+        <button onClick={pick('shown')}>{t(key('Shown'))}</button>
+        <button disabled={!hasSelection} onClick={pick('selection')}>
+          {t(key('Selection'))}
+        </button>
+        {revisionAuthors.length > 1 && <div className="rb-menu-sep" />}
+        {revisionAuthors.length > 1 &&
+          revisionAuthors.map((author) => (
+            <button key={author} onClick={pick({ author })}>
+              {t(key('By'), { author: author || unknownAuthor })}
+            </button>
+          ))}
+      </div>
+    )
+  }
   // One-time acknowledgement before whole-document AI rewrites:
   // Editor / Translate send the full document to the agent, consume credits and
   // may rewrite everything — say so once before the first run.
@@ -911,19 +942,21 @@ export function ReviewTab({
             </button>
             {dropdown === 'translate' && (
               <div data-rb-panel="" className="layout-menu">
-                {TRANSLATE_TARGETS.map((lang) => (
+                {TRANSLATE_LANGS.map(({ code }) => (
                   <button
-                    key={lang.labelKey}
+                    key={code}
                     onClick={() => {
                       setDropdown(() => null)
                       if (hasRangeSelection()) {
-                        onAiPreset(t('ribbonTranslateSelectionPrompt', { lang: t(lang.labelKey) }))
+                        onAiPreset(
+                          t('ribbonTranslateSelectionPrompt', { lang: t(ribbonLangKey(code)) }),
+                        )
                       } else if (confirmAiRewrite()) {
-                        onAiPreset(t('ribbonTranslatePrompt', { lang: t(lang.labelKey) }))
+                        onAiPreset(t('ribbonTranslatePrompt', { lang: t(ribbonLangKey(code)) }))
                       }
                     }}
                   >
-                    {t('ribbonTranslateTo', { lang: t(lang.labelKey) })}
+                    {t('ribbonTranslateTo', { lang: t(ribbonLangKey(code)) })}
                   </button>
                 ))}
               </div>
@@ -1104,6 +1137,64 @@ export function ReviewTab({
                     {revisionDisplay === mode ? ' ✓' : ''}
                   </button>
                 ))}
+                <div className="rb-menu-sep" />
+                <div className="layout-menu-head">{t('ribbonMarkupShow')}</div>
+                <button
+                  onClick={() =>
+                    onRevisionFilter({ ...revisionFilter, insDel: !revisionFilter.insDel })
+                  }
+                >
+                  {t('ribbonMarkupInsDel')}
+                  {revisionFilter.insDel ? ' ✓' : ''}
+                </button>
+                <button
+                  onClick={() =>
+                    onRevisionFilter({ ...revisionFilter, format: !revisionFilter.format })
+                  }
+                >
+                  {t('ribbonMarkupFormatting')}
+                  {revisionFilter.format ? ' ✓' : ''}
+                </button>
+                {revisionAuthors.length > 0 && (
+                  <div className="layout-menu-head">{t('ribbonMarkupPeople')}</div>
+                )}
+                {revisionAuthors.map((author) => (
+                  <button key={author} onClick={() => toggleAuthor(author)}>
+                    {author || unknownAuthor}
+                    {revisionFilter.hiddenAuthors.includes(author) ? '' : ' ✓'}
+                  </button>
+                ))}
+                <div className="layout-menu-head">{t('ribbonMarkupBalloons')}</div>
+                {(
+                  [
+                    ['revisions', t('ribbonBalloonsRevisions')],
+                    ['inline', t('ribbonBalloonsInline')],
+                    ['comments', t('ribbonBalloonsComments')],
+                  ] as Array<[BalloonMode, string]>
+                ).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    role="menuitemradio"
+                    aria-checked={balloonMode === mode}
+                    onClick={() => {
+                      onBalloonMode(mode)
+                      setDropdown(() => null)
+                    }}
+                  >
+                    {label}
+                    {balloonMode === mode ? ' ✓' : ''}
+                  </button>
+                ))}
+                <div className="rb-menu-sep" />
+                <button
+                  data-testid="tc-options"
+                  onClick={() => {
+                    onTrackChangesOptions()
+                    setDropdown(() => null)
+                  }}
+                >
+                  {t('ribbonTcOptions')}
+                </button>
               </div>
             )}
           </div>
@@ -1120,26 +1211,7 @@ export function ReviewTab({
               </span>
               <span>{t('ribbonAccept')}</span>
             </button>
-            {dropdown === 'acceptRev' && (
-              <div data-rb-panel="" className="layout-menu">
-                <button
-                  onClick={() => {
-                    onAcceptRevision(false)
-                    setDropdown(() => null)
-                  }}
-                >
-                  {t('ribbonAcceptOne')}
-                </button>
-                <button
-                  onClick={() => {
-                    onAcceptRevision(true)
-                    setDropdown(() => null)
-                  }}
-                >
-                  {t('ribbonAcceptAll')}
-                </button>
-              </div>
-            )}
+            {dropdown === 'acceptRev' && revisionMenu('accept', onAcceptRevision)}
           </div>
           <div className="rb-split-wrap">
             <button
@@ -1154,26 +1226,7 @@ export function ReviewTab({
               </span>
               <span>{t('ribbonReject')}</span>
             </button>
-            {dropdown === 'rejectRev' && (
-              <div data-rb-panel="" className="layout-menu">
-                <button
-                  onClick={() => {
-                    onRejectRevision(false)
-                    setDropdown(() => null)
-                  }}
-                >
-                  {t('ribbonRejectOne')}
-                </button>
-                <button
-                  onClick={() => {
-                    onRejectRevision(true)
-                    setDropdown(() => null)
-                  }}
-                >
-                  {t('ribbonRejectAll')}
-                </button>
-              </div>
-            )}
+            {dropdown === 'rejectRev' && revisionMenu('reject', onRejectRevision)}
           </div>
           <button
             className="rb-big"
@@ -1196,6 +1249,17 @@ export function ReviewTab({
               <IconRedo size={BIG} />
             </span>
             <span>{t('ribbonNextChange')}</span>
+          </button>
+          <button
+            className={`rb-big ${showReviewPane ? 'active' : ''}`}
+            disabled={!hasDoc}
+            data-tip={t('ribbonReviewingPaneTip')}
+            onClick={onToggleReviewPane}
+          >
+            <span className="rb-big-icon">
+              <IconNavPane size={BIG} />
+            </span>
+            <span>{t('ribbonReviewingPane')}</span>
           </button>
           <button
             className="rb-big"
@@ -1280,10 +1344,8 @@ interface ViewTabProps {
   filePath: string | null
   zoom: number
   onZoom: (zoom: number) => void
-  onZoomFit: (mode: 'width' | 'page') => void
+  onZoomFit: (mode: 'width' | 'page' | 'multi') => void
   onZoomDialog: () => void
-  showAi: boolean
-  onToggleAi: () => void
   darkPage: boolean
   onDarkPage: (v: boolean) => void
   showRuler: boolean
@@ -1308,8 +1370,6 @@ export function ViewTab({
   onZoom,
   onZoomFit,
   onZoomDialog,
-  showAi,
-  onToggleAi,
   darkPage,
   onDarkPage,
   showRuler,
@@ -1479,6 +1539,17 @@ export function ViewTab({
             </span>
             <span>{t('ribbonWholePage')}</span>
           </button>
+          <button
+            className="rb-big"
+            disabled={!hasDoc}
+            data-tip={t('ribbonMultiPageTip')}
+            onClick={() => onZoomFit('multi')}
+          >
+            <span className="rb-big-icon">
+              <IconMultiPage size={BIG} />
+            </span>
+            <span>{t('ribbonMultiPage')}</span>
+          </button>
         </div>
         <div className="ribbon-group-label">{t('ribbonGroupZoom')}</div>
       </div>
@@ -1487,16 +1558,6 @@ export function ViewTab({
 
       <div className="ribbon-group">
         <div className="ribbon-group-items">
-          <button
-            className={`rb-big ${showAi ? 'active' : ''}`}
-            data-tip={t('ribbonAiPanelTip')}
-            onClick={onToggleAi}
-          >
-            <span className="rb-big-icon">
-              <IconAiPanel size={BIG} />
-            </span>
-            <span>{t('ribbonAiPanel')}</span>
-          </button>
           <button
             className={`rb-big ${darkPage ? 'active' : ''}`}
             data-tip={t('ribbonDarkModeTip')}

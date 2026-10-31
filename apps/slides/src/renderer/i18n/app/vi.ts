@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const vi = {
+  redactMenuLabel: 'Ẩn phần đã chọn khỏi AI',
+  redactDialogDesc:
+    'Nội dung đã chọn vẫn còn trong tài liệu và tệp; mô hình chỉ thấy placeholder bên dưới. Đặt tên để mô hình biết nó đại diện cho điều gì.',
+  redactDialogScope:
+    'Điều này chỉ áp dụng cho AI trong ứng dụng này. CLI, các công cụ MCP và bản xuất không có cửa sổ đều đọc thẳng tệp, nên chúng vẫn thấy những từ này.',
+  redactDialogPlaceholder: 'Tên placeholder, ví dụ: số điện thoại khách hàng',
+  redactCancel: 'Hủy',
+  redactInsert: 'Ẩn',
+  redactEnable: 'Nhấp chuột phải vào phần đã chọn để ẩn khỏi mô hình.',
+
   appPhPromptTitle: 'Bấm để thêm tiêu đề',
   appPhPromptSubtitle: 'Bấm để thêm phụ đề',
   appPhPromptBody: 'Bấm để thêm văn bản',
@@ -51,8 +61,8 @@ export const vi = {
   appStatusEquationInserted: 'Đã chèn phương trình',
   appStatusVideoInserted: 'Đã chèn video (được nhúng trong tệp .pptx; phát được trong PowerPoint)',
   appStatusAudioInserted: 'Đã chèn âm thanh (được nhúng trong tệp .pptx)',
-  appStatusModel3dInserted:
-    'Đã nhúng mô hình 3D (vùng vẽ hiển thị phần giữ chỗ; tệp mô hình được lưu trong tệp .pptx)',
+  appStatusModel3dInserted: 'Đã chèn mô hình 3D: chọn để xoay (PowerPoint cũng hiển thị ở dạng 3D)',
+  appStatusModel3dNoPreview: 'Không thể vẽ mô hình 3D tại đây; hình ảnh của nó không thay đổi',
   appStatusRecordingEmpty: 'Bản ghi trống; không có gì được chèn',
   appStatusRecordingInserted: 'Đã chèn bản ghi màn hình vào trang chiếu hiện tại (nhúng webm)',
   appStatusRecording: 'Đang ghi hình… nhấp lại vào "Ghi màn hình" để dừng và chèn',
@@ -210,6 +220,8 @@ export const vi = {
   appMasterFillNone: 'Không tô màu',
   appMasterStroke: 'Màu viền…',
   appMasterStrokeNone: 'Không viền',
+  appMasterInsertTextBox: 'Hộp văn bản',
+  appMasterInsertShape: 'Hình dạng',
   appStartOpening: 'Đang mở…',
   appReadingSlideTitle: 'Nhấp để chuyển sang trang chiếu tiếp theo (Esc để thoát Chế độ đọc)',
   appReadingPrev: '‹ Trước',
@@ -236,6 +248,13 @@ export const vi = {
     'Tổng thời gian cho buổi trình chiếu là {duration}. Bạn có muốn lưu thời gian trang chiếu để tự động chuyển trang không?',
   appRehearseDiscard: 'Không lưu',
   appRehearseSave: 'Lưu',
+  appRecordTitle: 'Ghi tường thuật',
+  appRecordSummary: 'Thời lượng ghi {duration}. Lưu tường thuật và thời gian của từng trang chiếu?',
+  appRecordDiscard: 'Không lưu',
+  appRecordSave: 'Lưu',
+  appStatusRecordSaved: 'Đã lưu tường thuật trên {count} trang chiếu (PowerPoint cũng phát được)',
+  appStatusRecordFailed: 'Không thể lưu bản ghi',
+  appStatusNarrationCleared: 'Đã xóa tường thuật',
   appSettingsTitle: 'Cài đặt AI',
   appSettingsAccount: 'Tài khoản Genspark',
   appSettingsChecking: 'Đang kiểm tra…',

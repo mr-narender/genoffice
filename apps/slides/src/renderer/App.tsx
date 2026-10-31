@@ -9,6 +9,7 @@ import type {
   PictureRenderNode,
   TableRenderNode,
 } from '@genoffice/pptx-render'
+import { animGalleryKind } from './animation-play'
 import { handleSlidesControl, type ControlRequest } from './control'
 import type {
   AiSettings,
@@ -31,6 +32,8 @@ import type {
   SlideComment,
   TransitionKind,
 } from '../shared/ipc'
+import { baseName } from '../shared/base-name'
+import { mergeBroadcastUpdate, mergeSlideUpdate, setDeckRefresh } from '../shared/slide-update'
 import { SlideCanvas, selectionChromeColor, type SlideCanvasHandle } from './SlideCanvas'
 import { tableCellOverlayBox } from './table-hit'
 import { ZOOM_PREVIEW_EVENT } from './zoom-preview'
@@ -63,6 +66,7 @@ import {
   type ContextTabRequest,
 } from './components/context-tabs'
 import { SlideShowView } from './components/SlideShowView'
+import type { NarrationTake } from './narration/use-recording'
 import { IconNotes, IconPlayBoxed } from './components/icons'
 import { PresenterView } from './components/PresenterView'
 import { CustomShowDialog } from './components/CustomShowDialog'
@@ -92,7 +96,10 @@ import { CommentsPane } from './components/CommentsPane'
 import { AnimationPane } from './components/AnimationPane'
 import { AnimPreviewOverlay } from './components/AnimatedSlide'
 import { EquationDialog, HeaderFooterDialog, LinkDialog } from './components/InsertDialogs'
+import { RedactDialog } from './components/RedactDialog'
 import { ZoomDialog } from './components/ZoomDialog'
+import { SlideSizeDialog } from './components/SlideSizeDialog'
+import { defaultNewSlideSize } from './slide-size'
 import { CutoutDialog } from './components/CutoutDialog'
 import {
   createWheelPager,
@@ -102,6 +109,7 @@ import {
   type WordArtPreset,
   aiPanelInitiallyOpen,
   rememberAiPanelOpen,
+  useAiSidebarEnabled,
 } from '@genoffice/ui'
 import type { ChartPresetDef, IconDef, SmartArtDef } from './insert-presets'
 import { GensparkMark, IconAiBeautify, IconAiFactCheck, IconAiImage } from './components/icons'
@@ -122,6 +130,7 @@ import type {
   EditingState,
   HfDialogState,
   LinkDialogState,
+  RedactDialogState,
   SlideShowState,
   EditPointsState,
   UngroupedSet,
@@ -134,6 +143,9 @@ import { formatRulerValue, type RulerUnit } from './ruler-ticks'
 import * as fileActions from './file-actions'
 import * as clipboardActions from './clipboard-actions'
 import * as insertActions from './insert-actions'
+import * as model3dActions from './model3d/actions'
+import { Model3dTurnHandle } from './model3d/Model3dTurnHandle'
+import type { Model3dRotation } from '@genoffice/pptx-engine/model3d'
 import { bytesToBase64 } from './insert-actions'
 import { classifyDroppedFile, fileExt } from '../shared/media-kinds'
 import * as animationActions from './animation-actions'
@@ -142,11 +154,20 @@ import * as slideActions from './slide-actions'
 import * as zoomActions from './zoom-actions'
 import { groupSections } from './section-groups'
 import * as pictureEditActions from './picture-edit-actions'
+import * as redactActions from './redact-actions'
 import * as arrangeActions from './arrange-actions'
 import * as tableActions from './table-actions'
 import * as styleActions from './style-actions'
 import { handleGlobalKeydown, slideRailHasFocus } from './keyboard-actions'
 import { clickSelection, currentAfterHistory, normalizeSelection } from '../shared/slide-selection'
+import {
+  notesBaselineAfterFlush,
+  notesDraftIndex,
+  retargetNotesDraft,
+  startNotesDraft,
+  type LoadedNotes,
+  type NotesDraft,
+} from '../shared/notes-draft'
 import { useEscOverlay, useEscOverlayOpen } from './esc-overlay'
 import { buildCtxItems } from './context-menu-items'
 import { isMac, nextSelection } from './platform-modifiers'
@@ -463,6 +484,11 @@ export function App() {
     window.slidesApi.setAutoSavePref?.(autoSave)
   }, [autoSave])
   const [showAi, setShowAi] = useState(() => aiPanelInitiallyOpen('ai-slides-show-ai'))
+  // Settings › "show the AI sidebar" off hides the panel and its rail (Word's
+  // Copilot-pane model): an explicit Ask-AI action still opens the panel for
+  // this deck, and closing it returns to hidden. The dock stays mounted; the
+  // hook closes it when the switch itself goes off.
+  const aiSidebarEnabled = useAiSidebarEnabled(setShowAi)
   const [showFormat, setShowFormat] = useState(false)
   const [showBgFormat, setShowBgFormat] = useState(false)
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null)
@@ -537,6 +563,7 @@ export function App() {
   const [findOpen, setFindOpen] = useState(false)
   /** Per-page dwell seconds awaiting confirmation after rehearsal (non-null shows the "save?" confirmation dialog) */
   const [pendingRehearse, setPendingRehearse] = useState<number[] | null>(null)
+  const [pendingRecording, setPendingRecording] = useState<NarrationTake | null>(null)
   const [showRuler, setShowRuler] = useState(false)
   const [showGrid, setShowGrid] = useState(false)
   const [showGuides, setShowGuides] = useState(false)
@@ -552,7 +579,9 @@ export function App() {
   const [showNotes, setShowNotes] = useState(true)
   const [notesText, setNotesText] = useState('')
   /** Unsaved notes draft (flushed before page switch/save) */
-  const notesDraftRef = useRef<{ index: number; text: string } | null>(null)
+  const notesDraftRef = useRef<NotesDraft | null>(null)
+  /** Notes as last read from the document, so a draft knows what it started from */
+  const notesLoadedRef = useRef<LoadedNotes | null>(null)
   /** Notes pane height (px): default shows ~4 lines (PowerPoint-like), drag-resizable */
   const [notesHeight, setNotesHeight] = useState(100)
   const notesDragRef = useRef<{ startY: number; startH: number } | null>(null)
@@ -590,9 +619,12 @@ export function App() {
   const [annotationsNonce, setAnnotationsNonce] = useState(0)
   // ── Insert tab extensions: dialogs + screen recording ──────────────────────
   const [linkDialog, setLinkDialog] = useState<LinkDialogState | null>(null)
+  const [redactDialog, setRedactDialog] = useState<RedactDialogState | null>(null)
   const [hfDialog, setHfDialog] = useState<HfDialogState | null>(null)
   const [eqDialogOpen, setEqDialogOpen] = useState(false)
   const [zoomDialog, setZoomDialog] = useState<zoomActions.ZoomMode | null>(null)
+  /** Design › Slide Size › Custom Size… open, with the deck size it opened on */
+  const [slideSizeDialog, setSlideSizeDialog] = useState<{ cx: number; cy: number } | null>(null)
   const recorderRef = useRef<{ rec: MediaRecorder; stream: MediaStream } | null>(null)
   const [recording, setRecording] = useState(false)
   // ── Layout picking: layout list + slide size (loaded after the file opens) ─────────────────
@@ -656,7 +688,12 @@ export function App() {
     if (!pending) return
     notesDraftRef.current = null
     const ok = await window.slidesApi.setNotes({ slideIndex: pending.index, text: pending.text })
-    if (ok) setDirty(true)
+    if (!ok) return
+    setDirty(true)
+    // read back: the document normalizes what it stores (trailing empty paragraphs), and the
+    // baseline must match what a later getNotes returns
+    const stored = await window.slidesApi.getNotes(pending.index)
+    notesLoadedRef.current = notesBaselineAfterFlush(notesLoadedRef.current, pending.index, stored)
   }, [])
 
   // Uncapped proportional fit ratio from the stage container's measured size
@@ -853,7 +890,7 @@ export function App() {
       setStatus(
         result.path
           ? t('appStatusOpened', {
-              name: result.path.split('/').pop()!,
+              name: baseName(result.path),
               count: result.slides.length,
             })
           : t('appStatusNewBlank'),
@@ -931,16 +968,32 @@ export function App() {
   // Shared session (a second window on the same file): apply the other window's
   // edits without touching local selection or an open editor — the ids are stable,
   // so the selection stays valid; a same-element conflict resolves last-write-wins.
+  const refreshDeck = useCallback(() => {
+    void window.slidesApi
+      .getRenderSlides()
+      .then((slides) => {
+        if (slides) setSlides(slides)
+      })
+      .catch((error) => console.error('Failed to refresh deck:', error))
+  }, [])
+  useEffect(() => {
+    setDeckRefresh(refreshDeck)
+    return () => setDeckRefresh(null)
+  }, [refreshDeck])
   useEffect(
     () =>
-      window.slidesApi.onDeckChanged?.(({ slides: all }) => {
-        setSlides(all)
-        setCurrent((c) => Math.min(c, Math.max(0, all.length - 1)))
+      window.slidesApi.onDeckChanged?.(({ slides: all, order }) => {
+        setSlides((current) =>
+          order
+            ? (mergeBroadcastUpdate(current, { slides: all, order }, refreshDeck) ?? current)
+            : all,
+        )
+        setCurrent((c) => Math.min(c, Math.max(0, (order?.length ?? all.length) - 1)))
         // The broadcast also fires for undo back to a clean state — ask the
         // session instead of assuming the change dirtied it
         void window.slidesApi.isDirty?.().then((d) => setDirty(!!d))
       }),
-    [],
+    [refreshDeck],
   )
 
   // Auto-save (off by default): when on and a file path exists, silently write back every 30s + on blur.
@@ -982,7 +1035,11 @@ export function App() {
   }, [autoSave, path, editing, editingCell, save])
 
   const saveAs = useCallback(() => fileActions.saveAs(() => ctxRef.current), [])
-  const exportImages = useCallback(() => fileActions.exportImages(ctxRef.current), [])
+  const nameWithAi = useCallback(() => fileActions.nameWithAi(() => ctxRef.current), [])
+  const exportImages = useCallback(
+    (format: 'png' | 'jpg' = 'png') => fileActions.exportImages(ctxRef.current, format),
+    [],
+  )
   const exportPdf = useCallback(() => void fileActions.exportPdf(ctxRef.current), [])
 
   // Headless export mode (--headless-export): this renderer lives in a hidden
@@ -1200,7 +1257,7 @@ export function App() {
   }, [hasDoc, viewMode, previewZoom, slides.length])
 
   const newBlank = useCallback(async () => {
-    const r = await window.slidesApi.newBlank(FIT_WIDTH)
+    const r = await window.slidesApi.newBlank(FIT_WIDTH, defaultNewSlideSize() ?? undefined)
     applyOpen(r)
     return r
   }, [applyOpen])
@@ -1250,7 +1307,9 @@ export function App() {
   )
 
   useEffect(() => {
-    void window.slidesApi.getAiSettings().then(setAiSettings)
+    const loadSettings = () => void window.slidesApi.getAiSettings().then(setAiSettings)
+    loadSettings()
+    return window.slidesApi.onAiSettingsChanged?.(loadSettings)
   }, [])
 
   // Recent files for the start screen
@@ -1515,11 +1574,25 @@ export function App() {
     setSelectedIds([])
     setEditing(null)
     setDirty(true)
-    // The deck is the new truth: drop an in-progress notes draft (same as undo) so a stale
-    // draft can't overwrite what the AI batch wrote via setNotes on the next flush, then
-    // re-fetch notes/comments, which aren't part of RenderSlide.
+    // Notes/comments aren't part of RenderSlide, so the re-fetch below reads them back. A
+    // notes draft the user is typing survives unless the batch rewrote that slide's notes
+    // (or removed the slide): park it while the stored text is compared, so the re-fetch's
+    // flush can't write a stale draft over what the batch wrote via setNotes.
+    const draft = notesDraftRef.current
     notesDraftRef.current = null
-    setAnnotationsNonce((n) => n + 1)
+    if (!draft) {
+      setAnnotationsNonce((n) => n + 1)
+      return
+    }
+    const index = notesDraftIndex(draft, all)
+    void (index < 0 ? Promise.resolve('') : window.slidesApi.getNotes(index)).then((stored) => {
+      const kept = retargetNotesDraft(draft, all, stored)
+      const typedSince = notesDraftRef.current
+      if (kept && (!typedSince || typedSince.index === draft.index)) {
+        notesDraftRef.current = typedSince ? { ...typedSince, index: kept.index } : kept
+      }
+      setAnnotationsNonce((n) => n + 1)
+    })
   }, [])
 
   const addSlide = useCallback(() => slideActions.addSlide(ctxRef.current), [])
@@ -1638,6 +1711,10 @@ export function App() {
     (target: LinkTargetOp | null) => insertActions.applyLink(ctxRef.current, target),
     [],
   )
+  const applyRedaction = useCallback(
+    (label: string | null) => redactActions.applyRedaction(ctxRef.current, label),
+    [],
+  )
   const insertZooms = useCallback((mode: zoomActions.ZoomMode, keys: number[]) => {
     setZoomDialog(null)
     if (mode === 'summary') return zoomActions.insertSummaryZoom(ctxRef.current, keys)
@@ -1658,7 +1735,7 @@ export function App() {
     (kind: 'video' | 'audio') => insertActions.insertMediaFile(ctxRef.current, kind),
     [],
   )
-  const insertModel3dFile = useCallback(() => insertActions.insertModel3dFile(ctxRef.current), [])
+  const insertModel3dFile = useCallback(() => model3dActions.insertModel3dFile(ctxRef.current), [])
   const toggleScreenRecord = useCallback(() => insertActions.toggleScreenRecord(ctxRef.current), [])
 
   // Reflect the current page's transition effect on page/document changes
@@ -1788,7 +1865,8 @@ export function App() {
   /** Selected shape's current animation effect (gallery highlight: first match). */
   const selectedAnimEffect = useMemo(() => {
     if (selectedIds.length === 0) return null
-    return animations.find((a) => a.sourceId === selectedIds[0])?.effect ?? null
+    const first = animations.find((a) => a.sourceId === selectedIds[0])
+    return first ? animGalleryKind(first) : null
   }, [selectedIds, animations])
 
   const toggleAnimPane = useCallback(() => {
@@ -1859,6 +1937,19 @@ export function App() {
     [],
   )
   const saveRehearseTimings = useCallback(() => showActions.saveRehearseTimings(ctxRef.current), [])
+  const startRecordShow = useCallback(
+    (fromStart: boolean) => showActions.startRecordShow(ctxRef.current, fromStart),
+    [],
+  )
+  const onRecordDone = useCallback(
+    (take: Promise<NarrationTake | null>) => showActions.onRecordDone(ctxRef.current, take),
+    [],
+  )
+  const saveRecording = useCallback(() => showActions.saveRecording(ctxRef.current), [])
+  const clearNarration = useCallback(
+    (all: boolean) => void showActions.clearNarration(ctxRef.current, all),
+    [],
+  )
   const startPresenterView = useCallback(
     (fromStart: boolean) => showActions.startPresenterView(ctxRef.current, fromStart),
     [],
@@ -1919,7 +2010,9 @@ export function App() {
     void flushNotes()
       .then(() => window.slidesApi.getNotes(current))
       .then((t) => {
-        if (!cancelled) setNotesText(t)
+        if (cancelled) return
+        notesLoadedRef.current = { index: current, text: t }
+        setNotesText(t)
       })
     return () => {
       cancelled = true
@@ -1929,7 +2022,13 @@ export function App() {
   const onNotesChange = useCallback(
     (text: string) => {
       setNotesText(text)
-      notesDraftRef.current = { index: current, text }
+      notesDraftRef.current = startNotesDraft(
+        notesDraftRef.current,
+        notesLoadedRef.current,
+        current,
+        text,
+        ctxRef.current.slides[current]?.partPath,
+      )
     },
     [current],
   )
@@ -2247,9 +2346,11 @@ export function App() {
       if (cmd === 'open') void openDialog()
       else if (cmd === 'save') void save()
       else if (cmd === 'save-as') void saveAs()
+      else if (cmd === 'name-with-ai') void nameWithAi()
       // macOS has no File ribbon tab, so these only exist in the menu
       else if (cmd === 'export-pdf') void exportPdf()
-      else if (cmd === 'export-images') void exportImages()
+      else if (cmd === 'export-images') void exportImages('png')
+      else if (cmd === 'export-images-jpg') void exportImages('jpg')
       else if (cmd === 'print') setPrintDlgOpen(true)
       // Through the preview path so the zoom pivots on the viewport center, not the scroll origin
       else if (cmd === 'zoom-in') previewZoom(nextPreset)
@@ -2274,6 +2375,7 @@ export function App() {
     openDialog,
     save,
     saveAs,
+    nameWithAi,
     exportPdf,
     exportImages,
     undo,
@@ -2539,6 +2641,42 @@ export function App() {
     [current],
   )
 
+  const onTransformMulti = useCallback(
+    async (
+      items: Array<{
+        sourceId: string
+        groupId?: string
+        box: { x: number; y: number; w: number; h: number; rotationDeg: number }
+      }>,
+    ) => {
+      const updated = await window.slidesApi.editTransformMulti({
+        slideIndex: current,
+        fitWidthPx: FIT_WIDTH,
+        items: items.map((it) => ({
+          sourceId: it.sourceId,
+          ...(it.groupId ? { groupId: it.groupId } : {}),
+          xPx: it.box.x,
+          yPx: it.box.y,
+          wPx: it.box.w,
+          hPx: it.box.h,
+          rotationDeg: it.box.rotationDeg,
+        })),
+      })
+      if (updated) {
+        setSlides((s) => s.map((sl, i) => (i === current ? updated : sl)))
+        setDirty(true)
+      }
+    },
+    [current],
+  )
+
+  const onTransformCancel = useCallback(async () => {
+    const updated = await window.slidesApi.cancelTransformPreview({ slideIndex: current })
+    if (updated) setSlides((s) => s.map((sl, i) => (i === current ? updated : sl)))
+    // Preview frames marked the deck dirty; the rollback may have made it clean again
+    void window.slidesApi.isDirty().then(setDirty)
+  }, [current])
+
   // Yellow adjust-handle drag: throttled preview commits keep the geometry live,
   // the release commit is never dropped (edit-transform gesture undo semantics)
   const adjustLastSent = useRef(0)
@@ -2740,6 +2878,14 @@ export function App() {
   const selectedNode = useMemo(
     () => (selectedIds.length === 1 ? (findNodeCtx(selectedIds[0]!)?.node ?? null) : null),
     [selectedIds, findNodeCtx],
+  )
+
+  const model3dNode = useMemo(
+    () =>
+      selectedNode?.type === 'picture' && selectedNode.model3d
+        ? (selectedNode as PictureRenderNode & { model3d: Model3dRotation })
+        : null,
+    [selectedNode],
   )
 
   const [selectedChartData, setSelectedChartData] = useState<Awaited<
@@ -3022,6 +3168,8 @@ export function App() {
     setCustomShowDlgOpen,
     pendingRehearse,
     setPendingRehearse,
+    pendingRecording,
+    setPendingRecording,
     sections,
     setSections,
     renamingSec,
@@ -3039,6 +3187,8 @@ export function App() {
     commitEditPoints,
     linkDialog,
     setLinkDialog,
+    redactDialog,
+    setRedactDialog,
     setHfDialog,
     setEqDialogOpen,
     setChartDataDialogInit,
@@ -3060,6 +3210,7 @@ export function App() {
     setRecording,
     editingActiveRef,
     applySlide,
+    applyDeck,
     flushNotes,
     findNodeCtx,
     groupIdOf,
@@ -3135,6 +3286,17 @@ export function App() {
       })
   })
 
+  const applySlideSize = (cx: number, cy: number) =>
+    void window.slidesApi.setSlideSize({ cx, cy }).then((all) => {
+      if (all) {
+        setSlides(all)
+        // Every slide re-materializes with fresh element ids
+        setSelectedIds([])
+        setEditing(null)
+        setDirty(true)
+      }
+    })
+
   return (
     <div className="app">
       <ToastHost />
@@ -3152,9 +3314,11 @@ export function App() {
         onUndo={() => void undo()}
         onRedo={() => void redo()}
         onSaveAs={() => void saveAs()}
+        onNameWithAi={() => void nameWithAi()}
         onExportPdf={() => void exportPdf()}
         onPrint={() => setPrintDlgOpen(true)}
-        onExportImages={() => void exportImages()}
+        onExportImages={() => void exportImages('png')}
+        onExportImagesJpg={() => void exportImages('jpg')}
         onFormat={onFormat}
         zoom={zoom}
         onZoom={previewZoom}
@@ -3204,25 +3368,12 @@ export function App() {
           void slideActions.setSlideLayoutAt(ctxRef.current, current, layoutPath)
         }
         onResetLayout={() => void slideActions.setSlideLayoutAt(ctxRef.current, current)}
-        onSlideSize={(cx, cy) =>
-          void window.slidesApi.setSlideSize({ cx, cy }).then((all) => {
-            if (all) {
-              setSlides(all)
-              // Every slide re-materializes with fresh element ids
-              setSelectedIds([])
-              setEditing(null)
-              setDirty(true)
-            }
+        onSlideSize={applySlideSize}
+        getSlideSize={() => window.slidesApi.getSlideSize()}
+        onCustomSlideSize={() =>
+          void window.slidesApi.getSlideSize().then((size) => {
+            if (size) setSlideSizeDialog(size)
           })
-        }
-        slideSizeKey={
-          slide
-            ? Math.abs(slide.widthPx / slide.heightPx - 16 / 9) < 0.02
-              ? '16:9'
-              : Math.abs(slide.widthPx / slide.heightPx - 4 / 3) < 0.02
-                ? '4:3'
-                : null
-            : null
         }
         onParagraphFormat={onParagraphFormat}
         onDirection={onDirection}
@@ -3259,6 +3410,8 @@ export function App() {
         onPresenterView={startPresenterView}
         onCustomShow={() => setCustomShowDlgOpen(true)}
         onRehearse={startRehearseShow}
+        onRecord={startRecordShow}
+        onClearNarration={clearNarration}
         currentHidden={!!slide?.hidden}
         onToggleHidden={() => void toggleHidden()}
         inkTool={inkTool}
@@ -3302,6 +3455,17 @@ export function App() {
         recording={recording}
         onToggleScreenRecord={() => void toggleScreenRecord()}
         contextElementType={contextElementType}
+        onModel3dView={
+          model3dNode
+            ? (rot) =>
+                void model3dActions.storeModel3dView(
+                  ctxRef.current,
+                  model3dNode.sourceId,
+                  model3dNode.box,
+                  rot,
+                )
+            : undefined
+        }
         tabRequest={contextTabRequest}
         contextElementId={selectedNode?.sourceId}
         contextSlideIndex={current}
@@ -3465,7 +3629,11 @@ export function App() {
 
       <div className="app-main">
         {slide && viewMode !== 'reading' && viewMode !== 'sorter' && (
-          <div className={`ai-dock${showAi && aiSettings ? '' : ' collapsed'}`}>
+          <div
+            className={`ai-dock${showAi && aiSettings ? '' : ' collapsed'}${
+              !aiSidebarEnabled && !showAi ? ' ai-dock-off' : ''
+            }`}
+          >
             {/* always mounted once settings load: collapse must not drop state or in-flight runs */}
             {aiSettings ? (
               <AiPanel
@@ -3481,6 +3649,7 @@ export function App() {
                 settings={aiSettings}
                 preset={aiPreset}
                 open={showAi}
+                hideRail={!aiSidebarEnabled}
                 onExpand={toggleAi}
                 onCollapse={toggleAi}
                 onUndo={() => void undo()}
@@ -3503,7 +3672,7 @@ export function App() {
                   setEditQueue((prev) => prev.filter((it) => !keys.includes(it.key)))
                 }
               />
-            ) : (
+            ) : aiSidebarEnabled ? (
               <button
                 className="ai-rail"
                 onClick={toggleAi}
@@ -3512,7 +3681,7 @@ export function App() {
               >
                 <GensparkMark size={22} />
               </button>
-            )}
+            ) : null}
           </div>
         )}
         <div className="app-content">
@@ -3964,7 +4133,9 @@ export function App() {
                               onOpenContextTab={openContextTab}
                               onContextMenu={onCanvasContextMenu}
                               onMarqueeSelect={setSelectedIds}
-                              onDuplicateTo={(id, dx, dy) => void duplicateSelected([id], dx, dy)}
+                              onDuplicateTo={(ids, dx, dy) => void duplicateSelected(ids, dx, dy)}
+                              onTransformMulti={onTransformMulti}
+                              onTransformCancel={onTransformCancel}
                               images={images}
                               zoom={zoom}
                               enteredGroupId={enteredGroupId}
@@ -4106,6 +4277,22 @@ export function App() {
                                 frameColor={selectionChromeColor(slide, images, cellEditNode.box)}
                                 zoom={zoom}
                                 onContextMenu={onTextContextMenu}
+                              />
+                            )}
+                            {model3dNode && !mediaPlay && !cropTarget && (
+                              <Model3dTurnHandle
+                                key={model3dNode.sourceId}
+                                node={model3dNode}
+                                slideIndex={current}
+                                onTurn={(rot, view) =>
+                                  model3dActions.storeModel3dView(
+                                    ctxRef.current,
+                                    model3dNode.sourceId,
+                                    model3dNode.box,
+                                    rot,
+                                    view,
+                                  )
+                                }
                               />
                             )}
                             {mediaPlay && mediaPlayNode && (
@@ -4372,6 +4559,8 @@ export function App() {
           customOrder={slideShow.customOrder}
           rehearseMode={slideShow.rehearse}
           onRehearseDone={onRehearseDone}
+          recordMode={slideShow.record}
+          onRecordDone={onRecordDone}
           onExit={exitSlideShow}
         />
       )}
@@ -4406,6 +4595,13 @@ export function App() {
           onClose={() => setLinkDialog(null)}
         />
       )}
+      {redactDialog && (
+        <RedactDialog
+          seed={redactDialog.seed}
+          onSubmit={(label) => void applyRedaction(label)}
+          onCancel={() => setRedactDialog(null)}
+        />
+      )}
       {hfDialog && (
         <HeaderFooterDialog
           initial={hfDialog}
@@ -4428,6 +4624,18 @@ export function App() {
           currentSlide={current}
           onInsert={(keys) => void insertZooms(zoomDialog, keys)}
           onClose={() => setZoomDialog(null)}
+        />
+      )}
+
+      {slideSizeDialog && (
+        <SlideSizeDialog
+          initial={slideSizeDialog}
+          defaultUnit={rulerUnit}
+          onApply={(cx, cy) => {
+            setSlideSizeDialog(null)
+            applySlideSize(cx, cy)
+          }}
+          onClose={() => setSlideSizeDialog(null)}
         />
       )}
 
@@ -4466,8 +4674,8 @@ export function App() {
             setCurrent(si)
             setSelectedIds([id])
           }}
-          onReplaced={(all) => {
-            setSlides(all)
+          onReplaced={(update) => {
+            setSlides((current) => mergeSlideUpdate(current, update))
             setDirty(true)
           }}
           onClose={() => setFindOpen(false)}
@@ -4487,6 +4695,23 @@ export function App() {
               <button onClick={() => setPendingRehearse(null)}>{t('appRehearseDiscard')}</button>
               <button className="primary" onClick={() => void saveRehearseTimings()}>
                 {t('appRehearseSave')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingRecording && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>{t('appRecordTitle')}</h2>
+            <p className="rehearse-summary">
+              {t('appRecordSummary', { duration: formatClock(pendingRecording.endMs) })}
+            </p>
+            <div className="modal-actions">
+              <button onClick={() => setPendingRecording(null)}>{t('appRecordDiscard')}</button>
+              <button className="primary" onClick={() => void saveRecording()}>
+                {t('appRecordSave')}
               </button>
             </div>
           </div>

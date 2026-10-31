@@ -100,6 +100,11 @@ export const cs = {
     'Sledování změn zapnuto: úpravy obsahu od AI se označují jako revize (vložení podtržené, odstranění přeškrtnuté); přijměte nebo odmítněte v části Revize',
   aiTrackOffTitle:
     'Sledování změn vypnuto: úpravy AI se použijí okamžitě (stále se můžete vrátit pomocí snímků)',
+  aiRevisionBarTitle: 'Revize',
+  aiRevisionCount: 'Čekající změny: {count}',
+  aiRevisionRejectAll: 'Odmítnout vše',
+  aiRevisionAcceptAll: 'Přijmout vše',
+  aiRevisionPara: 'Odstavec {n}',
   aiTurnLimit:
     'Tento úkol byl pozastaven před dokončením všech kroků. Dokončené úpravy jsou zachovány; vyberte Pokračovat pro dokončení zbývající práce.',
   aiStopped: '(Zastaveno)',
@@ -112,6 +117,8 @@ export const cs = {
   aiUnknownError: 'Neznámá chyba',
   aiTimeoutError:
     'Časový limit požadavku AI vypršel: síť neodpověděla, běh byl zastaven. Zkontrolujte připojení a zkuste to znovu',
+  aiRegionError:
+    'Poskytovatel tohoto modelu neposkytuje služby ve vaší aktuální oblasti — vyberte jiný model nebo změňte síť',
   aiOverloadedError: 'Služba AI je právě zaneprázdněna – zkuste to prosím za chvíli znovu',
   aiNetworkError:
     'Problém se sítí: nepodařilo se připojit ke službě AI. Zkontrolujte připojení a zkuste to znovu',
@@ -121,6 +128,9 @@ export const cs = {
   aiSumImageAttachment: 'Obrázková příloha {name}',
   aiSumRead: 'Přečteno {name}',
   aiSumReadAttachmentName: 'Přečtena příloha {name}',
+  aiSumSkillsList: 'Výpis nainstalovaných skillů',
+  aiSumSkillRead: 'Přečten skill {name}',
+  aiSumRunCli: 'Spuštěno {args}',
   aiSumWebSearch: 'Hledání na webu',
   aiSumWebSearchDone: 'Hledáno „{query}“ ({count} výsledků)',
   aiSumImageSearch: 'Hledání obrázků',
@@ -183,4 +193,19 @@ export const cs = {
   aiCmdImages: 'Aktualizováno obrázků: {count}',
   aiCmdToc: 'Vložen obsah ({count} položek)',
   aiCmdSkipped: ' (přeskočeno {count} chráněných bloků)',
+  aiStarterMindMap: 'Vytvořit myšlenkovou mapu tohoto dokumentu',
+  aiMindMapBtn: 'Myšlenková mapa AI',
+  aiMindMapPrompt:
+    'Vytvoř myšlenkovou mapu tohoto dokumentu a uspořádej hlavní témata a klíčové pojmy podle struktury sekcí',
+  aiSumMindMap: 'Vytvořit myšlenkovou mapu',
+  aiMindMapTitle: 'Myšlenková mapa',
+  aiMindMapNodes: '{count} uzlů',
+  aiMindMapAskPrompt: 'Pověz mi o „{label}“ v tomto dokumentu',
+  aiMindMapJump: 'Přejít na citovanou pasáž',
+  aiMindMapExport: 'Exportovat PNG',
+  aiMindMapExportSvg: 'Exportovat SVG',
+  aiMindMapInsert: 'Vložit do dokumentu',
+  aiMindMapReset: 'Obnovit zobrazení',
+  aiMindMapExpand: 'Rozbalit větev',
+  aiMindMapCollapse: 'Sbalit větev',
 } satisfies Record<keyof typeof zh, string>

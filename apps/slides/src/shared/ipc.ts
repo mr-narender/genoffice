@@ -11,6 +11,9 @@ import type { AiPanelPrefs } from '@genoffice/ui'
 import type { RenderSlide } from '@genoffice/pptx-render'
 import type { CustGeomPathCmd, SlideComment, SectionInfo } from '@genoffice/pptx-engine'
 import type { FontSizeStep } from '@genoffice/pptx-ops/font-size'
+// the font catalog's shape is the store's to declare, not a copy kept in step by hand
+import type { CatalogEntry as FontCatalogEntry } from '@genoffice/electron-utils/font-store'
+import type { LayoutSkeleton } from '../renderer/ai/layout-skeleton'
 import type {
   AiSettings,
   AiStreamChunk,
@@ -166,7 +169,7 @@ export interface ApplyTxnResult {
   plan?: string[]
   failures?: Array<{ index: number; error: string }>
   /** compact journal echo: op name, target, ids minted by additive ops */
-  records?: Array<{ op: string; target?: string; created?: string[] }>
+  records?: Array<{ op: string; target?: string; created?: string[]; note?: string }>
   /** full deck after a mutation (a transaction may touch any slide) */
   slides?: RenderSlide[]
 }
@@ -326,6 +329,24 @@ export interface MasterEditStrokeOp {
 
 export interface MasterDeleteElementOp {
   sourceId: string
+}
+
+/** Insert onto the current master/layout part; pixel coordinates like AddElementOp, the part is the session's edit target */
+export interface MasterAddElementOp {
+  kind: InsertKind
+  xPx: number
+  yPx: number
+  wPx: number
+  hPx: number
+  fitWidthPx: number
+  /** Rich-text paragraphs (a text box starts empty; shape defaults apply otherwise) */
+  paragraphs?: EditParagraph[]
+  /** Shape solid fill #RRGGBB */
+  fillColor?: string
+  /** Shape stroke (solid color + point width) */
+  stroke?: { color: string; widthPt: number }
+  /** Text body wrap / autofit (click-to-type text boxes); absent = wrap="square", no autofit */
+  bodyPr?: { wrap?: 'square' | 'none'; autoFit?: 'shrink' | 'resize' }
 }
 
 /** Find/replace: matches within runs across pages; firstOnly+elementId used by "Replace" for the current hit. */
@@ -551,11 +572,15 @@ export type TransitionKind =
 
 // ── Shape animations (the "Animations" tab) ──────────────────────────
 
+/** Reveal direction for the directional effects. 'bottom' reveals upward (default). */
+export type AnimDirection = 'top' | 'bottom' | 'left' | 'right'
+
 export type AnimEffectKind =
   | 'appear'
   | 'fade'
   | 'flyIn'
   | 'wipe'
+  /** Write-compatible alias for wipe with direction 'top' (the same preset subtype). */
   | 'wipeDown'
   | 'splitIn'
   | 'bounce'
@@ -589,6 +614,9 @@ export interface AnimationItem {
   delayMs: number
   /** Path when effect='motionPath' (SVG subset M/L/C/Z, coordinates 0..1 relative to slide width/height) */
   motionPath?: string
+  /** Wipe/fly direction (enters only when the engine models one); the player reads it
+   *  so a top wipe does not play bottom-up. Defaults per effect when absent. */
+  direction?: AnimDirection
   /** Per-paragraph animation: 0-based paragraph number; default = the whole shape */
   paragraph?: number
 }
@@ -615,6 +643,18 @@ export interface SetTransitionOp {
 /** Batch-write each page's auto-advance time (<p:transition advTm>, ms; ms=null clears). Used by rehearsal timing save. */
 export interface SetAdvanceTimesOp {
   times: Array<{ slideIndex: number; ms: number | null }>
+}
+
+/** What the show needs to play a slide by itself: its saved advance time and its narration. */
+export interface ShowTiming {
+  advanceMs: number | null
+  /** Element ids of the slide's recorded narration pictures, hidden during the show */
+  narrationIds: string[]
+}
+
+/** Slide Show > Record: each recorded slide's narration (16-bit WAV) and time on screen. */
+export interface SaveRecordingOp {
+  slides: Array<{ slideIndex: number; wavBase64: string; durationMs: number; advanceMs: number }>
 }
 
 // ── Section management ────────────────────────────────────────────────
@@ -715,8 +755,20 @@ export interface RepasteSlideOp {
   fitWidthPx: number
 }
 
-export interface PasteSlideResult {
+/** Partial render update; order includes every part path, slides only changed pages. */
+export interface SlideUpdate {
+  order: string[]
   slides: RenderSlide[]
+}
+
+export interface DeckChange {
+  slides: RenderSlide[]
+  size: { cx: number; cy: number }
+  /** Present for a partial update; omitted for a full resync. */
+  order?: string[]
+}
+
+export interface PasteSlideResult extends SlideUpdate {
   /** First pasted slide ('picture': the anchor slide the bitmaps landed on) */
   index: number
   /** Slides inserted ('picture': 0) */
@@ -1014,6 +1066,28 @@ export type AddImageBytesOp = {
 )
 
 /** Swap a picture's backing image in place: frame, z-order, border and effects survive. */
+/** A 3D model the renderer read and rendered: inserted centred, half the slide high. */
+export interface AddModel3dOp {
+  slideIndex: number
+  /** glTF binary */
+  bytes: Uint8Array
+  name: string
+  /** The model's first rendering, base64 PNG without the data: prefix */
+  posterBase64?: string
+  /** Frame width / height */
+  aspect: number
+  fitWidthPx: number
+}
+
+/** Turn a 3D model (am3d:rot, 60,000ths of a degree) and store the rendering the renderer drew. */
+export interface SetModel3dViewOp {
+  slideIndex: number
+  sourceId: string
+  rot: { ax: number; ay: number; az: number }
+  /** base64 PNG without the data: prefix */
+  posterBase64?: string
+}
+
 export interface ReplacePictureBytesOp {
   slideIndex: number
   sourceId: string
@@ -1131,13 +1205,15 @@ export interface EditChartOp {
 
 // ── Export (PDF / images) ─────────────────────────────────────────────
 
-/** Export as images: the renderer has already rendered hi-res PNGs; the main process only writes them to disk. */
+/** Export as images: the renderer has already rendered hi-res pages; the main process only writes them to disk. */
 export interface ExportImagesOp {
   /** Target directory (absolute path chosen via pickExportDir) */
   dir: string
-  /** File base name (without extension), written as <baseName>-01.png / -02.png … */
+  /** File base name (without extension), written as <baseName>-01.png / -02.png … (or .jpg) */
   baseName: string
-  /** base64 per page PNG (without the data: prefix), in page order */
+  /** Image format of the rendered pages; anything but 'jpg' is written as .png */
+  format?: 'png' | 'jpg'
+  /** base64 per page image (without the data: prefix), in page order */
   pngsBase64: string[]
 }
 
@@ -1248,8 +1324,10 @@ export type MenuCommand =
   | 'open'
   | 'save'
   | 'save-as'
+  | 'name-with-ai'
   | 'export-pdf'
   | 'export-images'
+  | 'export-images-jpg'
   | 'print'
   | 'zoom-in'
   | 'zoom-out'
@@ -1297,15 +1375,13 @@ export interface SlidesApi {
   >
   /** Single-face sfnt bytes for one private face (null = gone/unreadable) */
   privateFontData: (id: string) => Promise<ArrayBuffer | null>
-  /** Curated downloadable (OFL) font catalog with per-family install state */
-  fontCatalog: () => Promise<
-    Array<{
-      family: string
-      script: 'latin' | 'ja' | 'ko' | 'sc' | 'tc'
-      installed: boolean
-      downloading: boolean
-    }>
-  >
+  /**
+   * Curated downloadable (OFL) font catalog with per-family install state and
+   * what each family would cost. Typed from the store that produces it rather
+   * than restated here: `ipcMain.handle` is untyped, so a drifted copy of this
+   * shape passes typecheck and fails at the point of use.
+   */
+  fontCatalog: () => Promise<FontCatalogEntry[]>
   /** Download a catalog family into the user font store; layouts refresh via deck-changed */
   fontDownload: (family: string) => Promise<{ ok: boolean; error?: string }>
   /** File picker → install local font files into the user font store */
@@ -1320,8 +1396,9 @@ export interface SlidesApi {
   /** Headless export mode: report the export outcome so the main process can quit */
   headlessExportDone: (result: { ok: boolean; error?: string }) => void
   /** New blank presentation (single blank 16:9 page, untitled) */
-  newBlank: (fitWidthPx: number) => Promise<OpenResult>
-  /** Land generated pages: each pageMarkers entry is a marker (cloudpptx:<path>) redeemable for a one-slide pptx.
+  /** `size` (EMU): the "Use for New Presentations" slide size; omitted keeps the 16:9 template */
+  newBlank: (fitWidthPx: number, size?: { cx: number; cy: number }) => Promise<OpenResult>
+  /** Land generated pages: each pageMarkers entry is a marker (genpptx:<path>) redeemable for a one-slide pptx.
    *  mode="append" merges the new pages onto the existing deck (appendedFrom = existing page count);
    *  mode="replace_at" redoes page atIndex in place from a single marker (other pages untouched, undoable, replacedIndex = that page's index);
    *  mode="insert_at" inserts a new page at atIndex from a single marker (later pages shift back, undoable, insertedIndex = that page's index);
@@ -1343,19 +1420,7 @@ export interface SlidesApi {
       })
     | { error: string }
   >
-  /** Whether cloud single-page generation (gsk slide_generate) is available (GENOFFICE_CLOUD_SLIDE=1 + gsk login) */
-  cloudGenStatus: () => Promise<{ enabled: boolean }>
-  /** Cloud single-page generation: brief → one-slide pptx temp file; the marker goes into a landGeneratedPages pageMarkers slot */
-  cloudGeneratePage: (op: {
-    brief: string
-    title?: string
-    styleSkill?: string
-    deckContext?: Record<string, unknown>
-    images?: { url: string; caption?: string }[]
-    width?: number
-    height?: number
-  }) => Promise<{ ok: boolean; marker?: string; error?: string }>
-  /** Local single-page generation: a JSON slide spec (LLM output) built directly into a one-slide pptx; same marker kind as the cloud path */
+  /** Single-page generation: a JSON slide spec (LLM output) built directly into a one-slide pptx; the marker goes into a landGeneratedPages pageMarkers slot */
   localGeneratePage: (op: {
     specJson: string
   }) => Promise<{ ok: boolean; marker?: string; error?: string; imageFailures?: string[] }>
@@ -1364,10 +1429,8 @@ export interface SlidesApi {
   setElementFont: (op: SetElementFontOp) => Promise<RenderSlide | null>
   /** Change paragraph format on selected elements (bullet/line spacing/paragraph spacing/align; elements without text ignored) */
   setElementParagraphFormat: (op: SetElementParagraphFormatOp) => Promise<RenderSlide | null>
-  /** Replace (when count=0, slides is null and no history step is created) */
-  findReplace: (
-    op: FindReplaceOp,
-  ) => Promise<{ count: number; slides: RenderSlide[] | null } | null>
+  /** Replace (when count=0, update is null and no history step is created) */
+  findReplace: (op: FindReplaceOp) => Promise<{ count: number; update: SlideUpdate | null } | null>
   /** Switch/reset the layout of an existing page */
   setSlideLayout: (op: SetSlideLayoutOp) => Promise<RenderSlide | null>
   /** Slide size (returns the fully rebuilt RenderSlide set + current size marker) */
@@ -1377,6 +1440,8 @@ export interface SlidesApi {
   editTransform: (op: EditTransformOp) => Promise<RenderSlide | null>
   /** Multi-selection nudge/rotate: every item commits like editTransform, all in one undo step */
   editTransformMulti: (op: EditTransformMultiOp) => Promise<RenderSlide | null>
+  /** Escape during a previewed resize: drop the gesture's preview frames and its undo snapshot */
+  cancelTransformPreview: (op: { slideIndex: number }) => Promise<RenderSlide | null>
   /** Connector endpoint drag: reposition ends and attach/detach shape anchors (stCxn/endCxn) */
   editConnectorEndpoints: (op: EditConnectorEndpointsOp) => Promise<RenderSlide | null>
   /** Batch position update (align/distribute); all items share one undo step */
@@ -1448,9 +1513,9 @@ export interface SlidesApi {
   deleteElement: (op: DeleteElementOp) => Promise<RenderSlide | null>
   /** Multi-selection delete in one undo step */
   deleteElements: (op: DeleteElementsOp) => Promise<RenderSlide | null>
-  addSlide: (op: AddSlideOp) => Promise<{ slides: RenderSlide[]; index: number } | null>
+  addSlide: (op: AddSlideOp) => Promise<(SlideUpdate & { index: number }) | null>
   /** New blank page (reuses slide sourceIndex's layout, content empty) */
-  addBlankSlide: (op: AddBlankSlideOp) => Promise<{ slides: RenderSlide[]; index: number } | null>
+  addBlankSlide: (op: AddBlankSlideOp) => Promise<(SlideUpdate & { index: number }) | null>
   /** Copy slides onto the app-wide slide clipboard, so another open deck can paste them */
   copySlides: (op: CopySlidesOp) => Promise<boolean>
   /** Paste the clipboard slides after afterIndex (mode: destination theme / source formatting / picture); index = first pasted slide, count = slides inserted */
@@ -1461,14 +1526,12 @@ export interface SlidesApi {
   hasSlideClipboard: () => Promise<boolean>
   /** Is there anything a paste would act on (internal elements/slide, or external image/text)? Drives the Paste menu item */
   clipboardProbe: () => Promise<boolean>
-  /** Delete a slide (refused when only one page remains); returns the full RenderSlide array */
-  deleteSlide: (slideIndex: number) => Promise<RenderSlide[] | null>
-  /** Delete a thumbnail selection in one undo step; returns the full RenderSlide array */
-  deleteSlides: (op: DeleteSlidesOp) => Promise<RenderSlide[] | null>
+  /** Delete a slide (refused when only one page remains); returns a partial update */
+  deleteSlide: (slideIndex: number) => Promise<SlideUpdate | null>
+  /** Delete a thumbnail selection in one undo step; returns a partial update */
+  deleteSlides: (op: DeleteSlidesOp) => Promise<SlideUpdate | null>
   /** Duplicate a thumbnail selection in one undo step; index = first copy */
-  duplicateSlides: (
-    op: DuplicateSlidesOp,
-  ) => Promise<{ slides: RenderSlide[]; index: number } | null>
+  duplicateSlides: (op: DuplicateSlidesOp) => Promise<(SlideUpdate & { index: number }) | null>
   /** Bring element to front/back or move one layer forward/backward */
   reorderElement: (op: ReorderElementOp) => Promise<RenderSlide | null>
   /** Table cell text edit */
@@ -1487,8 +1550,8 @@ export interface SlidesApi {
   editStroke: (op: EditStrokeOp) => Promise<RenderSlide | null>
   /** Mirror selected elements horizontally/vertically */
   flipElements: (op: FlipElementOp) => Promise<RenderSlide | null>
-  /** Returns the full affected RenderSlide array (when applied to all pages) */
-  editBackground: (op: EditBackgroundOp) => Promise<RenderSlide[] | null>
+  /** Returns the affected slides and their order */
+  editBackground: (op: EditBackgroundOp) => Promise<SlideUpdate | null>
   /** Show the system image picker and return the file's bytes (for Replace Picture); cancel returns null */
   pickPictureFile: () => Promise<{ base64: string; ext: string } | null>
   /** Show the system image picker and insert into the current page; returns the updated page + new element id, cancel returns null, undecodable format returns the error */
@@ -1539,11 +1602,12 @@ export interface SlidesApi {
     slideIndex: number,
     sourceId: string,
   ) => Promise<{ kind: 'video' | 'audio'; dataUrl: string } | null>
-  /** Show a dialog to pick a 3D model (glb/gltf), embed + poster placeholder */
-  insertModel3d: (
-    slideIndex: number,
-    fitWidthPx: number,
-  ) => Promise<{ slide: RenderSlide; sourceId: string } | null>
+  /** Show a dialog to pick a 3D model (.glb) and read it */
+  pickModel3d: () => Promise<{ name: string; bytes: Uint8Array } | null>
+  addModel3d: (op: AddModel3dOp) => Promise<{ slide: RenderSlide; sourceId: string } | null>
+  /** A 3D model element's glTF binary */
+  getModel3dData: (slideIndex: number, sourceId: string) => Promise<Uint8Array | null>
+  setModel3dView: (op: SetModel3dViewOp) => Promise<RenderSlide | null>
   /** Set/clear an element hyperlink; the whole page's element ids update, requiring a whole-page replace and clearing the selection */
   setLink: (op: SetLinkOp) => Promise<RenderSlide | null>
   /** Read the element's current hyperlink (dialog echo) */
@@ -1568,8 +1632,14 @@ export interface SlidesApi {
   setTransition: (op: SetTransitionOp) => Promise<boolean>
   /** The current page's transition effect (echoed on page switch) */
   getTransition: (slideIndex: number) => Promise<TransitionKind>
+  getShowTiming: (slideIndex: number) => Promise<ShowTiming>
   /** Batch-write each page's auto-advance time (rehearsal timing save; the saved pptx auto-advances in PowerPoint shows); returns success */
   setAdvanceTimes: (op: SetAdvanceTimesOp) => Promise<boolean>
+  /** Replaces the recorded slides' narration and advance time in one undo step; the whole deck back. */
+  saveRecording: (op: SaveRecordingOp) => Promise<RenderSlide[] | null>
+  clearNarration: (slideIndexes: number[]) => Promise<RenderSlide[] | null>
+  /** Asks the OS for the microphone where it gates it (macOS); false when refused. */
+  microphoneAccess: () => Promise<boolean>
   /** The current page's animation list (read by the Animations tab / during shows) */
   getAnimations: (slideIndex: number) => Promise<AnimationItem[]>
   /** Morph pairing keys of the current page's elements (matched against same-name/same-id elements on the previous page during morph tweening) */
@@ -1578,8 +1648,8 @@ export interface SlidesApi {
   setAnimations: (op: SetAnimationsOp) => Promise<boolean>
   /** Hide/unhide a slide; returns the updated page's RenderSlide (hidden flag), null on failure */
   setSlideHidden: (op: SetSlideHiddenOp) => Promise<RenderSlide | null>
-  /** Hide/unhide a thumbnail selection in one undo step; returns the full RenderSlide array */
-  setSlidesHidden: (op: SetSlidesHiddenOp) => Promise<RenderSlide[] | null>
+  /** Hide/unhide a thumbnail selection in one undo step; returns a partial update */
+  setSlidesHidden: (op: SetSlidesHiddenOp) => Promise<SlideUpdate | null>
   /** The current document's section list ([] when there are no sections) */
   getSections: () => Promise<SectionInfo[]>
   /** Overwrite-write the section structure; returns the updated section list */
@@ -1592,17 +1662,13 @@ export interface SlidesApi {
   /** Delete the section header and every slide in it (one undo step); null when it would empty the deck */
   removeSectionSlides: (
     op: RemoveSectionSlidesOp,
-  ) => Promise<{ slides: RenderSlide[]; sections: SectionInfo[] } | null>
-  /** Move a whole section up/down; slide order changes, returns the full RenderSlide set + section list */
-  moveSection: (
-    op: MoveSectionOp,
-  ) => Promise<{ slides: RenderSlide[]; sections: SectionInfo[] } | null>
-  /** Drag to reorder slides; returns the full RenderSlide set + section list, null on failure */
-  moveSlide: (op: MoveSlideOp) => Promise<{ slides: RenderSlide[]; sections: SectionInfo[] } | null>
+  ) => Promise<(SlideUpdate & { sections: SectionInfo[] }) | null>
+  /** Move a whole section up/down; slide order changes, returns a partial update and section list */
+  moveSection: (op: MoveSectionOp) => Promise<(SlideUpdate & { sections: SectionInfo[] }) | null>
+  /** Drag to reorder slides; returns a partial update and section list, null on failure */
+  moveSlide: (op: MoveSlideOp) => Promise<(SlideUpdate & { sections: SectionInfo[] }) | null>
   /** Drag-reorder a thumbnail selection as one undo step */
-  moveSlides: (
-    op: MoveSlidesOp,
-  ) => Promise<{ slides: RenderSlide[]; sections: SectionInfo[] } | null>
+  moveSlides: (op: MoveSlidesOp) => Promise<(SlideUpdate & { sections: SectionInfo[] }) | null>
   /** Plain text of the current page's speaker notes ('' when there are none) */
   getNotes: (slideIndex: number) => Promise<string>
   /** Overwrite-write notes (into the pptx's notesSlide part); returns success */
@@ -1622,7 +1688,7 @@ export interface SlidesApi {
   /** Apply an edit script's collected primitives as ONE atomic op transaction (the executor rolls back on any failure); returns the rebuilt slide or a guided error */
   applyEditScript: (
     op: ApplyEditScriptOp,
-  ) => Promise<{ slide: RenderSlide } | { error: string } | null>
+  ) => Promise<{ slide: RenderSlide; notes?: string[] } | { error: string } | null>
   /** AI batch surface: apply raw ops as one transaction (atomic/per_op, dry-run supported) */
   applyTxn: (op: ApplyTxnOp) => Promise<ApplyTxnResult | null>
   /** Roll the deck back to an AI rollback point; returns the restored full RenderSlide array, null when the id is unknown */
@@ -1680,9 +1746,7 @@ export interface SlidesApi {
   /** Undo/redo stack occupancy pushed by the main process (drives the QAT button gray states) */
   onHistoryChanged: (handler: (state: { canUndo: boolean; canRedo: boolean }) => void) => () => void
   /** Another window attached to the same file changed the deck (shared session): fresh render state to apply */
-  onDeckChanged: (
-    handler: (state: { slides: RenderSlide[]; size: { cx: number; cy: number } }) => void,
-  ) => () => void
+  onDeckChanged: (handler: (state: DeckChange) => void) => () => void
   reportCloseSaveResult: (ok: boolean) => void
   /** Mirror the autosave toggle state to the main process: files with it on save silently on close, no dialog */
   setAutoSavePref: (on: boolean) => void
@@ -1694,6 +1758,16 @@ export interface SlidesApi {
   onRenamed: (handler: (newPath: string) => void) => () => void
   getAiSettings: () => Promise<AiSettings>
   setAiSettings: (settings: AiSettings) => Promise<void>
+  /** ai-settings.json was rewritten by any renderer; re-read it */
+  onAiSettingsChanged: (handler: () => void) => () => void
+  /** shell only: switch to Home and open Settings › AI Model (rejects in standalone) */
+  openAiModelSettings: () => Promise<void>
+  /** shell only: switch to Home and open Settings › Integrations (the skills list) */
+  openSkillsSettings: () => Promise<void>
+  /** the skills installed into GenOffice's own folder */
+  skillsList: () => Promise<UserSkillEntry[]>
+  /** one installed skill's body, by name; the main process resolves the path */
+  skillText: (name: string) => Promise<string>
   aiStream: (request: AiStreamRequest) => Promise<void>
   aiStreamCancel: (requestId: string) => Promise<void>
   /** Genspark account status (gsk login state); with withEmail also fetches the email (needs a network request, slower) */
@@ -1776,18 +1850,28 @@ export interface SlidesApi {
   /** Store styleSkill in userData/style-templates/<name>.json */
   saveStyleTemplate: (
     name: string,
-    data: { topic: string; styleSkill: string; createdAt: string },
+    data: {
+      topic: string
+      styleSkill: string
+      createdAt: string
+      /** Deck chrome skeleton extracted at save time (layout-skeleton.ts); absent in older templates */
+      layout?: LayoutSkeleton
+    },
   ) => Promise<{ ok: boolean; error?: string }>
   /** List saved Style templates */
   listStyleTemplates: () => Promise<Array<{ name: string; topic: string; createdAt: string }>>
   /** Load a given Style template's content */
-  loadStyleTemplate: (
-    name: string,
-  ) => Promise<{ ok: boolean; styleSkill?: string; topic?: string; error?: string }>
+  loadStyleTemplate: (name: string) => Promise<{
+    ok: boolean
+    styleSkill?: string
+    topic?: string
+    layout?: LayoutSkeleton
+    error?: string
+  }>
   /** New blank page (with a specific layout): inserted after slide sourceIndex, rels pointing at the chosen layout */
   addSlideWithLayout: (
     op: AddSlideWithLayoutOp,
-  ) => Promise<{ slides: RenderSlide[]; index: number } | null>
+  ) => Promise<(SlideUpdate & { index: number }) | null>
   /** Query the current pptx's slideLayout list (for the new-slide dropdown panel) */
   getLayouts: () => Promise<GetLayoutsResult | null>
   // ── Master edit view ──────────────────────────────────────────────
@@ -1802,6 +1886,10 @@ export interface SlidesApi {
   masterEditFill: (op: MasterEditFillOp) => Promise<RenderSlide | null>
   masterEditStroke: (op: MasterEditStrokeOp) => Promise<RenderSlide | null>
   masterDeleteElement: (op: MasterDeleteElementOp) => Promise<RenderSlide | null>
+  /** Insert a text box / preset shape / line onto the current master/layout part */
+  masterAddElement: (
+    op: MasterAddElementOp,
+  ) => Promise<{ slide: RenderSlide; sourceId: string } | null>
   // ── Presenter-view multi-screen show ────────────────────────────────
   /** Enter presenter view: detects multiple displays and opens a fullscreen audience show window on the external screen (sharing this session's document) */
   presenterStart: () => Promise<{ audience: boolean }>
@@ -1830,4 +1918,10 @@ declare global {
     slidesApi: SlidesApi
     desktop: DesktopFilesApi
   }
+}
+
+export interface UserSkillEntry {
+  name: string
+  description: string
+  relevant: boolean
 }

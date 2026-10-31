@@ -40,9 +40,16 @@ export function statPathEntries(
   return paths.map((path) => toRecentEntry(path, starredPaths))
 }
 
+export const STAT_PATHS_MAX = RECENT_PAGE_MAX
+
+/** stat is synchronous; a renderer-supplied list is bounded like every recents page */
+export function capStatPaths(paths: readonly string[]): string[] {
+  return paths.slice(0, STAT_PATHS_MAX)
+}
+
 export function normalizeRecentQuery(
   raw: unknown,
-): Required<Omit<RecentQuery, 'ext'>> & { ext?: string } {
+): Required<Omit<RecentQuery, 'ext' | 'group'>> & { ext?: string } {
   const query = (raw ?? {}) as RecentQuery
   // offset/limit cross the preload boundary, so an IPC caller may send "10" rather
   // than 10; without coercion every page silently restarted at the first page.
@@ -63,10 +70,17 @@ export function normalizeRecentQuery(
 
 /** sidebar filter keys that stand for a family of extensions, not one exact ext */
 export const EXT_FAMILY: Record<string, readonly string[]> = {
+  // mirrors Home's FILTER_FAMILY and SEARCH_EXT_FAMILY
+  docx: ['docx', 'doc', 'odt', 'ott'],
   // delimited text belongs to the sheets family: Home's own FILTER_FAMILY and
   // the shell's open routing both treat .csv/.tsv as spreadsheets, so a
   // sidebar filtered on "xlsx" must page them in too (csv was missing here).
-  xlsx: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv'],
+  xlsx: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv', 'ods', 'ots'],
+  pptx: ['pptx', 'ppt', 'odp', 'otp'],
+  // the text app opens txt/json as source too, so the sidebar "md" filter has
+  // to page them in the same way Home's FILTER_FAMILY already does — otherwise
+  // the two views disagree about which files the filter means.
+  md: ['md', 'markdown', 'txt', 'json'],
   html: ['html', 'htm'],
 }
 
@@ -83,11 +97,14 @@ export function pageRecentPaths(
   starredPaths: ReadonlySet<string>,
 ): RecentPage {
   const { offset, limit, ext } = normalizeRecentQuery(raw)
-  const all = statPathEntries(paths, starredPaths)
-  const filtered = ext ? all.filter((entry) => matchesExtFamily(entry.ext, ext)) : all
+  // stat only the returned page: statting the whole list blocked main on long recents
+  const filtered = ext
+    ? paths.filter((p) => matchesExtFamily(extname(p).slice(1).toLowerCase(), ext))
+    : paths
+  const page = limit === 0 ? [] : filtered.slice(offset, offset + limit)
   return {
-    entries: limit === 0 ? [] : filtered.slice(offset, offset + limit),
+    entries: statPathEntries(page, starredPaths),
     total: filtered.length,
-    totalAll: all.length,
+    totalAll: paths.length,
   }
 }

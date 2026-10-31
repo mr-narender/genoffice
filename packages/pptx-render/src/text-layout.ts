@@ -112,6 +112,8 @@ function runStyle(run: TextRun, scale: number, fontScale: number): RunStyle {
     fontFamily: run.fontFamily || DEFAULT_FONT,
     ...(run.fontScriptHint != null ? { substScript: run.fontScriptHint } : {}),
     ...(run.text && !hasWideChar(run.text) ? { latinOnly: true } : {}),
+    // travels with the run so every token it splits into keeps the mark
+    ...(run.redact ? { redact: run.redact } : {}),
     fontSizePx: ptToPx(effPt, scale),
     bold: !!run.bold,
     italic: !!run.italic,
@@ -327,9 +329,41 @@ function hasWideChar(text: string): boolean {
 const LATIN_WORD_RE = /^[\u0020-\u024f\u1e00-\u1eff\u2000-\u206f\u20a0-\u20cf\u2100-\u214f]+$/
 const HALFWIDTH_KANA_RE = /[\uff61-\uff9f]/
 
+/** PowerPoint small caps: lowercase letters set as capitals at 80% of the run size (probe: Calibri/Arial, 16/40pt). */
+const SMALL_CAP_SCALE = 0.8
+function expandSmallCaps(runs: Paragraph['runs']): Array<{ run: TextRun; srcRun: number }> {
+  const out: Array<{ run: TextRun; srcRun: number }> = []
+  runs.forEach((run, srcRun) => {
+    if (run.cap !== 'small' || run.fontSize == null || !run.text) {
+      out.push({ run, srcRun })
+      return
+    }
+    let seg = ''
+    let segLower: boolean | undefined
+    const flush = () => {
+      if (!seg) return
+      out.push({
+        run: segLower
+          ? { ...run, text: seg, fontSize: run.fontSize! * SMALL_CAP_SCALE }
+          : { ...run, text: seg },
+        srcRun,
+      })
+      seg = ''
+    }
+    for (const ch of run.text) {
+      const lower = ch !== ch.toUpperCase() && [...ch.toUpperCase()].length === 1
+      if (segLower !== undefined && lower !== segLower) flush()
+      segLower = lower
+      seg += ch
+    }
+    flush()
+  })
+  return out
+}
+
 function tokenizeParagraph(p: Paragraph, scale: number, fontScale: number): Token[] {
   const tokens: Token[] = []
-  p.runs.forEach((run, srcRun) => {
+  expandSmallCaps(p.runs).forEach(({ run, srcRun }) => {
     const style = runStyle(run, scale, fontScale)
     // Latin characters of a CJK-bucket run draw with the run's a:latin face (PowerPoint):
     // the script hint stays with the CJK glyphs, Latin substitutes as western
@@ -486,7 +520,7 @@ class AutoNumCounter {
     for (let l = from; l < this.counts.length; l++) this.counts[l] = 0
     if (b?.type !== 'number') return undefined
     const scheme = b.numType ?? 'arabicPeriod'
-    const start = b.startAt ?? 1
+    const start = Math.max(1, b.startAt ?? 1) || 1
     const running = this.counts[lvl] && this.schemes[lvl] === scheme && start === this.starts[lvl]
     const n = running ? this.counts[lvl]! + 1 : start
     if (!running) this.starts[lvl] = start
@@ -954,6 +988,12 @@ function buildLine(
     runs.push({
       text: tok.text,
       x,
+      // "Withheld from the model". The canvas draws the real words, so this rides
+      // along as a flag rather than substituting the text. A run that wraps puts
+      // the mark on both lines and the model reads a split placeholder — which
+      // its own write guard refuses, so the cost of a wrapped span is a refused
+      // edit, never a leak.
+      ...(tok.style.redact ? { redact: tok.style.redact } : {}),
       baselineY: 0, // filled in later from the line's ascent
       // When a missing font is substituted, draw with the substitute name so drawing and measuring use the same font file
       fontFamily: metrics.displayFamily?.(tok.style, tok.text) ?? tok.style.fontFamily,

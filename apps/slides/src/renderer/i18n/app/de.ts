@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const de = {
+  redactMenuLabel: 'Auswahl vor der KI verbergen',
+  redactDialogDesc:
+    'Das Ausgewählte bleibt im Dokument und in der Datei; das Modell sieht nur den Platzhalter. Geben Sie ihm einen Namen.',
+  redactDialogScope:
+    'Das Verbergen gilt nur für die KI dieser App. CLI, MCP-Tools und der Headless-Export lesen die Datei direkt und sehen diese Wörter weiterhin.',
+  redactDialogPlaceholder: 'Name des Platzhalters, z. B. Telefonnummer des Kunden',
+  redactCancel: 'Abbrechen',
+  redactInsert: 'Verbergen',
+  redactEnable: 'Rechtsklick auf eine Auswahl, um sie vor dem Modell zu verbergen.',
+
   appPhPromptTitle: 'Titel durch Klicken hinzufügen',
   appPhPromptSubtitle: 'Untertitel durch Klicken hinzufügen',
   appPhPromptBody: 'Text durch Klicken hinzufügen',
@@ -56,7 +66,9 @@ export const de = {
     'Video eingefügt (in die .pptx-Datei eingebettet; abspielbar in PowerPoint)',
   appStatusAudioInserted: 'Audio eingefügt (in die .pptx-Datei eingebettet)',
   appStatusModel3dInserted:
-    '3D-Modell eingebettet (die Zeichenfläche zeigt einen Platzhalter; die Modelldatei ist in der .pptx-Datei gespeichert)',
+    '3D-Modell eingefügt: zum Drehen auswählen (PowerPoint zeigt es ebenfalls in 3D)',
+  appStatusModel3dNoPreview:
+    'Das 3D-Modell konnte hier nicht gezeichnet werden; sein Bild bleibt unverändert',
   appStatusRecordingEmpty: 'Die Aufzeichnung ist leer; nichts wurde eingefügt',
   appStatusRecordingInserted:
     'Bildschirmaufzeichnung auf der aktuellen Folie eingefügt (eingebettetes WebM)',
@@ -222,6 +234,8 @@ export const de = {
   appMasterFillNone: 'Keine Füllung',
   appMasterStroke: 'Konturfarbe…',
   appMasterStrokeNone: 'Keine Kontur',
+  appMasterInsertTextBox: 'Textfeld',
+  appMasterInsertShape: 'Formen',
   appStartOpening: 'Wird geöffnet…',
   appReadingSlideTitle: 'Klicken für die nächste Folie (Esc zum Beenden der Leseansicht)',
   appReadingPrev: '‹ Zurück',
@@ -250,6 +264,14 @@ export const de = {
     'Die Gesamtdauer der Bildschirmpräsentation betrug {duration}. Möchten Sie die Anzeigedauer der einzelnen Folien für den automatischen Folienwechsel speichern?',
   appRehearseDiscard: 'Nicht speichern',
   appRehearseSave: 'Speichern',
+  appRecordTitle: 'Kommentar aufzeichnen',
+  appRecordSummary: 'Aufnahmedauer {duration}. Kommentar und Anzeigedauer jeder Folie speichern?',
+  appRecordDiscard: 'Nicht speichern',
+  appRecordSave: 'Speichern',
+  appStatusRecordSaved:
+    'Kommentar auf {count} Folien gespeichert (PowerPoint spielt ihn ebenfalls ab)',
+  appStatusRecordFailed: 'Die Aufnahme konnte nicht gespeichert werden',
+  appStatusNarrationCleared: 'Kommentar gelöscht',
   appSettingsTitle: 'KI-Einstellungen',
   appSettingsAccount: 'Genspark-Konto',
   appSettingsChecking: 'Wird überprüft…',
