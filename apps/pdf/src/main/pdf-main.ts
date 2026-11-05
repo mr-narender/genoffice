@@ -30,13 +30,14 @@ import {
 } from '@genoffice/electron-utils'
 import { createI18n, getUiLang } from '@genoffice/i18n'
 import { generateImageTool, documentMediaRoots } from '@genoffice/ai-search'
-import { PDF_CHANNELS } from '../shared/ipc'
+import { PDF_CHANNELS, PDF_READ_CHUNK_BYTES } from '../shared/ipc'
 import { printJobOptions, printOutcome } from '@genoffice/electron-utils/print-job'
 import {
   printFileViaCups,
   printPdfViaCups,
   printToPdfOptionsFor,
 } from '@genoffice/electron-utils/print-cups'
+import { DRIVER_OPTION_NAMES, queryPrinterOptions } from '@genoffice/electron-utils/printer-options'
 
 /** 1-based file page positions for the lp `-P` page-list: integers within a
  * real document's reach, undefined = the whole document. Anything else is
@@ -125,8 +126,6 @@ import type { ExternalSigner, SignPdfOptions } from './pdf-sign'
 import { readPdfSignatures } from './pdf-signatures'
 import { SystemStoreError, openSystemSigner, listSystemCertificates } from './system-certificates'
 import type { SystemCertificateRef, SystemIdentity } from './system-certificates'
-/** the largest slice readFileChunk hands over IPC (the renderer loops) */
-const PDF_READ_CHUNK_MAX_BYTES = 8 * 1024 * 1024
 
 const tDlg = createI18n({
   zh: {
@@ -1292,7 +1291,7 @@ function registerPdfIpc(): void {
       }
       const from = typeof start === 'number' && Number.isInteger(start) && start >= 0 ? start : -1
       const to = typeof end === 'number' && Number.isInteger(end) && end >= from ? end : -1
-      if (from < 0 || to < 0 || to - from > PDF_READ_CHUNK_MAX_BYTES) {
+      if (from < 0 || to < 0 || to - from > PDF_READ_CHUNK_BYTES) {
         throw new Error('pdf: invalid chunk range')
       }
       const handle = await open(path, 'r')
@@ -1307,6 +1306,15 @@ function registerPdfIpc(): void {
       }
     },
   )
+  // The driver option groups one queue advertises, for the print dialog's
+  // dropdowns. The queue name becomes an lpoptions argument, so it is
+  // charset-guarded here; an unknown queue resolves to no groups and the
+  // dialog simply shows nothing extra.
+  ipcMain.handle(PDF_CHANNELS.printerOptions, async (_e, queue: unknown) => {
+    if (typeof queue !== 'string' || !/^[A-Za-z0-9_.+-]{1,128}$/.test(queue)) return []
+    const groups = await queryPrinterOptions(queue)
+    return groups.filter((g) => DRIVER_OPTION_NAMES.includes(g.name))
+  })
 
   // pdf.js has already accepted `password` for these bytes on the render side;
   // a failure here therefore means the standard handler refused it
