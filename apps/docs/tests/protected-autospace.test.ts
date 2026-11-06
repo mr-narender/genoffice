@@ -2,10 +2,11 @@
  * Static protected DOM (read-only tables / textboxes) gets the same
  * .doc-autospace-pad spans the editor adds via decorations.
  */
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { DOMSerializer } from '@tiptap/pm/model'
 import type { TableModel, TextboxDisplay } from '@genoffice/docx-engine'
 import { renderTableSpec, renderTextboxSpec } from '../src/renderer/editor/protected-render'
+import { setBalancedSpaceWidening } from '../src/renderer/line-metrics'
 
 const render = (spec: unknown): HTMLElement =>
   DOMSerializer.renderSpec(document, spec as never).dom as HTMLElement
@@ -14,6 +15,16 @@ const pads = (dom: HTMLElement) => dom.querySelectorAll('.doc-autospace-pad')
 
 describe('renderTableSpec hangul spaces', () => {
   const H = '\ud55c\uae00'
+  beforeAll(() => setBalancedSpaceWidening(true))
+  afterAll(() => setBalancedSpaceWidening(false))
+
+  it('leaves the spaces in their text node without balanceSingleByteDoubleByteWidth', () => {
+    setBalancedSpaceWidening(false)
+    const dom = render(renderTableSpec({ rows: [[{ paras: [`${H} A ${H}`] }]] }))
+    expect(dom.querySelectorAll('.doc-balanced-space')).toHaveLength(0)
+    expect(dom.querySelector('td')!.textContent).toBe(`${H} A ${H}`)
+    setBalancedSpaceWidening(true)
+  })
   it('wraps spaces with a hangul neighbour across rich-cell runs, not Latin ones', () => {
     const model: TableModel = {
       rows: [
@@ -26,7 +37,7 @@ describe('renderTableSpec hangul spaces', () => {
       ],
     }
     const dom = render(renderTableSpec(model))
-    const wraps = dom.querySelectorAll('.doc-hangul-space')
+    const wraps = dom.querySelectorAll('.doc-balanced-space')
     expect(wraps).toHaveLength(1)
     expect(dom.querySelector('td')!.textContent).toBe(`${H} A B`)
   })
@@ -58,7 +69,7 @@ describe('renderTableSpec hangul spaces', () => {
       ],
     }
     const dom = render(renderTableSpec(model))
-    const wraps = Array.from(dom.querySelectorAll('.doc-hangul-space'))
+    const wraps = Array.from(dom.querySelectorAll('.doc-balanced-space'))
     expect(wraps).toHaveLength(1)
     expect(wraps[0].parentElement!.textContent).toBe(` ${H}`)
   })
@@ -114,6 +125,23 @@ describe('renderTableSpec autospace pads', () => {
       expect(s.getAttribute('style')).toMatch(/text-autospace:\s*no-autospace/)
     })
     expect(dom.querySelector('td')!.textContent).toBe('ペン12A漢')
+  })
+
+  it('keeps only the letter seams as full pads when autoSpaceDN is off', () => {
+    const model: TableModel = {
+      rows: [
+        [
+          {
+            paras: ['ペン12A\u6f22'],
+            richParas: [{ runs: [{ text: 'ペン12A\u6f22' }], autoSpace: 'latin' }],
+          },
+        ],
+      ],
+    }
+    const dom = render(renderTableSpec(model))
+    expect(Array.from(pads(dom), (el) => el.textContent)).toEqual(['\u6f22'])
+    expect(dom.querySelectorAll('.doc-autospace-pad-full')).toHaveLength(1)
+    expect(dom.querySelector('td span')!.getAttribute('style')).toMatch(/no-autospace/)
   })
 
   it('gates pads per paragraph: only the autoSpace-off one loses them', () => {

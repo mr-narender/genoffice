@@ -1,10 +1,10 @@
 import type { AiPanelPrefs } from '@genoffice/ui'
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
-import type { RenderSlide } from '@genoffice/pptx-render'
 import type { ProjectApi } from '@genoffice/project-store'
 import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
 import type {
+  DeckChange,
   AddChartOp,
   AddElementOp,
   AiRunFailure,
@@ -14,6 +14,8 @@ import type {
   AddInkOp,
   AddMediaBytesOp,
   ReplacePictureBytesOp,
+  AddModel3dOp,
+  SetModel3dViewOp,
   AddSmartArtOp,
   ApplyThemeOp,
   AddBlankSlideOp,
@@ -47,6 +49,7 @@ import type {
   TableStructureIpcOp,
   TableMergeIpcOp,
   ReorderElementOp,
+  SaveRecordingOp,
   SetAdvanceTimesOp,
   SetAnimationsOp,
   SetSlideHiddenOp,
@@ -86,10 +89,13 @@ import type {
   MasterEditFillOp,
   MasterEditStrokeOp,
   MasterDeleteElementOp,
+  MasterAddElementOp,
   ExportImagesOp,
   SavePictureOp,
   ExportPdfOp,
   PrintSlidesOp,
+  PrinterInfo,
+  PrinterOption,
   MenuCommand,
   OpenResult,
   SlidesApi,
@@ -150,7 +156,7 @@ const api: SlidesApi = {
   consumeHeadlessExport: () => ipcRenderer.invoke('slides:consume-headless-export'),
   headlessExportDone: (result: { ok: boolean; error?: string }) =>
     ipcRenderer.send('slides:headless-export-done', result),
-  newBlank: (fitWidthPx) => ipcRenderer.invoke('slides:new-blank', fitWidthPx),
+  newBlank: (fitWidthPx, size) => ipcRenderer.invoke('slides:new-blank', fitWidthPx, size),
   landGeneratedPages: (
     pageMarkers: string[],
     fitWidthPx: number,
@@ -166,16 +172,6 @@ const api: SlidesApi = {
       atIndex,
       deckName,
     ),
-  cloudGenStatus: () => ipcRenderer.invoke('slides:cloud-gen-status'),
-  cloudGeneratePage: (op: {
-    brief: string
-    title?: string
-    styleSkill?: string
-    deckContext?: Record<string, unknown>
-    images?: { url: string; caption?: string }[]
-    width?: number
-    height?: number
-  }) => ipcRenderer.invoke('slides:cloud-page-generate', op),
   localGeneratePage: (op: { specJson: string }) =>
     ipcRenderer.invoke('slides:local-page-generate', op),
   editText: (op: EditTextOp) => ipcRenderer.invoke('slides:edit-text', op),
@@ -187,6 +183,8 @@ const api: SlidesApi = {
   setSlideSize: (op: SetSlideSizeOp) => ipcRenderer.invoke('slides:set-slide-size', op),
   getSlideSize: () => ipcRenderer.invoke('slides:get-slide-size'),
   editTransform: (op: EditTransformOp) => ipcRenderer.invoke('slides:edit-transform', op),
+  cancelTransformPreview: (op: { slideIndex: number }) =>
+    ipcRenderer.invoke('slides:cancel-transform-preview', op),
   editTransformMulti: (op: EditTransformMultiOp) =>
     ipcRenderer.invoke('slides:edit-transform-multi', op),
   editConnectorEndpoints: (op: EditConnectorEndpointsOp) =>
@@ -247,6 +245,7 @@ const api: SlidesApi = {
   masterEditStroke: (op: MasterEditStrokeOp) => ipcRenderer.invoke('slides:master-edit-stroke', op),
   masterDeleteElement: (op: MasterDeleteElementOp) =>
     ipcRenderer.invoke('slides:master-delete-element', op),
+  masterAddElement: (op: MasterAddElementOp) => ipcRenderer.invoke('slides:master-add-element', op),
   editFill: (op: EditFillOp) => ipcRenderer.invoke('slides:edit-fill', op),
   editStroke: (op: EditStrokeOp) => ipcRenderer.invoke('slides:edit-stroke', op),
   flipElements: (op: FlipElementOp) => ipcRenderer.invoke('slides:flip-elements', op),
@@ -295,8 +294,11 @@ const api: SlidesApi = {
   addMediaBytes: (op: AddMediaBytesOp) => ipcRenderer.invoke('slides:add-media-bytes', op),
   getMediaData: (slideIndex: number, sourceId: string) =>
     ipcRenderer.invoke('slides:media-data', slideIndex, sourceId),
-  insertModel3d: (slideIndex: number, fitWidthPx: number) =>
-    ipcRenderer.invoke('slides:insert-model3d', slideIndex, fitWidthPx),
+  pickModel3d: () => ipcRenderer.invoke('slides:pick-model3d'),
+  addModel3d: (op: AddModel3dOp) => ipcRenderer.invoke('slides:add-model3d', op),
+  getModel3dData: (slideIndex: number, sourceId: string) =>
+    ipcRenderer.invoke('slides:model3d-data', slideIndex, sourceId),
+  setModel3dView: (op: SetModel3dViewOp) => ipcRenderer.invoke('slides:set-model3d-view', op),
   setLink: (op: SetLinkOp) => ipcRenderer.invoke('slides:set-link', op),
   getLink: (slideIndex: number, sourceId: string) =>
     ipcRenderer.invoke('slides:get-link', slideIndex, sourceId),
@@ -308,7 +310,12 @@ const api: SlidesApi = {
   applyTheme: (op: ApplyThemeOp) => ipcRenderer.invoke('slides:apply-theme', op),
   setTransition: (op: SetTransitionOp) => ipcRenderer.invoke('slides:set-transition', op),
   getTransition: (slideIndex: number) => ipcRenderer.invoke('slides:get-transition', slideIndex),
+  getShowTiming: (slideIndex: number) => ipcRenderer.invoke('slides:get-show-timing', slideIndex),
   setAdvanceTimes: (op: SetAdvanceTimesOp) => ipcRenderer.invoke('slides:set-advance-times', op),
+  saveRecording: (op: SaveRecordingOp) => ipcRenderer.invoke('slides:save-recording', op),
+  clearNarration: (slideIndexes: number[]) =>
+    ipcRenderer.invoke('slides:clear-narration', slideIndexes),
+  microphoneAccess: () => ipcRenderer.invoke('slides:microphone-access'),
   getAnimations: (slideIndex: number) => ipcRenderer.invoke('slides:get-animations', slideIndex),
   getShapeKeys: (slideIndex: number) => ipcRenderer.invoke('slides:get-shape-keys', slideIndex),
   setAnimations: (op: SetAnimationsOp) => ipcRenderer.invoke('slides:set-animations', op),
@@ -345,6 +352,45 @@ const api: SlidesApi = {
   savePicture: (op: SavePictureOp) => ipcRenderer.invoke('slides:save-picture', op),
   exportPdf: (op: ExportPdfOp) => ipcRenderer.invoke('slides:export-pdf', op),
   printSlides: (op: PrintSlidesOp) => ipcRenderer.invoke('slides:print', op),
+  listPrinters: async () => {
+    const result: unknown = await ipcRenderer.invoke('slides:printers')
+    if (!Array.isArray(result)) throw new Error('Invalid printers response.')
+    return result.map((entry): PrinterInfo => {
+      if (
+        typeof entry !== 'object' ||
+        entry === null ||
+        typeof (entry as Record<string, unknown>).name !== 'string' ||
+        typeof (entry as Record<string, unknown>).displayName !== 'string'
+      ) {
+        throw new Error('Invalid printers entry.')
+      }
+      const { name, displayName } = entry as Record<string, string>
+      return { name, displayName }
+    })
+  },
+  printerOptions: async (queue: string) => {
+    const result: unknown = await ipcRenderer.invoke('slides:printer-options', queue)
+    if (!Array.isArray(result)) throw new Error('Invalid printer-options response.')
+    return result.map((entry): PrinterOption => {
+      const shape = entry as Record<string, unknown>
+      if (
+        typeof entry !== 'object' ||
+        entry === null ||
+        typeof shape.name !== 'string' ||
+        typeof shape.translation !== 'string' ||
+        !Array.isArray(shape.values) ||
+        !shape.values.every((v) => typeof v === 'string')
+      ) {
+        throw new Error('Invalid printer-option entry.')
+      }
+      return {
+        name: shape.name,
+        translation: shape.translation,
+        values: shape.values,
+        ...(typeof shape.defaultValue === 'string' ? { defaultValue: shape.defaultValue } : {}),
+      }
+    })
+  },
   save: () => ipcRenderer.invoke('slides:save'),
   saveAs: (defaultName: string) => ipcRenderer.invoke('slides:save-as', defaultName),
   onCloseSaveRequest: (handler: () => void) => {
@@ -358,13 +404,8 @@ const api: SlidesApi = {
     ipcRenderer.on('slides:history-changed', listener)
     return () => ipcRenderer.removeListener('slides:history-changed', listener)
   },
-  onDeckChanged: (
-    handler: (state: { slides: RenderSlide[]; size: { cx: number; cy: number } }) => void,
-  ) => {
-    const listener = (
-      _e: IpcRendererEvent,
-      state: { slides: RenderSlide[]; size: { cx: number; cy: number } },
-    ) => handler(state)
+  onDeckChanged: (handler: (state: DeckChange) => void) => {
+    const listener = (_e: IpcRendererEvent, state: DeckChange) => handler(state)
     ipcRenderer.on('slides:deck-changed', listener)
     return () => ipcRenderer.removeListener('slides:deck-changed', listener)
   },
@@ -389,6 +430,15 @@ const api: SlidesApi = {
   },
   getAiSettings: () => ipcRenderer.invoke('ai:get-settings'),
   setAiSettings: (settings: AiSettings) => ipcRenderer.invoke('ai:set-settings', settings),
+  onAiSettingsChanged: (handler: () => void) => {
+    const listener = () => handler()
+    ipcRenderer.on('ai:settings-changed', listener)
+    return () => ipcRenderer.removeListener('ai:settings-changed', listener)
+  },
+  openAiModelSettings: () => ipcRenderer.invoke('ai:open-model-settings'),
+  openSkillsSettings: () => ipcRenderer.invoke('ai:open-skills-settings'),
+  skillsList: () => ipcRenderer.invoke('ai:skills-list'),
+  skillText: (name: string) => ipcRenderer.invoke('ai:skill-text', name),
   aiStream: (request: AiStreamRequest) => ipcRenderer.invoke('ai:stream', request),
   aiStreamCancel: (requestId: string) => ipcRenderer.invoke('ai:stream-cancel', requestId),
   aiGskStatus: (withEmail?: boolean) => ipcRenderer.invoke('ai:gsk-status', withEmail),
@@ -439,7 +489,7 @@ const api: SlidesApi = {
     ipcRenderer.invoke('ai:save-sidecar', data),
   saveStyleTemplate: (
     name: string,
-    data: { topic: string; styleSkill: string; createdAt: string },
+    data: { topic: string; styleSkill: string; createdAt: string; layout?: unknown },
   ) => ipcRenderer.invoke('ai:save-style-template', name, data),
   listStyleTemplates: () => ipcRenderer.invoke('ai:list-style-templates'),
   loadStyleTemplate: (name: string) => ipcRenderer.invoke('ai:load-style-template', name),
@@ -467,7 +517,31 @@ const api: SlidesApi = {
   },
 }
 
+/**
+ * Model file naming: the transport half of `suggestFileName`.
+ *
+ * Inlined rather than imported — a preload entry must stay a single-file bundle,
+ * or the sandbox drops every global it exposed. The one `ai:` channel is
+ * registered app-wide by the shell (`registerAiNamingIpc`), not by this app, the
+ * same arrangement the `project:*` bridge below already depends on. A slides
+ * window running on its own has no such handler: the invoke rejects, and the
+ * shared client treats that as a declined naming, which leaves the deck with
+ * the name it already had.
+ *
+ * `content` crosses this bridge verbatim and the main process cannot see what
+ * this editor withheld, so what the caller hands over is exactly what the model
+ * sees. A caller that passed raw document text would undo its own redactions.
+ *
+ * The global is `aiNamingApi`, not `aiOffice`: `aiOffice` is the shell's home
+ * API, and a partial one in an editor window would shadow it there.
+ */
+const aiNamingApi = {
+  suggestFileName: (input: { content: string }) =>
+    ipcRenderer.invoke('ai:suggest-file-name', input),
+}
+
 contextBridge.exposeInMainWorld('slidesApi', api)
+contextBridge.exposeInMainWorld('aiNamingApi', aiNamingApi)
 
 // Chat attachment bridge: method names/signatures match the window.desktop attachment subset in docs, so the renderer's files-skill is copied over wholesale
 const filesApi: DesktopFilesApi = {
@@ -488,6 +562,8 @@ const projectApi: ProjectApi = {
   appendChat: (args) => ipcRenderer.invoke('project:appendChat', args),
   loadChat: (args) => ipcRenderer.invoke('project:loadChat', args),
   rebindChat: (args) => ipcRenderer.invoke('project:rebindChat', args),
+  listChats: (args) => ipcRenderer.invoke('project:listChats', args),
+  deleteChat: (args) => ipcRenderer.invoke('project:deleteChat', args),
 }
 contextBridge.exposeInMainWorld('projectApi', projectApi)
 

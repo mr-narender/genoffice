@@ -1,12 +1,27 @@
 import type { zh } from './zh'
 
 export const vi = {
+  redactMenuLabel: 'Ẩn phần đã chọn khỏi AI',
+  redactDialogDesc:
+    'Văn bản vẫn còn trong tài liệu và tệp; mô hình chỉ thấy placeholder bên dưới. Đặt tên để mô hình biết nó đại diện cho điều gì.',
+  redactDialogScope:
+    'Điều này chỉ áp dụng cho AI trong ứng dụng này. CLI, các công cụ MCP và bản xuất không có cửa sổ đều đọc thẳng tệp, nên chúng vẫn thấy những từ này.',
+  redactDialogPlaceholder: 'Tên placeholder, ví dụ: số điện thoại khách hàng',
+  redactCancel: 'Hủy',
+  redactInsert: 'Ẩn',
+  diskChangedMsg: 'Tệp này đã bị một chương trình khác thay đổi.',
+  diskConflictMsg: 'Tệp này đã thay đổi trên đĩa; lưu sẽ ghi đè các thay đổi đó.',
+  diskReload: 'Tải lại',
+  diskKeepMine: 'Giữ của tôi',
+  diskOverwrite: 'Vẫn ghi đè',
+
   loading: 'Đang tải…',
   loadFailed: 'Không thể mở tệp',
   untitled: 'Không có tiêu đề',
   saveFailed: 'Lưu thất bại: {error}',
   saveFailedStatus: 'Lưu thất bại',
   exportFailed: 'Xuất thất bại',
+  printFailed: 'In thất bại: {error}',
   exportHtmlSkipped: 'Đã xuất, nhưng {count} tài nguyên không thể nhúng (ví dụ {first})',
   viewPreview: 'Xem trước',
   viewSplit: 'Chia đôi',
@@ -54,6 +69,7 @@ export const vi = {
   openExternal: 'Đã mở liên kết trong trình duyệt của bạn',
   save: 'Lưu (⌘S)',
   saveAs: 'Lưu dưới dạng…',
+  aiNameFile: 'Đặt tên bằng AI…',
   ribbonCollapse: 'Thu gọn dải băng',
   ribbonExpand: 'Mở rộng dải băng',
   ribbonGroupInsert: 'Chèn',
@@ -84,6 +100,7 @@ export const vi = {
   alignLeft: 'Căn trái',
   alignCenter: 'Căn giữa',
   alignRight: 'Căn phải',
+  alignJustify: 'Căn đều',
   fontSizeDec: 'Giảm cỡ chữ',
   fontSizeInc: 'Tăng cỡ chữ',
   typography: 'Kiểu chữ',
@@ -120,6 +137,7 @@ export const vi = {
   insertImageUrl: 'Hình ảnh từ URL…',
   insertConfirm: 'Chèn',
   insertMore: 'Thêm',
+  insertSkeleton: 'Chèn khung',
   insertTableSize: 'Bảng {r}×{c}',
   insertTablePickSize: 'Chọn kích thước bảng',
   insertPlaceholderTableHeader: 'Tiêu đề {n}',

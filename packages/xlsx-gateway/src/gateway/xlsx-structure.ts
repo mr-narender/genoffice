@@ -5,10 +5,8 @@
 /// safely throws — the save must fail closed rather than corrupt references.
 
 import type { WorkbookStyleEdit } from '../shared/edit-schemas'
-
-/// Excel grid bounds, mirrored from gateway/xlsx-gateway.ts: importing them
-/// would close a cycle, and this file already needs the row count to clamp.
-const MAX_GRID_ROWS = 1_048_576
+import { MAX_GRID_COLUMNS, MAX_GRID_ROWS } from '../shared/grid-bounds'
+import { decodeXmlText } from './xlsx-escapes'
 
 export type StructuralOp =
   | {
@@ -55,6 +53,13 @@ export type StructuralOp =
       readonly end: number
       readonly level: number
       readonly collapsed?: boolean
+    }
+  /// sheetPr/outlinePr summary placement; true is the schema default and
+  /// drops the attribute.
+  | {
+      readonly kind: 'set-outline-pr'
+      readonly summaryBelow: boolean
+      readonly summaryRight: boolean
     }
 
 export type AxisAttributeOp = Extract<StructuralOp, { start: number }>
@@ -181,12 +186,17 @@ export function applyStructuralOps(
           : applyColAttributeOp(xml, op, resolveColStyle)
       continue
     }
+    if ('summaryBelow' in op) {
+      xml = applyOutlinePr(xml, op)
+      continue
+    }
     if (!('index' in op)) {
       xml = applyMergeOp(xml, op)
       continue
     }
     const axis: Axis = axisOf(op)
     const shift = toShift(op)
+    if (!shift.swap) xml = materializeSharedGroupsTheShiftBreaks(xml, sheetName, shift, axis, true)
     if (axis === 'column') {
       xml = transformColumnOperation(xml, sheetName, shift)
     } else {
@@ -257,6 +267,52 @@ function shiftVmlAnchorValues(values: readonly number[], ops: readonly RowColumn
     }
   }
   return next
+}
+
+const SHEET_PR_PATTERN = /<sheetPr\b[^>]*\/>|<sheetPr\b[^>]*>[\s\S]*?<\/sheetPr>/
+const OUTLINE_PR_PATTERN = /<outlinePr\b[^>]*\/>|<outlinePr\b[^>]*>[\s\S]*?<\/outlinePr>/
+
+export function applyOutlinePr(
+  xml: string,
+  op: Extract<StructuralOp, { summaryBelow: boolean }>,
+): string {
+  const attributes =
+    (op.summaryBelow ? '' : ' summaryBelow="0"') + (op.summaryRight ? '' : ' summaryRight="0"')
+  const existing = SHEET_PR_PATTERN.exec(xml)
+  const sheetPr = existing?.[0]
+  const current = sheetPr === undefined ? undefined : OUTLINE_PR_PATTERN.exec(sheetPr)?.[0]
+  // Other outlinePr attributes (applyStyles, showOutlineSymbols) stay verbatim.
+  const kept = (current ?? '')
+    .replace(/^<outlinePr\b|\/?>$|<\/outlinePr>$/g, '')
+    .replace(/\s+summary(?:Below|Right)="[^"]*"/g, '')
+    .replace(/>.*$/s, '')
+    .trim()
+  const element =
+    kept === '' && attributes === '' ? '' : `<outlinePr${kept ? ` ${kept}` : ''}${attributes}/>`
+  if (sheetPr === undefined) {
+    if (element === '') return xml
+    return xml.replace(
+      /(<worksheet\b[^>]*>)/,
+      (_full, open: string) => `${open}<sheetPr>${element}</sheetPr>`,
+    )
+  }
+  let next: string
+  if (current !== undefined) {
+    next = sheetPr.replace(OUTLINE_PR_PATTERN, () => element)
+  } else if (element === '') {
+    next = sheetPr
+  } else if (sheetPr.endsWith('/>')) {
+    next = `${sheetPr.slice(0, -2)}>${element}</sheetPr>`
+  } else {
+    // Schema order: tabColor, outlinePr, pageSetUpPr.
+    const pageSetUp = /<pageSetUpPr\b/.exec(sheetPr)
+    next = pageSetUp
+      ? `${sheetPr.slice(0, pageSetUp.index)}${element}${sheetPr.slice(pageSetUp.index)}`
+      : sheetPr.replace(/<\/sheetPr>$/, `${element}</sheetPr>`)
+  }
+  const emptied = /^<sheetPr\b([^>]*)>\s*<\/sheetPr>$/.exec(next)
+  if (emptied && emptied[1]!.trim() === '') next = ''
+  return xml.replace(SHEET_PR_PATTERN, () => next)
 }
 
 /// Excel sizes the outline gutter from sheetFormatPr's outlineLevelRow/Col;
@@ -553,6 +609,9 @@ export function shiftCrossSheetFormulas(
   for (const op of rowColumnOps(ops)) {
     const axis: Axis = axisOf(op)
     const shift = toShift(op)
+    if (!shift.swap) {
+      xml = materializeSharedGroupsTheShiftBreaks(xml, editedSheetName, shift, axis, false)
+    }
     const rewrite = (body: string): string =>
       escapeXmlText(shiftFormulaText(decodeEntities(body), editedSheetName, shift, axis, true))
     // The attribute part must not end with '/': a self-closing shared
@@ -746,7 +805,7 @@ export function shiftTablePart(
   let xml = tableXml
   const records: TableColumnInsertion[] = []
   for (const op of ops) {
-    if ('start' in op) continue
+    if ('start' in op || 'summaryBelow' in op) continue
     const table = parseTablePart(xml)
     if ('range' in op) {
       if (op.kind === 'merge-cells' && areasOverlap(op.range, table)) {
@@ -1090,6 +1149,227 @@ function toShift(op: RowColumnOp): Shift {
     delta: -op.count,
     deleted: { start: op.index, end: op.index + op.count - 1 },
   }
+}
+
+function materializeSharedGroupsTheShiftBreaks(
+  xml: string,
+  shiftedSheetName: string,
+  shift: LinearShift,
+  axis: Axis,
+  cellsMove: boolean,
+): string {
+  const along = (cell: SharedFormulaCell) => (axis === 'row' ? cell.row : cell.column)
+  const moved = (cell: SharedFormulaCell) =>
+    cellsMove ? movePosition(along(cell), shift) : along(cell)
+  const maximum = (axis === 'row' ? MAX_GRID_ROWS : MAX_GRID_COLUMNS) - 1
+  return materializeSharedFormulaGroups(
+    xml,
+    ({ anchor, formula, followers }) => {
+      const anchorTo = moved(anchor)
+      if (anchorTo === null) return true
+      const references = axisReferences(formula, shiftedSheetName, axis, !cellsMove)
+      return followers.some((follower) => {
+        const to = moved(follower)
+        if (to === null) return false
+        const offset = along(follower) - along(anchor)
+        const movedOffset = to - anchorTo
+        return !references.every((reference) => {
+          const start = reference.start + (reference.startRelative ? offset : 0)
+          const end = reference.end + (reference.endRelative ? offset : 0)
+          if (start < 0 || start > maximum || end < 0 || end > maximum) return false
+          if (!reference.range) {
+            const place = (position: number) =>
+              reference.shifts ? movePosition(position, shift) : position
+            const before = place(reference.start)
+            const after = place(start)
+            return before !== null && after === before + (reference.startRelative ? movedOffset : 0)
+          }
+          const span = (first: number, last: number) =>
+            reference.shifts ? moveRange(first, last, shift) : { start: first, end: last }
+          const before = span(reference.start, reference.end)
+          const after = span(start, end)
+          return (
+            before !== null &&
+            after !== null &&
+            after.start === before.start + (reference.startRelative ? movedOffset : 0) &&
+            after.end === before.end + (reference.endRelative ? movedOffset : 0)
+          )
+        })
+      })
+    },
+    (cell) => moved(cell) === null,
+    'throw',
+  )
+}
+
+interface AxisReference {
+  readonly shifts: boolean
+  readonly range: boolean
+  readonly start: number
+  readonly startRelative: boolean
+  readonly end: number
+  readonly endRelative: boolean
+}
+
+function axisReferences(
+  formula: string,
+  sheetName: string,
+  axis: Axis,
+  qualifiedOnly: boolean,
+): AxisReference[] {
+  const references: AxisReference[] = []
+  formula.split('"').forEach((segment, index) => {
+    if (index % 2 === 1) return
+    for (const match of segment.matchAll(FORMULA_REFERENCE_PATTERN)) {
+      const qualifier = match[2]
+      const parts = (match[3] ?? '').split(':').map((part) => axisOrdinal(part, axis))
+      const first = parts[0]
+      const last = parts[parts.length - 1]
+      if (!first || !last) continue
+      references.push({
+        shifts: qualifier === undefined ? !qualifiedOnly : qualifierMatches(qualifier, sheetName),
+        range: parts.length > 1,
+        start: first.value,
+        startRelative: first.relative,
+        end: last.value,
+        endRelative: last.relative,
+      })
+    }
+  })
+  return references
+}
+
+function axisOrdinal(part: string, axis: Axis): { value: number; relative: boolean } | null {
+  const cell = /^(\$?)([A-Z]{1,3})(\$?)([0-9]+)$/.exec(part)
+  if (cell) {
+    return axis === 'row'
+      ? { value: Number(cell[4]) - 1, relative: cell[3] !== '$' }
+      : { value: lettersToColumn(cell[2] ?? 'A'), relative: cell[1] !== '$' }
+  }
+  const column = /^(\$?)([A-Z]{1,3})$/.exec(part)
+  if (column) {
+    return axis === 'column'
+      ? { value: lettersToColumn(column[2] ?? 'A'), relative: column[1] !== '$' }
+      : null
+  }
+  const row = /^(\$?)([0-9]+)$/.exec(part)
+  if (row) return axis === 'row' ? { value: Number(row[2]) - 1, relative: row[1] !== '$' } : null
+  return null
+}
+
+export interface SharedFormulaCell {
+  readonly row: number
+  readonly column: number
+}
+
+export interface SharedFormulaGroup {
+  readonly anchor: SharedFormulaCell
+  readonly formula: string
+  readonly followers: readonly SharedFormulaCell[]
+}
+
+export function materializeSharedFormulaGroups(
+  xml: string,
+  breaks: (group: SharedFormulaGroup) => boolean,
+  keeps: (cell: SharedFormulaCell) => boolean,
+  untranslatable: 'cached-value' | 'throw',
+): string {
+  if (!xml.includes('t="shared"')) return xml
+  interface Fragment extends SharedFormulaCell {
+    start: number
+    end: number
+    openTag: string
+    si: string
+    isAnchor: boolean
+    body: string
+  }
+  const fragments: Fragment[] = []
+  // The open tag is matched alone so a self-closing follower never pairs
+  // with a later </f>.
+  const sharedOpen = /<f\b[^>]*?\bt="shared"[^>]*?(\/?)>/g
+  let match: RegExpExecArray | null
+  while ((match = sharedOpen.exec(xml)) !== null) {
+    const openTag = match[0]
+    const si = /\bsi="([^"]+)"/.exec(openTag)?.[1]
+    if (si === undefined) continue
+    const openEnd = match.index + openTag.length
+    let end = openEnd
+    let body = ''
+    if (match[1] !== '/') {
+      const close = xml.indexOf('</f>', openEnd)
+      if (close === -1) continue
+      body = xml.slice(openEnd, close)
+      end = close + '</f>'.length
+    }
+    const cellOpen = xml.lastIndexOf('<c', match.index)
+    const address = /\br="([A-Z]{1,3})([0-9]+)"/.exec(xml.slice(cellOpen, match.index))
+    if (!address) continue
+    fragments.push({
+      start: match.index,
+      end,
+      openTag,
+      row: Number(address[2]) - 1,
+      column: lettersToColumn(address[1] ?? 'A'),
+      si,
+      isAnchor: /\bref="/.test(openTag),
+      body,
+    })
+  }
+  const groups = new Map<string, { anchor: Fragment; followers: Fragment[] }>()
+  for (const fragment of fragments) {
+    if (fragment.isAnchor && fragment.body !== '') {
+      groups.set(fragment.si, { anchor: fragment, followers: [] })
+    }
+  }
+  for (const fragment of fragments) {
+    if (!fragment.isAnchor && fragment.body === '') {
+      groups.get(fragment.si)?.followers.push(fragment)
+    }
+  }
+  const broken = new Map<string, string>()
+  for (const [si, { anchor, followers }] of groups) {
+    const formula = decodeXmlText(anchor.body)
+    if (breaks({ anchor, formula, followers })) broken.set(si, formula)
+  }
+  if (broken.size === 0) return xml
+  const parts: string[] = []
+  let cursor = 0
+  for (const fragment of fragments) {
+    const group = groups.get(fragment.si)
+    const formula = broken.get(fragment.si)
+    if (group === undefined || formula === undefined || keeps(fragment)) continue
+    let replacement: string
+    if (fragment === group.anchor) {
+      replacement = `<f${plainFormulaAttributes(fragment.openTag)}>${fragment.body}</f>`
+    } else if (!fragment.isAnchor && fragment.body === '') {
+      const translated = translateSharedFormula(
+        formula,
+        fragment.row - group.anchor.row,
+        fragment.column - group.anchor.column,
+      )
+      if (translated === null && untranslatable === 'throw') {
+        throw new StructuralShiftError(
+          `The shared formula in ${columnToLetters(fragment.column)}${fragment.row + 1} ` +
+            'would reference cells outside the sheet — aborted.',
+        )
+      }
+      replacement =
+        translated === null
+          ? ''
+          : `<f${plainFormulaAttributes(fragment.openTag)}>${escapeXmlText(translated)}</f>`
+    } else {
+      continue
+    }
+    parts.push(xml.slice(cursor, fragment.start), replacement)
+    cursor = fragment.end
+  }
+  if (parts.length === 0) return xml
+  parts.push(xml.slice(cursor))
+  return parts.join('')
+}
+
+function plainFormulaAttributes(openTag: string): string {
+  return openTag.slice(2, openTag.endsWith('/>') ? -2 : -1).replace(/\s+(?:t|ref|si)="[^"]*"/g, '')
 }
 
 /// Shifts a single 0-based position; null means it was deleted.
@@ -1672,9 +1952,6 @@ function shiftReferenceToken(token: string, shift: Shift, axis: Axis): string | 
   )
 }
 
-const SHARED_MAX_ROW = 1_048_576
-const SHARED_MAX_COLUMN = 16_384
-
 /// Shared-formula expansion (OOXML 18.3.1.40): the master's relative
 /// references shift by the follower's (row, column) offset; `$`-anchored
 /// components stay put. Null when a shifted reference leaves the sheet.
@@ -1713,12 +1990,12 @@ function translateSharedToken(token: string, rowDelta: number, columnDelta: numb
       const column = translateOrdinal(
         lettersToColumn(cell[2] ?? 'A'),
         cell[1] === '$' ? 0 : columnDelta,
-        SHARED_MAX_COLUMN - 1,
+        MAX_GRID_COLUMNS - 1,
       )
       const row = translateOrdinal(
         Number(cell[4]) - 1,
         cell[3] === '$' ? 0 : rowDelta,
-        SHARED_MAX_ROW - 1,
+        MAX_GRID_ROWS - 1,
       )
       if (column === null || row === null) return null
       return `${cell[1]}${columnToLetters(column)}${cell[3]}${row + 1}`
@@ -1728,7 +2005,7 @@ function translateSharedToken(token: string, rowDelta: number, columnDelta: numb
       const column = translateOrdinal(
         lettersToColumn(wholeColumn[2] ?? 'A'),
         wholeColumn[1] === '$' ? 0 : columnDelta,
-        SHARED_MAX_COLUMN - 1,
+        MAX_GRID_COLUMNS - 1,
       )
       if (column === null) return null
       return `${wholeColumn[1]}${columnToLetters(column)}`
@@ -1738,7 +2015,7 @@ function translateSharedToken(token: string, rowDelta: number, columnDelta: numb
       const row = translateOrdinal(
         Number(wholeRow[2]) - 1,
         wholeRow[1] === '$' ? 0 : rowDelta,
-        SHARED_MAX_ROW - 1,
+        MAX_GRID_ROWS - 1,
       )
       if (row === null) return null
       return `${wholeRow[1]}${row + 1}`

@@ -15,6 +15,30 @@ export const norm = (s: string) =>
     .toLowerCase()
     .replace(/[\s\-_]/g, '')
 
+/**
+ * Font asset catalogs under AssetsV2 (downloaded and OS-preinstalled), newest catalog
+ * version first. The version suffix moves with macOS releases (macOS 26 downloads into
+ * com_apple_MobileAsset_Font8 and leaves Font7 empty), so catalogs are discovered rather
+ * than hardcoded.
+ */
+export function appleFontAssetRoots(assetsV2 = '/System/Library/AssetsV2'): string[] {
+  const roots: Array<{ path: string; ver: number }> = []
+  for (const base of [assetsV2, join(assetsV2, 'PreinstalledAssetsV2/InstallWithOs')]) {
+    let names: string[]
+    try {
+      names = readdirSync(base)
+    } catch {
+      continue
+    }
+    for (const d of names) {
+      const m = /^com_apple_MobileAsset_Font(\d+)$/.exec(d)
+      if (m) roots.push({ path: join(base, d), ver: Number(m[1]) })
+    }
+  }
+  // Newer catalogs first; at equal version the downloaded catalog beats the preinstalled one
+  return roots.sort((a, b) => b.ver - a.ver).map((r) => r.path)
+}
+
 function fontDirs(): string[] {
   switch (process.platform) {
     case 'darwin':
@@ -25,8 +49,7 @@ function fontDirs(): string[] {
         join(homedir(), 'Library/Fonts'),
         // On-demand system font assets: PingFang and other CJK faces live here on
         // recent macOS ( <hash>.asset/AssetData/*.ttc ), not under /System/Library/Fonts
-        '/System/Library/AssetsV2/com_apple_MobileAsset_Font7',
-        '/System/Library/AssetsV2/com_apple_MobileAsset_Font6',
+        ...appleFontAssetRoots(),
       ]
     case 'win32':
       return ['C:\\Windows\\Fonts', join(homedir(), 'AppData/Local/Microsoft/Windows/Fonts')]
@@ -234,6 +257,7 @@ export const styleTokens = (ps: string): string[] =>
   ).map((t) => (t === 'oblique' ? 'italic' : t === 'demi' ? 'demibold' : t))
 
 const REGULARISH = ['regular', 'medium', 'w3', 'w4']
+const BOLDISH = ['bold', 'semibold', 'demibold', 'extrabold']
 
 /**
  * Token-level style score of a face against wanted tokens, not substring: a
@@ -248,7 +272,16 @@ export function styleScore(face: FaceRef, want: string[]): number {
   const have = styleTokens(face.style)
   const wanted = want.length > 0 ? want : REGULARISH
   const hits = want.filter((t) => have.includes(t)).length
-  const extras = have.filter((t) => !wanted.includes(t)).length
+  // A heavier-than-regular want with no exact face still prefers a neighbouring
+  // weight (Demibold want -> Bold face) over falling all the way back to Regular.
+  const nearWeight =
+    want.some((t) => BOLDISH.includes(t) && !have.includes(t)) &&
+    have.some((t) => BOLDISH.includes(t) && !want.includes(t))
+      ? 1
+      : 0
+  const extras = have.filter(
+    (t) => !wanted.includes(t) && !(nearWeight && BOLDISH.includes(t)),
+  ).length
   const regularBonus = want.length === 0 && have.some((t) => REGULARISH.includes(t)) ? 1 : 0
-  return hits * 4 - extras + regularBonus
+  return hits * 4 + nearWeight * 2 - extras + regularBonus
 }

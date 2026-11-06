@@ -79,6 +79,7 @@ function toolFieldText(value: unknown): string {
 const TEXT_MAX_CHARS = 32_000
 /** Max stored characters of a scope excerpt */
 const SCOPE_TEXT_MAX_CHARS = 400
+const SCOPE_LABEL_MAX_CHARS = 200
 const TEXT_TRUNCATED_MARK = '\n\n[truncated]'
 /**
  * Max opening messages buffered in memory per chat before the first
@@ -100,6 +101,7 @@ const DEFAULT_CHAT_LIMIT = 200
 // Upper bound for loadChat limit to avoid unbounded reads
 const MAX_CHAT_LIMIT = 10_000
 const MAX_CHAT_FILE_READ_BYTES = 8 * 1024 * 1024
+const MAX_CHAT_FILE_HARD_CAP_BYTES = 64 * 1024 * 1024
 /** Max project name chars: prevents MB names bloating index.json/project.json. */
 export const MAX_PROJECT_NAME_CHARS = 128
 /** Default timeline entries; upper bound avoids loading every chat fully. */
@@ -171,23 +173,62 @@ function hashPathKey(key: string): string {
 function readChatTail(filePath: string): string {
   const size = statSync(filePath).size
   if (size === 0) return ''
-  const partialTail = size > MAX_CHAT_FILE_READ_BYTES
-  const length = partialTail ? MAX_CHAT_FILE_READ_BYTES - 1 : size
-  const buffer = Buffer.allocUnsafe(length)
   const fd = openSync(filePath, 'r')
   try {
-    const start = size - length
-    const bytesRead = readSync(fd, buffer, 0, length, start)
-    let contentStart = 0
-    if (partialTail) {
+    let length = Math.min(size, MAX_CHAT_FILE_READ_BYTES - 1)
+    for (;;) {
+      const start = size - length
+      const buffer = Buffer.allocUnsafe(length)
+      const bytesRead = readSync(fd, buffer, 0, length, start)
+      const window = buffer.subarray(0, bytesRead)
+      if (start === 0) return window.toString('utf8')
       const boundary = Buffer.allocUnsafe(1)
       readSync(fd, boundary, 0, 1, start - 1)
-      if (boundary[0] !== 0x0a) {
-        const newline = buffer.subarray(0, bytesRead).indexOf(0x0a)
-        contentStart = newline >= 0 ? newline + 1 : bytesRead
+      if (boundary[0] === 0x0a) return window.toString('utf8')
+      const newline = window.indexOf(0x0a)
+      // A newline only at the very end means the window is one oversized record
+      if (newline >= 0 && newline < bytesRead - 1)
+        return window.subarray(newline + 1).toString('utf8')
+      if (length >= MAX_CHAT_FILE_HARD_CAP_BYTES) {
+        console.warn(
+          `[project-store] no record boundary within the last ${length} bytes of ${filePath}; loading an empty chat`,
+        )
+        return ''
+      }
+      console.warn(
+        `[project-store] one chat record exceeds ${length} bytes in ${filePath}; reading further back`,
+      )
+      length = Math.min(size, length * 2, MAX_CHAT_FILE_HARD_CAP_BYTES)
+    }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/// The first user turn in a transcript, read from the file's head. A list of
+/// threads must not read every transcript in full to label them, and the
+/// first question sits on the first lines by construction; a window that ends
+/// mid-record just fails to parse and yields no label.
+function firstQuestionInFile(filePath: string): string | undefined {
+  const size = statSync(filePath).size
+  if (size === 0) return undefined
+  const fd = openSync(filePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(Math.min(size, 8192))
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0)
+    for (const line of buffer.subarray(0, bytesRead).toString('utf8').split('\n')) {
+      try {
+        const record = JSON.parse(line) as { role?: string; text?: string }
+        if (record.role === 'user' && typeof record.text === 'string' && record.text.trim()) {
+          return record.text
+        }
+      } catch {
+        // a torn line at the window's edge, or a record we can't read: no label
       }
     }
-    return buffer.subarray(contentStart, bytesRead).toString('utf8')
+    return undefined
+  } catch {
+    return undefined
   } finally {
     closeSync(fd)
   }
@@ -199,8 +240,13 @@ function parseChatRecords(raw: string): ChatMessage[] {
     if (!line.trim()) continue
     try {
       const msg = JSON.parse(line) as ChatMessage
+      // A non-finite seq (Infinity, either written directly or from an
+      // overflowing max+1 in mergeChatFiles) survives typeof, but JSON.stringify
+      // writes it as null, which fails this gate on the next read and drops
+      // every record of the file. Rejecting it here also keeps the merge from
+      // renumbering moved records from Infinity.
       if (
-        typeof msg.seq === 'number' &&
+        Number.isFinite(msg.seq) &&
         typeof msg.role === 'string' &&
         typeof msg.text === 'string'
       ) {
@@ -276,9 +322,16 @@ function readJson<T>(filePath: string): T | null {
 /** Atomic write: write to .tmp then rename, so a process interruption can't leave half-written JSON */
 function writeJson(filePath: string, data: unknown): void {
   ensureDir(dirname(filePath))
-  const tmpPath = `${filePath}.tmp`
-  writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8')
-  renameSync(tmpPath, filePath)
+  const tmpPath = `${filePath}.${randomBytes(6).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8')
+    renameSync(tmpPath, filePath)
+  } catch (error) {
+    try {
+      unlinkSync(tmpPath)
+    } catch {}
+    throw error
+  }
 }
 
 // ────────────────────────────────────────────────────────────
@@ -559,23 +612,71 @@ export class ProjectStore {
     // the only path that can find a transcript an older version wrote under
     // the raw-path hash, and it needs the projectId to look inside.
     const pid = pidKey !== undefined ? index.fileMap[pidKey] : undefined
+    const chatKey = this.findMapKey(index.chatIdByPath, oldPath)
+    // The file at newPath (if any) was replaced by the renamed one, so the
+    // source mappings win; the displaced file's entries are cleaned up instead
+    // of lingering in project.files or as an unreachable transcript.
+    const displacedPidKey = this.findMapKey(index.fileMap, newPath)
+    const displacedPid =
+      displacedPidKey !== undefined && displacedPidKey !== pidKey
+        ? index.fileMap[displacedPidKey]
+        : undefined
+    const displacedChatKey = this.findMapKey(index.chatIdByPath, newPath)
+    const displacedChatId =
+      displacedChatKey !== undefined && displacedChatKey !== chatKey
+        ? index.chatIdByPath![displacedChatKey]
+        : undefined
     if (pidKey !== undefined && pid !== undefined) {
       delete index.fileMap[pidKey]
+      if (displacedPid !== undefined) delete index.fileMap[displacedPidKey!]
       index.fileMap[newKey] = pid
+      if (displacedPid !== undefined && displacedPid !== pid) {
+        const other = this.readProject(displacedPid)
+        if (other) {
+          other.files = other.files.filter((f) => canonicalPathKey(f) !== newKey)
+          other.updatedAt = nowIso()
+          this.writeProject(other)
+        }
+      }
       const proj = this.readProject(pid)
       if (proj) {
-        proj.files = proj.files.map((f) => (canonicalPathKey(f) === oldKey ? newPath : f))
+        const seen = new Set<string>()
+        proj.files = proj.files
+          .map((f) => (canonicalPathKey(f) === oldKey ? newPath : f))
+          .filter((f) => {
+            const k = canonicalPathKey(f)
+            if (seen.has(k)) return false
+            seen.add(k)
+            return true
+          })
         proj.updatedAt = nowIso()
         this.writeProject(proj)
       }
     }
     // Old data without a mapping: the chatId was derived from the old path hash; register the mapping under that hash on rename so history keeps up
-    const chatKey = this.findMapKey(index.chatIdByPath, oldPath)
     const chatId =
       chatKey !== undefined ? index.chatIdByPath![chatKey]! : this.fallbackChatId(pid, oldPath)
     if (chatKey !== undefined) delete index.chatIdByPath![chatKey]
+    if (displacedChatId !== undefined) delete index.chatIdByPath![displacedChatKey!]
     index.chatIdByPath = { ...(index.chatIdByPath ?? {}), [newKey]: chatId }
+    if (displacedChatId !== undefined && displacedChatId !== chatId) {
+      this.trashChat(displacedPid ?? pid ?? 'default', displacedChatId)
+    }
     this.writeIndex(index)
+  }
+
+  /** Soft-deletes a transcript the way deleteProject does with a project directory. */
+  private trashChat(projectId: string, chatId: string): void {
+    const src = this.chatPath(projectId, chatId)
+    if (!existsSync(src)) return
+    const trashDir = join(this.baseDir, '.trash')
+    try {
+      ensureDir(trashDir)
+      renameSync(src, join(trashDir, `${projectId}-${chatId}-${Date.now()}.jsonl`))
+    } catch (err) {
+      console.warn('[project-store] fileRenamed move of displaced chat to trash failed:', err)
+    }
+    this.seqCounters.delete(this.seqKey(projectId, chatId))
   }
 
   /**
@@ -605,7 +706,8 @@ export class ProjectStore {
   }
 
   /**
-   * Appends one message to the JSONL. Write failures warn silently, never throw.
+   * Appends one message to the JSONL. A write failure keeps the buffered
+   * opening messages and throws so the caller sees it.
    * seq is auto-assigned by the store layer (monotonically increasing).
    * When the record file doesn't exist yet, non-assistant messages are buffered;
    * the file is created and flushed only when the first assistant message arrives.
@@ -651,7 +753,7 @@ export class ProjectStore {
       }
       if (msg.scope !== undefined) {
         record.scope = {
-          label: msg.scope.label,
+          label: clampChatField(msg.scope.label, SCOPE_LABEL_MAX_CHARS),
           ...(msg.scope.text !== undefined
             ? { text: msg.scope.text.slice(0, SCOPE_TEXT_MAX_CHARS) }
             : {}),
@@ -666,9 +768,9 @@ export class ProjectStore {
         // instead of dropping user messages.
         if (buf.length >= MAX_PENDING_OPENING_MESSAGES) {
           ensureDir(this.chatsDir(projectId))
-          this.pendingFirstWrite.delete(key)
           const lines = buf.map((r) => JSON.stringify(r) + '\n').join('')
           appendJsonLines(this.chatPath(projectId, chatId), lines)
+          this.pendingFirstWrite.delete(key)
           return
         }
         this.pendingFirstWrite.set(key, buf)
@@ -676,11 +778,15 @@ export class ProjectStore {
       }
       ensureDir(this.chatsDir(projectId))
       const buf = this.pendingFirstWrite.get(key) ?? []
-      this.pendingFirstWrite.delete(key)
       const lines = [...buf, record].map((r) => JSON.stringify(r) + '\n').join('')
       appendJsonLines(this.chatPath(projectId, chatId), lines)
+      this.pendingFirstWrite.delete(key)
     } catch (err) {
-      console.warn('[project-store] appendChatMessage failed:', err)
+      console.warn(
+        `[project-store] appendChatMessage failed for ${this.chatPath(projectId, chatId)}:`,
+        err,
+      )
+      throw err
     }
   }
 
@@ -728,10 +834,49 @@ export class ProjectStore {
         } catch {
           // use defaults if stat fails
         }
-        return { chatId, updatedAt, approxCount }
+        const firstQuestion = firstQuestionInFile(fullPath)
+        return {
+          chatId,
+          updatedAt,
+          approxCount,
+          ...(firstQuestion === undefined ? {} : { firstQuestion }),
+        }
       })
     } catch {
       return []
+    }
+  }
+
+  /**
+   * Removes one chat's transcript. Unlike deleteProject this is not a soft
+   * delete: a conversation has no files to migrate out of it, and a reader who
+   * dismisses a thread means for it to be gone. The chatId is checked against
+   * the directory's own contents rather than trusted, so a crafted id cannot
+   * reach outside the project's chats directory.
+   */
+  deleteChat(projectId: string, chatId: string): void {
+    assertSafeId(projectId, 'projectId')
+    assertSafeId(chatId, 'chatId')
+    const path = this.chatPath(projectId, chatId)
+    // A user turn that has not been answered yet is still only in the pending
+    // buffer, so a conversation whose file was never written is the normal case
+    // for a question the reader has just asked and then dismissed. Dropping the
+    // queue is what deletes it; the file below may well not exist yet.
+    this.pendingFirstWrite.delete(this.seqKey(projectId, chatId))
+    // A transcript bound to a document leaves its path mapping behind; drop
+    // every entry that points at the deleted id so a future file at the same
+    // path is not handed the deleted conversation's identity.
+    const index = this.readIndex()
+    const bound = Object.entries(index.chatIdByPath ?? {}).filter(([, id]) => id === chatId)
+    if (bound.length > 0) {
+      for (const [key] of bound) delete index.chatIdByPath![key]
+      this.writeIndex(index)
+    }
+    if (!existsSync(path)) return
+    try {
+      unlinkSync(path)
+    } catch (err) {
+      throw new Error(`Could not delete the conversation: ${String(err)}`, { cause: err })
     }
   }
 
@@ -749,6 +894,8 @@ export class ProjectStore {
     if (fromProjectId === toProjectId && fromId === toId) return
     // The source may still have buffered opening messages: materialize them first (once the file is saved, they should be kept)
     this.flushPending(fromProjectId, fromId)
+    // the target may have buffered opening messages too, or the merge produces duplicate seqs
+    this.flushPending(toProjectId, toId)
     const oldPath = this.chatPath(fromProjectId, fromId)
     const newPath = this.chatPath(toProjectId, toId)
     let mergedMaxSeq: number | undefined
@@ -862,12 +1009,17 @@ export class ProjectStore {
       )
     }
     const now = nowIso()
-    // Generate a stable yet unique id
-    const hash = createHash('sha256')
-      .update(trimmed + now)
-      .digest('hex')
-      .slice(0, 12)
-    const id = `proj-${hash}`
+    // attempt 0 reproduces the historical id; a nonce only on a same-millisecond collision
+    let id: string
+    let attempt = 0
+    do {
+      const hash = createHash('sha256')
+        .update(attempt === 0 ? trimmed + now : `${trimmed}:${now}:${attempt}`)
+        .digest('hex')
+        .slice(0, 12)
+      id = `proj-${hash}`
+      attempt++
+    } while (this.readIndex().projects.some((p) => p.id === id))
     const data: ProjectData = {
       id,
       name: trimmed,
@@ -1047,7 +1199,7 @@ export class ProjectStore {
     const chats = this.listChats(projectId)
     for (const { chatId } of chats) {
       const filePath = chatToFile.get(chatId) ?? ''
-      const msgs = this.loadChat(projectId, chatId, 200)
+      const msgs = this.loadChat(projectId, chatId, boundedLimit)
       for (const msg of msgs) {
         entries.push({
           filePath,

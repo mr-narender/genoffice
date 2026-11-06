@@ -34,6 +34,7 @@ import {
   type MasterTextStyles,
   type TextStyleLevels,
   type LevelTextStyle,
+  MAX_AUTO_NUM_START,
 } from './placeholder'
 import type {
   RunStyleSource,
@@ -58,7 +59,9 @@ import type {
   TableCell,
   TableCellBorders,
   ChartElement,
+  EmuRect,
 } from './types'
+import { COORD_MAX } from './generate'
 import { parseChartXml } from './chart'
 import { parseChartExXml } from './chartex'
 import { parseCustGeom } from './custgeom'
@@ -70,6 +73,7 @@ import {
   type TableStyleFlags,
 } from './table-style'
 import { decodeNumericCharRefs } from './xml-utils'
+import { readRedactLabel } from './redaction-xml'
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -118,6 +122,8 @@ export interface ParseContext {
   chartUserShapes?: Map<string, string>
   /** Audio/video rId → media zip path or external URL (r:link of videoFile/audioFile) */
   avRels?: Map<string, { target: string; external?: boolean }>
+  /** 3D model rId → .glb zip path (am3d:model3d r:embed) */
+  model3dRels?: Map<string, string>
   /** SmartArt: diagramData rId (dgm:relIds@r:dm) → data part content (fallback layout without a drawing part) */
   diagramDatas?: Map<string, string>
   /** SmartArt: diagramData rId (dgm:relIds@r:dm) → prerendered drawing part content */
@@ -176,7 +182,12 @@ export function parseSlide(input: SlideParseInput): Slide {
 
   // Parse each shape's XML fragment with fast-xml-parser (independent parses, naturally aligned with scan order)
   const elements: SlideElement[] = []
-  scan.elements.forEach((sp, idx) => {
+  // The slide's own <p:spTree> children spent no budget at all, so a slide carrying a
+  // million top-level shapes built a million model elements. They now share the budget
+  // the group path already spends on p:grpSp descendants (MAX_GROUP_DESCENDANTS); the
+  // surplus stays one byte-preserving passthrough, so a save replays it verbatim.
+  const withinBudget = scan.elements.slice(0, MAX_GROUP_DESCENDANTS)
+  withinBudget.forEach((sp, idx) => {
     const fragXml = slideXml.slice(sp.start, sp.end)
     const anchor: ByteAnchor = {
       spIndex: idx,
@@ -187,6 +198,25 @@ export function parseSlide(input: SlideParseInput): Slide {
     const el = parseShapeFragment(sp, fragXml, anchor, ctx)
     if (el) elements.push(el)
   })
+  const surplus = scan.elements.slice(MAX_GROUP_DESCENDANTS)
+  if (surplus.length > 0) {
+    const first = surplus[0]!
+    const last = surplus[surplus.length - 1]!
+    // One slice spans every surplus shape, so the gaps between them stay inside it;
+    // only the last shape's gapAfter trails the slice.
+    elements.push(
+      passthrough(
+        {
+          spIndex: MAX_GROUP_DESCENDANTS,
+          originalXml: slideXml.slice(first.start, last.end),
+          range: [first.start, last.end],
+          ...(last.gapAfter ? { gapAfter: last.gapAfter } : {}),
+        },
+        'unknown',
+        undefined,
+      ),
+    )
+  }
 
   // Background: the slide's own <p:bg> wins, otherwise inherit layout→master (read-only).
   // Inherited backgrounds resolve blip rIds against their own part's rels, not the slide's.
@@ -385,6 +415,24 @@ function parseShapeFragment(
       const pic = Array.isArray(picRaw) ? picRaw[0] : picRaw
       if (pic) {
         const el = parsePicture(pic, anchor, ctx)
+        const model = choices
+          .map((ch) => {
+            const gf = ch?.['p:graphicFrame']
+            return (Array.isArray(gf) ? gf[0] : gf)?.['a:graphic']?.['a:graphicData']?.[
+              'am3d:model3d'
+            ]
+          })
+          .find(Boolean)
+        if (model) {
+          const rot = model['am3d:trans']?.['am3d:rot']
+          const angle = (name: string) => Number(rot?.[`@_${name}`] ?? 0) || 0
+          const target = ctx.model3dRels?.get(String(model['@_r:embed']))
+          el.model3d = {
+            ...(target ? { target } : {}),
+            rot: { ax: angle('ax'), ay: angle('ay'), az: angle('az') },
+          }
+          return el
+        }
         // Ink (p:contentPart) fallback bitmaps are placed by the ink's own p14:xfrm; the
         // fallback picture's box is often a much taller strip that PowerPoint never shows
         const inkXfrm = choices
@@ -425,14 +473,14 @@ function parseSpShape(
 
   let transform = parseXfrm(spPr['a:xfrm'])
   // Phase 2 fix: when a placeholder omits <a:xfrm>, geometry is backfilled from layout/master inheritance.
-  if (ph && !spPr['a:xfrm']) {
+  if (ph && lacksExt(spPr['a:xfrm'])) {
     const inherited = resolvePlaceholderTransform(
       ctx.layoutPlaceholders,
       ctx.masterPlaceholders,
       phType,
       phIdx,
     )
-    if (inherited) transform = inherited
+    if (inherited) transform = withInheritedExt(spPr['a:xfrm'], transform, inherited)
   }
 
   const prstGeom = spPr['a:prstGeom']
@@ -560,14 +608,18 @@ function parseSpShape(
     }
   }
 
+  // PowerPoint marks Insert > Text Box with txBox="1" and still writes prstGeom rect;
+  // a geometry-less txBody is the legacy shape of our own inserted text boxes
+  const txBox = nv?.['p:cNvSpPr']?.['@_txBox'] === '1'
+  const isTextBox = txBox && !customGeometry && (!presetGeometry || presetGeometry === 'rect')
   const el: TextElement = {
     id: uid('sp'),
-    type: txBody && !presetGeometry && !customGeometry ? 'text' : 'shape',
+    type: txBody && (isTextBox || (!presetGeometry && !customGeometry)) ? 'text' : 'shape',
     anchor,
     transform,
     // <p:ph> without a type (content placeholder) defaults to body per ECMA
     placeholder: ph ? (phType ?? 'body') : undefined,
-    ...(nv?.['p:cNvSpPr']?.['@_txBox'] === '1' ? { txBox: true } : {}),
+    ...(txBox ? { txBox: true } : {}),
     name,
     presetGeometry,
     ...(adjust ? { adjust } : {}),
@@ -832,6 +884,55 @@ interface GroupParseBudget {
   remaining: number
 }
 
+/**
+ * Whether a group's child coordinate system is usable: the scale it implies
+ * (group ext / chExt, per axis) must keep the group box inside the coordinate
+ * range the write path emits into — COORD_MAX, the ST_PositiveCoordinate ceiling
+ * generate.ts clamps every a:ext to, with non-finite values refused outright.
+ * The group box is measured after one more trip through the same scale, which is
+ * what bounds the nested-group case; every group PowerPoint writes sits orders of
+ * magnitude below the bound.
+ *
+ * Each axis is judged on its own, and a zero on one axis is not a verdict about
+ * the other: PowerPoint writes ext cy=0 / chExt cy=0 for a horizontal connector
+ * group, and a zero chExt (or ext) is a legitimate degenerate group, not a
+ * malformed one. Every consumer already maps a zero axis to scale 1
+ * (pptx-ops: `ch?.cx ? … : 1`, pptx-render: `ch?.cx || …`) — the very mapping
+ * the 1:1 fallback gives — so scale 1 costs nothing and the chOff coordinate
+ * that positions the child survives. Only a real quotient can overflow, and
+ * non-finite input is refused outright on either side of the mapping.
+ */
+function groupScaleWithinWriteRange(groupExt: EmuRect, childExt: EmuRect): boolean {
+  // An attribute outside the int64 the schema allows parses to Infinity
+  // (parseInt of a 400-digit string). Infinity/NaN on any field that feeds the
+  // mapping — the group origin, the group box, chOff, chExt — would carry
+  // straight into the layout tree, so the child coordinate system goes.
+  const mapped = [
+    groupExt.x,
+    groupExt.y,
+    groupExt.cx,
+    groupExt.cy,
+    childExt.x,
+    childExt.y,
+    childExt.cx,
+    childExt.cy,
+  ]
+  if (!mapped.every(Number.isFinite)) return false
+  const axes: Array<[number, number]> = [
+    [groupExt.cx, childExt.cx],
+    [groupExt.cy, childExt.cy],
+  ]
+  for (const [g, ch] of axes) {
+    // ch <= 0 (0 for a degenerate group, negative only in a broken file) is
+    // scale 1 on this axis: no quotient, nothing to overflow, and the sibling
+    // axis is never consulted here. Scale 1 leaves the group box at |g|, which
+    // is the a:ext the write path already clamps on its own.
+    if (ch <= 0) continue
+    if (g * (g / ch) > COORD_MAX) return false
+  }
+  return true
+}
+
 function groupExceedsBudget(xml: string): boolean {
   const tags = new Set<string>(GROUP_CHILD_TAGS)
   GROUP_TAG_RE.lastIndex = 0
@@ -878,7 +979,7 @@ function parseGroup(
   // Child coordinate system: <a:chOff>/<a:chExt> (child coords are based on it, mapped to the parent when rendering)
   const chOff = xfrm?.['a:chOff']
   const chExt = xfrm?.['a:chExt']
-  const childOffset =
+  let childOffset: EmuRect | undefined =
     chOff || chExt
       ? {
           x: chOff ? parseInt(chOff['@_x'], 10) || 0 : 0,
@@ -887,6 +988,13 @@ function parseGroup(
           cy: chExt ? parseInt(chExt['@_cy'], 10) || 0 : 0,
         }
       : undefined
+  // ext/chExt was unbounded, so the scale multiplied straight into the layout tree:
+  // ext=2^31 with chExt=1 carries an ordinary 1e6 EMU child ~2e11 px away. Bound it by
+  // the write path's own range (COORD_MAX) and drop the child coordinate system when it
+  // is not representable there, leaving the 1:1 mapping every consumer already handles.
+  if (childOffset && !groupScaleWithinWriteRange(transform.offset, childOffset)) {
+    childOffset = undefined
+  }
 
   const group: GroupElement = {
     id: uid('grp'),
@@ -972,8 +1080,9 @@ function groupChildNvId(child: any): string | undefined {
   return undefined
 }
 
-// Same tag matching style as scan.ts (tolerates '>' inside attribute values)
-const GROUP_TAG_RE = /<\/?(?:[^<>"']|"[^"]*"|'[^']*')*>/g
+// Same tag matching style as scan.ts (tolerates '>' inside attribute values);
+// the comment alternative comes first so a comment body containing '<' is skipped whole
+const GROUP_TAG_RE = /<!--[\s\S]*?-->|<\/?(?:[^<>"']|"[^"]*"|'[^']*')*>/g
 const GROUP_NAME_RE = /^<\/?\s*([A-Za-z_][\w:.-]*)/
 
 interface GroupChildSlice {
@@ -1069,14 +1178,14 @@ function parsePicture(
   let transform = parseXfrm(spPr['a:xfrm'])
   // Pictures dropped into a placeholder may omit <a:xfrm> entirely; geometry comes from layout/master
   const picPh = node['p:nvPicPr']?.['p:nvPr']?.['p:ph']
-  if (picPh && !spPr['a:xfrm']) {
+  if (picPh && lacksExt(spPr['a:xfrm'])) {
     const inherited = resolvePlaceholderTransform(
       ctx.layoutPlaceholders,
       ctx.masterPlaceholders,
       picPh['@_type'],
       picPh['@_idx'] != null ? String(picPh['@_idx']) : undefined,
     )
-    if (inherited) transform = inherited
+    if (inherited) transform = withInheritedExt(spPr['a:xfrm'], transform, inherited)
   }
   const blipFill = node['p:blipFill']
   const blip = blipFill?.['a:blip']
@@ -1116,13 +1225,18 @@ function parsePicture(
   const shadow = parseShadow(spPr, ctx)
   const glow = parseGlow(spPr, ctx)
   const reflection = parseReflection(spPr)
+  // "Withheld from the model" on a picture, video or audio shape. spPr is the one
+  // legal extension slot here: p:nvPicPr admits only cNvPr + cNvPicPr, and
+  // cNvPr takes attributes alone, which the user's own alt text already uses.
+  const redact = readRedactLabel(spPr)
   // Pic's own spPr fill: PowerPoint draws it as a backdrop behind the (possibly translucent) blip
   const fill = parseFill(spPr, ctx)
   const duotone = parseDuotone(blip, ctx)
   const clrChange = parseClrChange(blip, ctx)
   const lum = parseLum(blip)
   const biLevel = parseBiLevel(blip)
-  // Audio/video: a:videoFile/a:audioFile under p:nvPr; blipFill is the poster frame
+  // Audio/video: a:videoFile/a:audioFile under p:nvPr; blipFill is the poster frame.
+  // p14-only media (extLst p14:media r:embed, no legacy tag) resolves the same way.
   const nvPr = node['p:nvPicPr']?.['p:nvPr']
   const avNode = nvPr?.['a:videoFile'] ?? nvPr?.['a:audioFile']
   let media: PictureElement['media']
@@ -1134,6 +1248,15 @@ function parsePicture(
       kind,
       ...(rel ? { target: rel.target, ...(rel.external ? { external: true } : {}) } : {}),
     }
+  } else {
+    const extRaw = nvPr?.['p:extLst']?.['p:ext']
+    const exts = Array.isArray(extRaw) ? extRaw : extRaw ? [extRaw] : []
+    const embed = exts.map((e: any) => e?.['p14:media']?.['@_r:embed']).find((v: any) => v != null)
+    const rel = embed != null ? ctx.avRels?.get(String(embed)) : undefined
+    if (rel) {
+      const kind = /\.(mp3|wav|m4a|aac|ogg|flac|wma)$/i.test(rel.target) ? 'audio' : 'video'
+      media = { kind, target: rel.target, ...(rel.external ? { external: true } : {}) }
+    }
   }
   return {
     id: uid('pic'),
@@ -1142,6 +1265,7 @@ function parsePicture(
     transform,
     name,
     ...(descr ? { descr } : {}),
+    ...(redact ? { redact } : {}),
     mediaRef,
     ...(srcRect ? { srcRect } : {}),
     ...(blipFill && typeof blipFill === 'object' && 'a:tile' in blipFill ? { tile: true } : {}),
@@ -1218,6 +1342,92 @@ function parseChartUserLines(
   return out
 }
 
+/**
+ * chartUserShapes text boxes / shapes (cdr:sp with a body, anything but the straight lines
+ * handled above): anchored by frame fractions (relSizeAnchor) or EMU from+ext (absSizeAnchor),
+ * mapped into slide coordinates and parsed as ordinary shapes. Read-only overlays.
+ */
+function parseChartUserShapes(
+  usXml: string,
+  frame: Transform,
+  anchor: ByteAnchor,
+  ctx: ParseContext,
+): TextElement[] {
+  let doc: any
+  try {
+    doc = parser.parse(usXml)
+  } catch {
+    return []
+  }
+  const root = doc['c:userShapes']
+  if (!root || !frame.offset.cx || !frame.offset.cy) return []
+  const list = (k: string): any[] => {
+    const raw = root[k]
+    return Array.isArray(raw) ? raw : raw ? [raw] : []
+  }
+  const num = (n: any) => {
+    const v = parseFloat(String(n ?? ''))
+    return Number.isFinite(v) ? v : 0
+  }
+  const out: TextElement[] = []
+  const build = (a: any, rect: { x: number; y: number; cx: number; cy: number }) => {
+    const spRaw = a?.['cdr:sp']
+    const sps: any[] = Array.isArray(spRaw) ? spRaw : spRaw ? [spRaw] : []
+    for (const sp of sps) {
+      const spPr = sp?.['cdr:spPr'] ?? {}
+      const prst = spPr['a:prstGeom']?.['@_prst']
+      if (prst === 'line' || prst === 'straightConnector1') continue
+      if (rect.cx <= 0 || rect.cy <= 0) continue
+      const xfrm = spPr['a:xfrm'] ?? {}
+      const nv = sp?.['cdr:nvSpPr'] ?? {}
+      const pNode = {
+        'p:nvSpPr': {
+          'p:cNvPr': nv['cdr:cNvPr'] ?? {},
+          'p:cNvSpPr': nv['cdr:cNvSpPr'] ?? {},
+          'p:nvPr': {},
+        },
+        'p:spPr': {
+          ...spPr,
+          'a:xfrm': {
+            ...(xfrm['@_rot'] ? { '@_rot': xfrm['@_rot'] } : {}),
+            ...(xfrm['@_flipH'] ? { '@_flipH': xfrm['@_flipH'] } : {}),
+            ...(xfrm['@_flipV'] ? { '@_flipV': xfrm['@_flipV'] } : {}),
+            'a:off': { '@_x': String(Math.round(rect.x)), '@_y': String(Math.round(rect.y)) },
+            'a:ext': { '@_cx': String(Math.round(rect.cx)), '@_cy': String(Math.round(rect.cy)) },
+          },
+        },
+        ...(sp?.['cdr:style'] ? { 'p:style': sp['cdr:style'] } : {}),
+        ...(sp?.['cdr:txBody'] ? { 'p:txBody': sp['cdr:txBody'] } : {}),
+      }
+      const el = parseSpShape(pNode, anchor, ctx)
+      if (el.type === 'text' || el.type === 'shape') out.push(el as TextElement)
+    }
+  }
+  for (const a of list('cdr:relSizeAnchor')) {
+    const fx = num(a?.['cdr:from']?.['cdr:x'])
+    const fy = num(a?.['cdr:from']?.['cdr:y'])
+    const tx = num(a?.['cdr:to']?.['cdr:x'])
+    const ty = num(a?.['cdr:to']?.['cdr:y'])
+    build(a, {
+      x: frame.offset.x + fx * frame.offset.cx,
+      y: frame.offset.y + fy * frame.offset.cy,
+      cx: (tx - fx) * frame.offset.cx,
+      cy: (ty - fy) * frame.offset.cy,
+    })
+  }
+  for (const a of list('cdr:absSizeAnchor')) {
+    const fx = num(a?.['cdr:from']?.['cdr:x'])
+    const fy = num(a?.['cdr:from']?.['cdr:y'])
+    build(a, {
+      x: frame.offset.x + fx * frame.offset.cx,
+      y: frame.offset.y + fy * frame.offset.cy,
+      cx: num(a?.['cdr:ext']?.['@_cx']),
+      cy: num(a?.['cdr:ext']?.['@_cy']),
+    })
+  }
+  return out
+}
+
 function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContext): SlideElement {
   const data = node['a:graphic']?.['a:graphicData']
   const uri: string = data?.['@_uri'] ?? ''
@@ -1262,11 +1472,14 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
       ? parseChartXml(chartXml, chartTheme, (spPr) => parseFill(spPr, chartFillCtx))
       : null
     if (model && ctx.chartStyleRels?.has(String(rid))) model.hasStylePart = true
+    let userShapes: TextElement[] = []
+    const frameXfrm = parseXfrm(node['p:xfrm'])
     if (model) {
       const usXml = rid ? ctx.chartUserShapes?.get(String(rid)) : undefined
       if (usXml) {
         const lines = parseChartUserLines(usXml, ctx)
         if (lines.length) model.userLines = lines
+        userShapes = parseChartUserShapes(usXml, frameXfrm, anchor, ctx)
       }
     }
     if (model) {
@@ -1276,10 +1489,11 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
         id: uid('chart'),
         type: 'chart',
         anchor,
-        transform: parseXfrm(node['p:xfrm']),
+        transform: frameXfrm,
         name: cNvPr?.['@_name'],
         ...(descr ? { descr } : {}),
         chart: model,
+        ...(userShapes.length ? { userShapes } : {}),
       } satisfies ChartElement
     }
   }
@@ -3066,19 +3280,35 @@ function parseTableCell(
 
   if (tc['a:txBody']) {
     // Table-style text defaults (bold white header text etc.) injected at the end of the inheritance chain
-    const styleChain: TextStyleLevels[] =
-      part && (part.bold !== undefined || part.textColor)
-        ? [
-            {
-              levels: [
-                {
-                  ...(part.bold !== undefined ? { bold: part.bold } : {}),
-                  ...(part.textColor ? { color: part.textColor } : {}),
-                },
-              ],
-            },
-          ]
-        : []
+    const styleChain: TextStyleLevels[] = []
+    if (part && (part.bold !== undefined || part.textColor || part.fontRef || part.font)) {
+      const level: TextStyleLevels['levels'][number] = {
+        ...(part.bold !== undefined ? { bold: part.bold } : {}),
+        ...(part.textColor ? { color: part.textColor } : {}),
+      }
+      // fontRef picks the theme scheme as unresolved refs so a run re-resolves +mn-ea with
+      // its own script (ja-JP cells on a built-in style set kana in the theme's Jpan font,
+      // not in the master's Latin <a:ea>; PowerPoint ranks tcTxStyle above those defaults)
+      if (part.fontRef) {
+        const pre = part.fontRef === 'major' ? '+mj' : '+mn'
+        const latinFont = resolveFontRef(`${pre}-lt`, ctx.theme)
+        const eaFont = resolveFontRef(`${pre}-ea`, ctx.theme)
+        const csFont = resolveFontRef(`${pre}-cs`, ctx.theme)
+        if (latinFont) Object.assign(level, { latinFont, latinFontRef: `${pre}-lt` })
+        if (eaFont) Object.assign(level, { eaFont, eaFontRef: `${pre}-ea` })
+        if (csFont) level.csFont = csFont
+      }
+      if (part.font?.latin) {
+        level.latinFont = part.font.latin
+        delete level.latinFontRef
+      }
+      if (part.font?.ea) {
+        level.eaFont = part.font.ea
+        delete level.eaFontRef
+      }
+      if (part.font?.cs) level.csFont = part.font.cs
+      styleChain.push({ levels: [level], src: 'table style' })
+    }
     // Cell text without its own size sits on presentation.xml defaultTextStyle like any
     // non-placeholder shape (Google Slides export: 14pt default, PowerPoint draws 14pt)
     if (ctx.defaultTextStyle)
@@ -3177,6 +3407,19 @@ function parseXfrm(xfrm: any): Transform {
     rot: xfrm['@_rot'] ? parseInt(xfrm['@_rot'], 10) || 0 : 0,
     flipH: xfrm['@_flipH'] === '1' || xfrm['@_flipH'] === 'true',
     flipV: xfrm['@_flipV'] === '1' || xfrm['@_flipV'] === 'true',
+  }
+}
+
+function lacksExt(xfrm: any): boolean {
+  return !xfrm || !xfrm['a:ext']
+}
+
+/** Placeholder <a:xfrm> with <a:off> but no <a:ext>: keep the offset, size comes from the layout/master. */
+function withInheritedExt(xfrm: any, own: Transform, inherited: Transform): Transform {
+  if (!xfrm) return inherited
+  return {
+    ...own,
+    offset: { ...own.offset, cx: inherited.offset.cx, cy: inherited.offset.cy },
   }
 }
 
@@ -3633,7 +3876,8 @@ function parseParagraph(
     bullet = { type: 'number' }
     if (pPr['a:buAutoNum']['@_type']) bullet.numType = String(pPr['a:buAutoNum']['@_type'])
     const startAt = parseInt(pPr['a:buAutoNum']['@_startAt'], 10)
-    if (Number.isFinite(startAt) && startAt > 1) bullet.startAt = startAt
+    if (Number.isFinite(startAt) && startAt > 1)
+      bullet.startAt = Math.min(startAt, MAX_AUTO_NUM_START)
   } else if (pPr['a:buBlip'] !== undefined) {
     bullet = { type: 'blip' }
     const embed = blipEmbedId(pPr['a:buBlip']?.['a:blip'])
@@ -3708,10 +3952,16 @@ function parseParagraph(
       : rtlAttr === '0' || rtlAttr === 'false'
         ? false
         : undefined
-  const hangAttr = pPr['@_hangingPunct']
-  const hangingOff = hangAttr === '0' || hangAttr === 'false'
-  const latinLnBrk = pPr['@_latinLnBrk'] === '1' || pPr['@_latinLnBrk'] === 'true'
-  const eaLnBrkOff = pPr['@_eaLnBrk'] === '0' || pPr['@_eaLnBrk'] === 'false'
+  // Line-break switches inherit through lstStyle/master txStyles like any level property
+  const brkFlag = (k: 'hangingPunct' | 'latinLnBrk' | 'eaLnBrk'): boolean | undefined => {
+    const v = pPr[`@_${k}`]
+    if (v === '1' || v === 'true') return true
+    if (v === '0' || v === 'false') return false
+    return dflt?.[k]
+  }
+  const hangingPunct = brkFlag('hangingPunct')
+  const latinLnBrk = brkFlag('latinLnBrk')
+  const eaLnBrk = brkFlag('eaLnBrk')
 
   // Record which properties come from an explicit pPr (the rebuild path writes only explicit items; inherited values are not baked in)
   const pPrExplicit: NonNullable<Paragraph['pPrExplicit']> = {
@@ -3725,6 +3975,9 @@ function parseParagraph(
     ...(hasIndent ? { indent: true } : {}),
     ...(tabStops.length ? { tabLst: true } : {}),
     ...(hasDefTabSz ? { defTabSz: true } : {}),
+    ...(pPr['@_hangingPunct'] != null ? { hangingPunct: true } : {}),
+    ...(pPr['@_latinLnBrk'] != null ? { latinLnBrk: true } : {}),
+    ...(pPr['@_eaLnBrk'] != null ? { eaLnBrk: true } : {}),
   }
 
   return {
@@ -3734,9 +3987,9 @@ function parseParagraph(
       ? { alignSrc: pPr['@_algn'] ? 'paragraph' : (dflt?.src?.align ?? 'inherited') }
       : {}),
     ...(rtl != null ? { rtl } : {}),
-    ...(hangingOff ? { hangingPunct: false } : {}),
-    ...(latinLnBrk ? { latinLnBrk: true } : {}),
-    ...(eaLnBrkOff ? { eaLnBrk: false } : {}),
+    ...(hangingPunct != null ? { hangingPunct } : {}),
+    ...(latinLnBrk != null ? { latinLnBrk } : {}),
+    ...(eaLnBrk != null ? { eaLnBrk } : {}),
     level,
     pPrExplicit,
     ...(lineHeight != null ? { lineHeight } : {}),
@@ -3819,6 +4072,7 @@ function themeFontSource(ref: string | undefined): string | undefined {
 
 function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
   const rPr = r['a:rPr'] ?? {}
+  const redactLabel = readRedactLabel(rPr)
   const rawT = r['a:t']
   const text = decodeNumericCharRefs(
     typeof rawT === 'string'
@@ -4027,6 +4281,9 @@ function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
     ...(uAttr !== undefined && uAttr !== 'none' ? { underlineStyle: String(uAttr) } : {}),
     ...(uAttr === 'none' ? { underlineExplicitNone: true } : {}),
     ...(linkUnderline ? { underlineImplicit: true } : {}),
+    // "Withheld from the model": the label is read off our own extension in the
+    // rPr, never off the text. The words stay; only the model's view changes.
+    ...(redactLabel ? { redact: redactLabel } : {}),
     ...(hasStrike ? { strike: true, strikeStyle: String(strikeAttr) } : {}),
     ...(strikeAttr === 'noStrike' ? { strikeExplicitNone: true } : {}),
     ...(latinRaw ? { latinFont: String(latinRaw) } : {}),

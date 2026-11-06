@@ -9,13 +9,14 @@
  * of racing, and retries on its next 30 s wake-up.
  */
 import { describe, expect, it } from 'vitest'
-import { shouldRunSaveTick } from '../src/renderer/save-scheduler'
+import { createSaveGate, shouldRunSaveTick } from '../src/renderer/save-scheduler'
 
 function dirtyWorkbookState(overrides: Partial<Parameters<typeof shouldRunSaveTick>[0]> = {}) {
   return {
     saveInFlight: false,
     hasWorkbook: true,
     journalEmpty: false,
+    redactionsPendingSave: false,
     editingCell: false,
     needsSaveAsNotUnsavedNew: false,
     isCsv: false,
@@ -75,5 +76,80 @@ describe('shouldRunSaveTick', () => {
     expect(
       shouldRunSaveTick(dirtyWorkbookState({ kind: 'save', restoredFromRecovery: true })),
     ).toBe(true)
+  })
+})
+
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+describe('createSaveGate', () => {
+  it('runs saves one after another and reports busy until the last one settles', async () => {
+    const gate = createSaveGate()
+    const order: string[] = []
+    let releaseFirst!: () => void
+    const first = gate.run(async () => {
+      order.push('first:start')
+      await new Promise<void>((resolve) => (releaseFirst = resolve))
+      order.push('first:end')
+      return 1
+    })
+    const second = gate.run(async () => {
+      order.push('second:start')
+      return 2
+    })
+    expect(gate.busy).toBe(true)
+    await settle()
+    expect(order).toEqual(['first:start'])
+    releaseFirst()
+    expect(await first).toBe(1)
+    expect(await second).toBe(2)
+    expect(order).toEqual(['first:start', 'first:end', 'second:start'])
+    await settle()
+    expect(gate.busy).toBe(false)
+  })
+
+  it('a failed save does not block the next one and the gate reopens', async () => {
+    const gate = createSaveGate()
+    const failed = gate.run(() => Promise.reject(new Error('boom')))
+    await expect(failed).rejects.toThrow('boom')
+    expect(await gate.run(async () => 'ok')).toBe('ok')
+    await settle()
+    expect(gate.busy).toBe(false)
+  })
+})
+
+describe('a workbook whose only edit is a withheld cell still saves', () => {
+  /**
+   * A mark lives in a package part, not in the edit journal, so the journal
+   * looks empty. Before this was checked, such a workbook was skipped by both
+   * ticks: no AutoSave, no crash-recovery copy, and the mark lost on close —
+   * with the reader having watched it get drawn.
+   */
+  const onlyRedactions = { journalEmpty: true, redactionsPendingSave: true }
+
+  it('runs the AutoSave tick', () => {
+    expect(shouldRunSaveTick(dirtyWorkbookState({ ...onlyRedactions, kind: 'save' }))).toBe(true)
+  })
+
+  it('runs the crash-recovery tick', () => {
+    expect(shouldRunSaveTick(dirtyWorkbookState({ ...onlyRedactions, kind: 'recovery' }))).toBe(
+      true,
+    )
+  })
+
+  it('still skips when nothing at all is pending', () => {
+    // The flag is what makes the difference, so a workbook that is genuinely
+    // clean must keep skipping — otherwise every idle workbook would save
+    // every thirty seconds.
+    expect(
+      shouldRunSaveTick(
+        dirtyWorkbookState({ journalEmpty: true, redactionsPendingSave: false, kind: 'save' }),
+      ),
+    ).toBe(false)
+  })
+
+  it('still honours the in-cell editor guard', () => {
+    expect(
+      shouldRunSaveTick(dirtyWorkbookState({ ...onlyRedactions, kind: 'save', editingCell: true })),
+    ).toBe(false)
   })
 })

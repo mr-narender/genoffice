@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const it = {
+  redactMenuLabel: 'Nascondi la selezione all’IA',
+  redactDialogDesc:
+    'Il contenuto selezionato resta nel documento e nel file; il modello vede solo il segnaposto. Dai un nome perché sappia cosa rappresenta.',
+  redactDialogScope:
+    'Nascondere vale solo per l’IA di questa app. La CLI, gli strumenti MCP e l’esportazione senza interfaccia leggono direttamente il file e vedono comunque queste parole.',
+  redactDialogPlaceholder: 'Nome del segnaposto, es. telefono del cliente',
+  redactCancel: 'Annulla',
+  redactInsert: 'Nascondi',
+  redactEnable: 'Clic destro su una selezione per nasconderla al modello.',
+
   appPhPromptTitle: 'Fai clic per aggiungere un titolo',
   appPhPromptSubtitle: 'Fai clic per aggiungere un sottotitolo',
   appPhPromptBody: 'Fai clic per aggiungere del testo',
@@ -56,7 +66,9 @@ export const it = {
     'Video inserito (incorporato nel file .pptx; riproducibile in PowerPoint)',
   appStatusAudioInserted: 'Audio inserito (incorporato nel file .pptx)',
   appStatusModel3dInserted:
-    "Modello 3D incorporato (l'area di lavoro mostra un segnaposto; il file del modello è salvato nel .pptx)",
+    'Modello 3D inserito: selezionalo per ruotarlo (anche PowerPoint lo mostra in 3D)',
+  appStatusModel3dNoPreview:
+    'Impossibile disegnare qui il modello 3D; la sua immagine resta invariata',
   appStatusRecordingEmpty: 'La registrazione è vuota; non è stato inserito nulla',
   appStatusRecordingInserted:
     'Registrazione dello schermo inserita nella diapositiva corrente (webm incorporato)',
@@ -156,6 +168,15 @@ export const it = {
   appPrintProgress: 'Preparazione della stampa…',
   appPrintTitle: 'Stampa',
   appPrintLayoutFull: 'Diapositive a pagina intera',
+  appPrintPrinter: 'Stampante',
+  appPrintDefaultPrinter: 'Stampante predefinita',
+  appPrintSystemDialog: 'Finestra di sistema…',
+  appPrintCopies: 'Copie',
+  appPrintCollate: 'Fascicola',
+  appPrintDuplex: 'Fronte/retro',
+  appPrintDuplexOff: 'Singola faccia',
+  appPrintDuplexLong: 'Fronte/retro, lato lungo',
+  appPrintDuplexShort: 'Fronte/retro, lato corto',
   appPrintLayoutHandout2: 'Stampati (2 per pagina)',
   appPrintLayoutHandout3: 'Stampati (3 per pagina)',
   appPrintLayoutHandout6: 'Stampati (6 per pagina)',
@@ -181,6 +202,7 @@ export const it = {
   appCtxSendToBack: 'Porta in secondo piano',
   appCtxBringForward: 'Porta avanti',
   appCtxSendBackward: 'Porta indietro',
+  appCtxRotate: 'Ruota',
   appCtxRotateLeft90: 'Ruota di 90° a sinistra',
   appCtxRotateRight90: 'Ruota di 90° a destra',
   appCtxFlipH: 'Capovolgi orizzontalmente',
@@ -220,6 +242,8 @@ export const it = {
   appMasterFillNone: 'Nessun riempimento',
   appMasterStroke: 'Colore contorno…',
   appMasterStrokeNone: 'Nessun contorno',
+  appMasterInsertTextBox: 'Casella di Testo',
+  appMasterInsertShape: 'Forme',
   appStartOpening: 'Apertura…',
   appReadingSlideTitle:
     'Fai clic per passare alla diapositiva successiva (Esc per uscire dalla visualizzazione di lettura)',
@@ -248,6 +272,14 @@ export const it = {
     "Il tempo totale della presentazione è stato {duration}. Vuoi salvare gli intervalli delle diapositive per l'avanzamento automatico?",
   appRehearseDiscard: 'Non salvare',
   appRehearseSave: 'Salva',
+  appRecordTitle: 'Registra commento',
+  appRecordSummary:
+    'Durata della registrazione: {duration}. Salvare il commento e la durata di ogni diapositiva?',
+  appRecordDiscard: 'Non salvare',
+  appRecordSave: 'Salva',
+  appStatusRecordSaved: 'Commento salvato in {count} diapositive (riprodotto anche da PowerPoint)',
+  appStatusRecordFailed: 'Impossibile salvare la registrazione',
+  appStatusNarrationCleared: 'Commento cancellato',
   appSettingsTitle: 'Impostazioni IA',
   appSettingsAccount: 'Account Genspark',
   appSettingsChecking: 'Verifica in corso…',
