@@ -4,6 +4,7 @@
  * Phase 1 scope: openPptx (parsing) + savePptx's "no changes = byte identical"
  * path (proving fidelity). Element-level patch regeneration is left for Phase 3.
  */
+import { stripRedactExt, syncRedactExt } from './redaction-xml'
 import JSZip from 'jszip'
 import { PackageArchive, relsPathFor, resolveTarget, type Relationship } from './zip'
 import { parseClrMap, parseTheme, type Theme } from './theme'
@@ -79,7 +80,12 @@ import type {
   ReflectionEffect,
 } from './types'
 import { patchTableStyleXml, ensureTableStyleXml, type TableStyleEdit } from './table-edit'
-import { buildChartSpaceXml, type NewChartKind, type NewChartOptions } from './chart-insert'
+import {
+  buildChartSpaceXml,
+  writeChartWorkbook,
+  type NewChartKind,
+  type NewChartOptions,
+} from './chart-insert'
 import { parseLayoutPlaceholders, placeholderSpXml, prepareInsertSlideWithLayout } from './layout'
 import {
   chooseLayout,
@@ -91,9 +97,19 @@ import {
   type SlideBundle,
 } from './slide-transfer'
 import { moveSlide } from './sections'
+import { MODEL3D_REL_TYPE, syncModel3dFrame } from './model3d'
 import { cleanupSupersededSlideResources, removePartWithOwnedResources } from './resource-cleanup'
 
 export * from './types'
+export {
+  REDACT_EXT_URI,
+  hasRedactExtIn,
+  readRedactLabel,
+  redactExtXml,
+  setRedactExt,
+  stripRedactExt,
+  syncRedactExt,
+} from './redaction-xml'
 export { cleanupSupersededSlideResources }
 export type { ResourceCleanupStats } from './resource-cleanup'
 export {
@@ -262,6 +278,7 @@ export {
   type ChartSeries,
   type ChartKind,
   type ChartAxisStyle,
+  type ChartDataTable,
 } from './chart'
 export { parseChartExXml } from './chartex'
 export { getSlideNotes, setSlideNotes, notesPathForSlide, unescapeXml } from './notes'
@@ -285,9 +302,16 @@ export { NAMED_ACTIONS, namedActionOf, type NamedAction } from './named-action'
 export {
   addChart,
   buildChartSpaceXml,
+  writeChartWorkbook,
   type NewChartKind,
   type NewChartOptions,
 } from './chart-insert'
+export {
+  CHART_WORKBOOK_REL_TYPE,
+  chartWorkbookParts,
+  chartWorkbookXlsx,
+  type ChartWorkbookData,
+} from './chart-workbook'
 export {
   addSmartArt,
   buildSmartArtXml,
@@ -295,13 +319,30 @@ export {
   type NewSmartArtOptions,
 } from './smartart'
 export {
+  AM3D_NS,
+  MODEL3D_REL_TYPE,
+  NO_ROTATION,
+  readModel3dRotation,
+  type Model3dRotation,
+} from './model3d'
+export { glbBounds, type GlbBounds } from './glb-bounds'
+export {
   addMedia,
   addModel3d,
+  setModel3dView,
   model3dPartOf,
   solidPng,
   type NewMediaOptions,
   type NewModel3dOptions,
 } from './media-insert'
+export {
+  addNarration,
+  clearNarration,
+  narrationSpids,
+  setShowNarration,
+  NARRATION_NAME,
+  type NarrationAudio,
+} from './narration'
 export { applyHeaderFooter, readHeaderFooter, type HeaderFooterOptions } from './headerfooter'
 export {
   getSections,
@@ -391,6 +432,7 @@ function parseSlideFromArchive(archive: PackageArchive, slidePath: string): Slid
   const diagramColors = new Map<string, string>()
   const vmlPreviews = new Map<string, string>()
   const hlinkRels = new Map<string, string>()
+  const model3dRels = new Map<string, string>()
   let slideOrder: string[] | undefined
   for (const rel of rels.values()) {
     if (rel.type.endsWith('/hyperlink')) {
@@ -429,6 +471,8 @@ function parseSlideFromArchive(archive: PackageArchive, slidePath: string): Slid
         target: external ? rel.target : resolveTarget(slidePath, rel.target),
         ...(external ? { external: true } : {}),
       })
+    } else if (rel.type === MODEL3D_REL_TYPE) {
+      model3dRels.set(rel.id, resolveTarget(slidePath, rel.target))
     } else if (rel.type.endsWith('/vmlDrawing')) {
       // Legacy OLE previews: v:shape (matched by oleObj spid) → v:imagedata → the VML part's own image rel
       const vmlPath = resolveTarget(slidePath, rel.target)
@@ -481,6 +525,7 @@ function parseSlideFromArchive(archive: PackageArchive, slidePath: string): Slid
   ctx.chartThemeOverrides = chartThemeOverrides
   if (hlinkRels.size) ctx.hlinkRels = hlinkRels
   if (avRels.size) ctx.avRels = avRels
+  if (model3dRels.size) ctx.model3dRels = model3dRels
   if (diagramDrawings.size) ctx.diagramDrawings = diagramDrawings
   if (diagramDatas.size) ctx.diagramDatas = diagramDatas
   if (diagramMediaRels.size) ctx.diagramMediaRels = diagramMediaRels
@@ -707,6 +752,11 @@ export async function savePptx(opened: OpenedPptx): Promise<Uint8Array> {
  * time. JSZip throws stream errors from inside its own scheduled callbacks, so the
  * stream's 'error' event — not just the returned promise — has to be handled or the
  * throw escapes as an uncaught exception and takes the process down.
+ *
+ * The stream truncates `filePath` before its first chunk lands, so a caller that
+ * replaces an existing deck hands this a sibling temp path and renames it over the
+ * deck once the promise resolves (Slides does so through atomicWriteVia); given the
+ * deck's own path, a save that dies mid-stream leaves it cut off.
  */
 export async function savePptxToFile(opened: OpenedPptx, filePath: string): Promise<void> {
   const { createWriteStream } = await import('node:fs')
@@ -886,6 +936,8 @@ export function patchedElementXml(el: SlideElement): string {
   // graphicFrame (table/chart/passthrough) uses the p:xfrm patch, everything else a:xfrm
   if (el.dirtyTransform) {
     xml = patchAnchorXml(el, xml, (x) => patchElementXfrm(el, x), true)
+    // PowerPoint shows a model's Choice, while the editor moves its Fallback picture
+    if (el.type === 'picture' && el.model3d) xml = syncModel3dFrame(xml)
   }
   if (el.dirtyFill && (el.type === 'text' || el.type === 'shape')) {
     const fill = (el as TextElement).fill
@@ -1742,6 +1794,40 @@ export function setElementImageFill(
 }
 
 /**
+ * Withhold a picture, video or audio shape from the model, or stop withholding it
+ * (`label` null/empty clears). A `label` puts `go:redact` in the element's
+ * `<a:spPr><a:extLst>` — the one extension slot a picture has, since `p:nvPicPr`
+ * admits only `cNvPr` + `cNvPicPr` and `cNvPr` takes attributes alone, which the
+ * reader's own alt text already uses.
+ *
+ * The words of a *text* element are withheld through `TextRun.redact` on the edit
+ * path instead, because a run is a finer unit than an element and the text-edit
+ * pipeline already carries run attributes.
+ *
+ * Byte surgery on `originalXml` with no separate dirty flag, exactly as
+ * `setPictureOpacity` does for `a:alphaModFix`: a picture's shape properties are
+ * never regenerated from the model, so this is the only place the mark can live.
+ */
+export function setElementRedaction(slide: Slide, sourceId: string, label: string | null): boolean {
+  const el = slide.elements.find((e) => e.id === sourceId && e.type === 'picture')
+  if (!el) return false
+  const pic = el as import('./types').PictureElement
+  const clean = (label ?? '').trim()
+  const next = clean
+    ? syncRedactExt(patchedElementXml(el), 'p:spPr', clean)
+    : stripRedactExt(patchedElementXml(el))
+  if (next === patchedElementXml(el)) return false
+  if (clean) pic.redact = clean
+  else delete pic.redact
+  el.dirty = el.dirtyTransform = el.dirtyFill = el.dirtyStroke = false
+  el.dirtySrcRect = false
+  el.dirtyPPr = undefined
+  el.anchor.originalXml = next
+  slide.structureDirty = true
+  return true
+}
+
+/**
  * Whole-picture opacity (0..1; ≥1 clears alphaModFix). Byte surgery on the
  * <a:blip> child, baked directly into originalXml (no separate dirty flag).
  */
@@ -1799,6 +1885,7 @@ export function replacePictureBytes(
   const added = addImageMediaAndRel(opened, slide, bytes, ext)
   if (!added) return false
   let tag = blip[0]
+  const previousRId = /r:embed="([^"]*)"/.exec(tag)?.[1]
   // A coexisting r:link ("insert and link" pictures) would keep refreshing from
   // the old external file, so it is dropped once the embed points at new bytes
   if (/r:embed="/.test(tag))
@@ -1806,6 +1893,13 @@ export function replacePictureBytes(
   else if (/r:link="/.test(tag)) tag = tag.replace(/r:link="[^"]*"/, `r:embed="${added.rid}"`)
   else tag = tag.replace(/<a:blip\b/, `<a:blip r:embed="${added.rid}"`)
   xml = xml.slice(0, blip.index) + tag + xml.slice(blip.index + blip[0].length)
+  // A 3D model's Choice caches the same rendering (am3d:raster), which PowerPoint shows
+  if (pic.model3d && previousRId) {
+    xml = xml.replace(
+      new RegExp(`(<am3d:blip\\b[^>]*\\br:embed=")${previousRId}"`),
+      `$1${added.rid}"`,
+    )
+  }
   // The replacement is always raster (IMAGE_MIME gate), and PowerPoint prefers a
   // leftover Office-2016 <asvg:svgBlip> extension over the retargeted r:embed —
   // drop that extension entry (and its wrapper when nothing else remains)
@@ -2036,10 +2130,18 @@ function ensureDefaultContentType(archive: PackageArchive, ext: string, contentT
   const ct = archive.readText(ctPath)
   if (!ct) return
   if (new RegExp(`<Default\\s[^>]*Extension="${ext}"`, 'i').test(ct)) return
-  // Insert the Default after the root <Types …> open tag (after the first >)
+  // Insert before </Types>. indexOf('>') finds the XML declaration's closing
+  // angle bracket first, so splicing there would put the Default between the
+  // declaration and <Types> — outside the root element — and every OPC reader
+  // would then reject the package (genoffice#1518).
   const def = `<Default Extension="${ext}" ContentType="${contentType}"/>`
-  const at = ct.indexOf('>') + 1
-  archive.entries.set(ctPath, Buffer.from(ct.slice(0, at) + def + ct.slice(at), 'utf8'))
+  archive.entries.set(
+    ctPath,
+    Buffer.from(
+      ct.replace('</Types>', () => `${def}</Types>`),
+      'utf8',
+    ),
+  )
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -2297,6 +2399,8 @@ export function materializeSlide(opened: OpenedPptx, slideIndex: number): Slide 
   archive.entries.set(slide.path, Buffer.from(patchSlideXml(slide), 'utf8'))
   const fresh = parseSlideFromArchive(archive, slide.path)
   if (!fresh) return null
+  // a reparse is not a save: the edits it baked into the XML are still unsaved
+  if (slideIsDirty(slide)) fresh.structureDirty = true
   deck.slides[slideIndex] = fresh
   return fresh
 }
@@ -2317,26 +2421,38 @@ export function connectionSiteForSide(el: SlideElement, side: ConnectionSide): n
   return (prst === 'ellipse' ? ELLIPSE_SIDES : RECT_SIDES)[side]
 }
 
-/** Connection point index → shape edge midpoint (edge sites of the preset geometry, else center). */
-function connectionPoint(el: SlideElement, idx: number): { x: number; y: number } {
-  const o = el.transform.offset
+/** Connection site index → unit-box point (edge sites of the preset geometry, else center). */
+function connectionSiteLocal(el: SlideElement, idx: number): { u: number; v: number } {
   const prst = el.type === 'shape' || el.type === 'picture' ? el.presetGeometry : undefined
   const sides = prst === 'ellipse' ? ELLIPSE_SIDES : RECT_SIDES
-  if (idx === sides.top) return { x: o.x + o.cx / 2, y: o.y }
-  if (idx === sides.left) return { x: o.x, y: o.y + o.cy / 2 }
-  if (idx === sides.bottom) return { x: o.x + o.cx / 2, y: o.y + o.cy }
-  if (idx === sides.right) return { x: o.x + o.cx, y: o.y + o.cy / 2 }
+  if (idx === sides.top) return { u: 0.5, v: 0 }
+  if (idx === sides.left) return { u: 0, v: 0.5 }
+  if (idx === sides.bottom) return { u: 0.5, v: 1 }
+  if (idx === sides.right) return { u: 1, v: 0.5 }
   if (prst === 'ellipse' && idx >= 1 && idx <= 7) {
     // odd ellipse sites are the 45-degree points: inset (1 - 1/sqrt2)/2 of each extent
     const k = 0.1464
     const left = idx === 1 || idx === 3
     const top = idx === 1 || idx === 7
-    return {
-      x: o.x + (left ? o.cx * k : o.cx * (1 - k)),
-      y: o.y + (top ? o.cy * k : o.cy * (1 - k)),
-    }
+    return { u: left ? k : 1 - k, v: top ? k : 1 - k }
   }
-  return { x: o.x + o.cx / 2, y: o.y + o.cy / 2 }
+  return { u: 0.5, v: 0.5 }
+}
+
+/** Connection point in slide space: site mirrored by the shape flips, then rotated about the box centre. */
+function connectionPoint(el: SlideElement, idx: number): { x: number; y: number } {
+  const t = el.transform
+  const o = t.offset
+  const site = connectionSiteLocal(el, idx)
+  const dx = ((t.flipH ? 1 - site.u : site.u) - 0.5) * o.cx
+  const dy = ((t.flipV ? 1 - site.v : site.v) - 0.5) * o.cy
+  const cxx = o.x + o.cx / 2
+  const cyy = o.y + o.cy / 2
+  const rad = ((t.rot ?? 0) / 60000) * (Math.PI / 180)
+  if (rad === 0) return { x: cxx + dx, y: cyy + dy }
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  return { x: cxx + dx * cos - dy * sin, y: cyy + dx * sin + dy * cos }
 }
 
 /**
@@ -2944,8 +3060,8 @@ export function editChartElement(
     ...(colorScheme ? { colorScheme } : {}),
     ...(holeSizePct != null ? { holeSizePct } : {}),
   }
-  const newXml = buildChartSpaceXml(opts)
-  archive.entries.set(chartPath, Buffer.from(newXml, 'utf8'))
+  const workbookRId = writeChartWorkbook(opened, chartPath, opts)
+  archive.entries.set(chartPath, Buffer.from(buildChartSpaceXml(opts, workbookRId), 'utf8'))
   slide.structureDirty = true
   return true
 }
@@ -4106,9 +4222,15 @@ export function pasteElements(
         rid = `rId${++maxRid}`
         const target = rel.external ? rel.target : relTargetFromSlide(landed)
         const mode = rel.external ? ' TargetMode="External"' : ''
+        // Replacement must be a function: a string replacement expands $&, $`,
+        // $' and $$, and an external target is a user-supplied URL, so a $& in
+        // it substituted the matched </Relationships> into the middle of the
+        // Target attribute and left the part malformed. Several other
+        // relationship writers here already pass a function.
         relsXml = relsXml.replace(
           '</Relationships>',
-          `<Relationship Id="${rid}" Type="${rel.type}" Target="${escapeXmlAttr(target)}"${mode}/></Relationships>`,
+          () =>
+            `<Relationship Id="${rid}" Type="${rel.type}" Target="${escapeXmlAttr(target)}"${mode}/></Relationships>`,
         )
         relsDirty = true
         byKey.set(key, rid)

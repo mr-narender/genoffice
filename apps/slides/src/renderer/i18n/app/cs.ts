@@ -1,6 +1,16 @@
 import type { zh } from './zh'
 
 export const cs = {
+  redactMenuLabel: 'Skrýt výběr před AI',
+  redactDialogDesc:
+    'Vybraný obsah zůstane v dokumentu i v souboru; model uvidí jen zástupný symbol. Pojmenujte ho, aby věděl, co zastupuje.',
+  redactDialogScope:
+    'Skrýtí se týká jen AI v této aplikaci. CLI, nástroje MCP a headless export čtou soubor přímo a tato slova stále vidí.',
+  redactDialogPlaceholder: 'Název zástupného symbolu, např. telefon zákazníka',
+  redactCancel: 'Zrušit',
+  redactInsert: 'Skrýt',
+  redactEnable: 'Pravým klikem na výběr jej skryjete před modelem.',
+
   appPhPromptTitle: 'Klikněte a přidejte nadpis',
   appPhPromptSubtitle: 'Klikněte a přidejte podnadpis',
   appPhPromptBody: 'Klikněte a přidejte text',
@@ -52,7 +62,8 @@ export const cs = {
   appStatusVideoInserted: 'Video vloženo (vložené v .pptx; přehrává se v PowerPointu)',
   appStatusAudioInserted: 'Zvuk vložen (vložený v .pptx)',
   appStatusModel3dInserted:
-    '3D model vložen (na plátně se zobrazuje zástupný symbol; soubor modelu je uložen v .pptx)',
+    '3D model vložen: po výběru ho můžete otáčet (PowerPoint ho také zobrazí ve 3D)',
+  appStatusModel3dNoPreview: '3D model tu nelze vykreslit; jeho obrázek zůstává beze změny',
   appStatusRecordingEmpty: 'Nahrávka je prázdná; nic nebylo vloženo',
   appStatusRecordingInserted: 'Nahrávka obrazovky vložena na aktuální snímek (vložené webm)',
   appStatusRecording: 'Nahrává se… dalším kliknutím na „Nahrávání obrazovky“ zastavíte a vložíte',
@@ -147,6 +158,15 @@ export const cs = {
   appPrintProgress: 'Příprava tisku…',
   appPrintTitle: 'Tisk',
   appPrintLayoutFull: 'Snímky na celou stránku',
+  appPrintPrinter: 'Tiskárna',
+  appPrintDefaultPrinter: 'Výchozí tiskárna',
+  appPrintSystemDialog: 'Systémový dialog…',
+  appPrintCopies: 'Kopie',
+  appPrintCollate: 'Třídit',
+  appPrintDuplex: 'Oboustranně',
+  appPrintDuplexOff: 'Jednostranně',
+  appPrintDuplexLong: 'Oboustranně, po dlouhé hraně',
+  appPrintDuplexShort: 'Oboustranně, po krátké hraně',
   appPrintLayoutHandout2: 'Podklady (2 na stránku)',
   appPrintLayoutHandout3: 'Podklady (3 na stránku)',
   appPrintLayoutHandout6: 'Podklady (6 na stránku)',
@@ -171,6 +191,7 @@ export const cs = {
   appCtxSendToBack: 'Přenést do pozadí',
   appCtxBringForward: 'Přenést blíž',
   appCtxSendBackward: 'Přenést dál',
+  appCtxRotate: 'Otočit',
   appCtxRotateLeft90: 'Otočit vlevo o 90°',
   appCtxRotateRight90: 'Otočit vpravo o 90°',
   appCtxFlipH: 'Překlopit vodorovně',
@@ -210,6 +231,8 @@ export const cs = {
   appMasterFillNone: 'Bez výplně',
   appMasterStroke: 'Barva obrysu…',
   appMasterStrokeNone: 'Bez obrysu',
+  appMasterInsertTextBox: 'Textové pole',
+  appMasterInsertShape: 'Obrazce',
   appStartOpening: 'Otevírá se…',
   appReadingSlideTitle:
     'Kliknutím přejdete na další snímek (zobrazení pro čtení ukončíte klávesou Esc)',
@@ -237,6 +260,13 @@ export const cs = {
     'Celková doba prezentace byla {duration}. Chcete uložit časování snímků pro automatické přepínání?',
   appRehearseDiscard: 'Neukládat',
   appRehearseSave: 'Uložit',
+  appRecordTitle: 'Nahrát komentář',
+  appRecordSummary: 'Délka nahrávky: {duration}. Uložit komentář a čas každého snímku?',
+  appRecordDiscard: 'Neukládat',
+  appRecordSave: 'Uložit',
+  appStatusRecordSaved: 'Komentář uložen na snímcích: {count} (přehraje ho i PowerPoint)',
+  appStatusRecordFailed: 'Nahrávku se nepodařilo uložit',
+  appStatusNarrationCleared: 'Komentář byl vymazán',
   appSettingsTitle: 'Nastavení AI',
   appSettingsAccount: 'Účet Genspark',
   appSettingsChecking: 'Kontroluje se…',

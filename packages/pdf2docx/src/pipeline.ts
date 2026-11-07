@@ -6,7 +6,8 @@
  */
 import { analyzePage, PAGE_CONFIDENCE_MIN } from './analyze'
 import { classifyPages } from './analyze/canvas'
-import { detectFurniture, type FurnitureHf } from './analyze/furniture'
+import { detectFurniture, type FurnitureHf, type FurnitureResult } from './analyze/furniture'
+import type { ListSeq } from './analyze/lists'
 import {
   extractPage,
   PdfLoadError,
@@ -104,11 +105,12 @@ const GRAPHICS_GUARD_EMIT_SHARE = 0.35
 const GUARD_WHITE_MIN = 0xf2
 
 function isNearWhiteHex(hex: string): boolean {
-  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return false
+  const v = (hex ?? '').trim()
+  if (!/^[0-9a-fA-F]{6}$/.test(v)) return false
   return (
-    parseInt(hex.slice(0, 2), 16) >= GUARD_WHITE_MIN &&
-    parseInt(hex.slice(2, 4), 16) >= GUARD_WHITE_MIN &&
-    parseInt(hex.slice(4, 6), 16) >= GUARD_WHITE_MIN
+    parseInt(v.slice(0, 2), 16) >= GUARD_WHITE_MIN &&
+    parseInt(v.slice(2, 4), 16) >= GUARD_WHITE_MIN &&
+    parseInt(v.slice(4, 6), 16) >= GUARD_WHITE_MIN
   )
 }
 
@@ -322,18 +324,22 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
 
       // P6: the source document renders its headers/footers/page numbers onto
       // every page — detected across pages and dropped (first occurrence kept)
-      // so they do not repeat through the rebuilt body text
-      const furniture = detectFurniture(
-        extractedPages.map((p) => ({
-          index: p.index,
-          heightPt: p.heightPt,
-          chars: p.chars,
-          skip: p.scanned || p.degraded,
-        })),
-        // cell-data: repeated lines with no header/footer seat keep every
-        // occurrence — deleting data breaks the xlsx promise
-        { keepUnemitted: opts.cellData === true },
-      )
+      // so they do not repeat through the rebuilt body text. Absolute layout
+      // has no body flow: each slide is its page, so a repeated line stays on
+      // every slide.
+      const furniture: FurnitureResult = opts.absoluteLayout
+        ? { drop: extractedPages.map(() => new Set()), droppedLines: 0, hf: [] }
+        : detectFurniture(
+            extractedPages.map((p) => ({
+              index: p.index,
+              heightPt: p.heightPt,
+              chars: p.chars,
+              skip: p.scanned || p.degraded,
+            })),
+            // cell-data: repeated lines with no header/footer seat keep every
+            // occurrence — deleting data breaks the xlsx promise
+            { keepUnemitted: opts.cellData === true },
+          )
       if (furniture.droppedLines > 0) {
         warnings.push(
           `headers/footers: ${furniture.droppedLines} repeated line(s) detected across pages and deduplicated`,
@@ -341,11 +347,18 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
       }
       furnitureHf = furniture.hf
 
+      // one ordered-list run state for the whole document: a list split by a
+      // page break keeps its numbering when the run continues on the next page
+      const listSeq: ListSeq = { next: 0 }
+
       for (let i = 0; i < total; i++) {
         const extracted = extractedPages[i]!
         const dropSet = furniture.drop[i]!
         if (dropSet.size > 0) extracted.chars = extracted.chars.filter((c) => !dropSet.has(c))
-        let page = analyzePage(extracted, { absoluteLayout: opts.absoluteLayout === true })
+        let page = analyzePage(extracted, {
+          absoluteLayout: opts.absoluteLayout === true,
+          listSeq,
+        })
         let graphicsUnderlay = false
 
         // scanned page + an OCR engine: try to recover editable text; every
@@ -356,7 +369,7 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
         if (page.scanned && opts.ocr) {
           const hiRender =
             renderPageByIndexPng(m, doc, i, Math.max(opts.renderScale ?? 2, 3)) ?? undefined
-          const recovered = tryOcrScannedPage(extracted, opts.ocr, hiRender)
+          const recovered = tryOcrScannedPage(extracted, opts.ocr, hiRender, listSeq)
           if (recovered) {
             page = recovered.page
             ocrConfidence = recovered.confidence
@@ -521,9 +534,10 @@ export function extractIrDocument(pdf: Uint8Array, opts: ConvertOptions): IrDocu
       // by design — document priors only lower the page gate, borderline pages
       // stay flow.
       classifyPages(irPages, readDocMetadata(m, doc))
-      // cell-data (xlsx) promises page ↔ sheet: stitching would move a page's
-      // continuation paragraph onto the previous sheet and leave its own empty
-      if (!opts.cellData) stitchCrossPageParagraphs(irPages)
+      // cell-data (xlsx) and absolute layout (pptx) promise page ↔ sheet/slide:
+      // stitching would move a page's continuation paragraph onto the previous
+      // one and leave its own empty
+      if (!opts.cellData && !opts.absoluteLayout) stitchCrossPageParagraphs(irPages)
     },
     opts.password,
   )
