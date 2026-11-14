@@ -1,12 +1,27 @@
 import type { zh } from './zh'
 
 export const cs = {
+  redactMenuLabel: 'Skrýt výběr před AI',
+  redactDialogDesc:
+    'Slova zůstanou v dokumentu i v souboru; model uvidí jen zástupný symbol. Pojmenujte ho, aby věděl, co zastupuje.',
+  redactDialogScope:
+    'Skrýtí se týká jen AI v této aplikaci. CLI, nástroje MCP a headless export čtou soubor přímo a tato slova stále vidí.',
+  redactDialogPlaceholder: 'Název zástupného symbolu, např. telefon zákazníka',
+  redactCancel: 'Zrušit',
+  redactInsert: 'Skrýt',
+  diskChangedMsg: 'Tento soubor změnil jiný program.',
+  diskConflictMsg: 'Tento soubor se na disku změnil; uložení tyto změny přepíše.',
+  diskReload: 'Znovu načíst',
+  diskKeepMine: 'Ponechat moje',
+  diskOverwrite: 'Přesto přepsat',
+
   loading: 'Načítání…',
   loadFailed: 'Soubor nelze otevřít',
   untitled: 'Bez názvu',
   saveFailed: 'Uložení se nezdařilo: {error}',
   saveFailedStatus: 'Uložení se nezdařilo',
   exportFailed: 'Export se nezdařil',
+  printFailed: 'Tisk se nezdařil: {error}',
   exportHtmlSkipped: 'Exportováno, ale {count} zdrojů se nepodařilo vložit (např. {first})',
   viewPreview: 'Náhled',
   viewSplit: 'Rozdělit',
@@ -41,6 +56,7 @@ export const cs = {
   openExternal: 'Odkaz byl otevřen v prohlížeči',
   save: 'Uložit (⌘S)',
   saveAs: 'Uložit jako…',
+  aiNameFile: 'Pojmenovat pomocí AI…',
   ribbonCollapse: 'Sbalit pás karet',
   ribbonExpand: 'Rozbalit pás karet',
   ribbonGroupInsert: 'Vložit',
@@ -71,6 +87,7 @@ export const cs = {
   alignLeft: 'Zarovnat vlevo',
   alignCenter: 'Na střed',
   alignRight: 'Zarovnat vpravo',
+  alignJustify: 'Zarovnat do bloku',
   fontSizeDec: 'Zmenšit písmo',
   fontSizeInc: 'Zvětšit písmo',
   typography: 'Typografie',
@@ -107,6 +124,7 @@ export const cs = {
   insertImageUrl: 'Obrázek z adresy URL…',
   insertConfirm: 'Vložit',
   insertMore: 'Další',
+  insertSkeleton: 'Vložit kostru',
   insertTableSize: 'Tabulka {r}×{c}',
   insertTablePickSize: 'Zvolte velikost tabulky',
   insertPlaceholderTableHeader: 'Záhlaví {n}',

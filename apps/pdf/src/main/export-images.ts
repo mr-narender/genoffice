@@ -11,7 +11,9 @@ export function hasValidExportPageNumbers(
   return (
     Array.isArray(value) &&
     value.length === expectedLength &&
-    value.every((pageNumber) => isValidExportPageNumber(pageNumber))
+    value.every((pageNumber) => isValidExportPageNumber(pageNumber)) &&
+    // duplicate pages would write two exports over one target file
+    new Set(value).size === value.length
   )
 }
 
@@ -19,12 +21,13 @@ export function buildExportImagePaths(
   dir: string,
   baseName: unknown,
   pageNumbers: readonly unknown[],
+  ext: 'png' | 'jpg',
 ): string[] {
   const root = resolve(dir)
   const safeBase = String(baseName || 'page').replace(/[/\\:*?"<>|]/g, '_')
   return pageNumbers.map((pageNumber) => {
     if (!isValidExportPageNumber(pageNumber)) throw new Error('pdf: invalid page numbers')
-    const target = join(root, `${safeBase}-p${pageNumber}.png`)
+    const target = join(root, `${safeBase}-p${pageNumber}.${ext}`)
     const fromRoot = relative(root, target)
     if (!fromRoot || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
       throw new Error('pdf: invalid export path')

@@ -9,10 +9,11 @@
  * (Arabic joining, complex scripts) is out of scope — callers should not
  * measure those scripts here.
  */
-import { closeSync, openSync } from 'node:fs'
+import { closeSync, openSync, readFileSync } from 'node:fs'
 
 import { getFontIndex, norm, readTable, readTableDir, styleScore } from './sfnt'
 import type { FaceRef } from './sfnt'
+import { woff2ToSfnt } from './woff2'
 
 export interface AdvanceStyle {
   bold?: boolean
@@ -84,6 +85,7 @@ function glyphOf(face: ParsedFace, cp: number): number {
   }
   // format 4: BMP only
   if (cp > 0xffff) return 0
+  if (sub.length < 8) return 0
   const segCountX2 = sub.readUInt16BE(6)
   const endBase = 14
   const startBase = endBase + segCountX2 + 2
@@ -93,17 +95,23 @@ function glyphOf(face: ParsedFace, cp: number): number {
   let hi = segCountX2 / 2 - 1
   while (lo <= hi) {
     const mid = (lo + hi) >> 1
+    // segCountX2 is self-declared, so a truncated subtable can run out of bytes
+    // part-way through the four segment arrays. Check each base before reading
+    // it: unlike parseFaceAdvances, glyphOf runs outside any try/catch, so a
+    // crafted font would throw out of advanceWidths' caller.
     if (endBase + 2 * mid + 2 > sub.length) return 0
     const end = sub.readUInt16BE(endBase + 2 * mid)
     if (cp > end) {
       lo = mid + 1
       continue
     }
+    if (startBase + 2 * mid + 2 > sub.length) return 0
     const start = sub.readUInt16BE(startBase + 2 * mid)
     if (cp < start) {
       hi = mid - 1
       continue
     }
+    if (rangeBase + 2 * mid + 2 > sub.length) return 0
     const delta = sub.readInt16BE(deltaBase + 2 * mid)
     const rangeOff = sub.readUInt16BE(rangeBase + 2 * mid)
     if (rangeOff === 0) return (cp + delta) & 0xffff
@@ -115,17 +123,39 @@ function glyphOf(face: ParsedFace, cp: number): number {
   return 0
 }
 
-function parseFaceAdvances(fd: number, offset: number): ParsedFace | null {
+type TableReader = (tag: string, maxLen: number) => Buffer | null
+
+function fileTables(fd: number, offset: number): TableReader | null {
   const tables = readTableDir(fd, offset)
-  if (!tables) return null
-  const head = readTable(fd, tables, 'head', 512)
-  const hhea = readTable(fd, tables, 'hhea', 512)
+  return tables && ((tag, maxLen) => readTable(fd, tables, tag, maxLen))
+}
+
+/** a decoded woff2 (woff2ToSfnt) is read from memory, same directory layout */
+function bufferTables(sfnt: Buffer): TableReader | null {
+  if (sfnt.length < 12) return null
+  const numTables = sfnt.readUInt16BE(4)
+  if (12 + 16 * numTables > sfnt.length) return null
+  return (tag, maxLen) => {
+    for (let t = 0; t < numTables; t++) {
+      if (sfnt.toString('latin1', 12 + 16 * t, 16 + 16 * t) !== tag) continue
+      const off = sfnt.readUInt32BE(12 + 16 * t + 8)
+      const len = sfnt.readUInt32BE(12 + 16 * t + 12)
+      if (len < 2 || len > maxLen || off + len > sfnt.length) return null
+      return sfnt.subarray(off, off + len)
+    }
+    return null
+  }
+}
+
+function parseFaceAdvances(table: TableReader): ParsedFace | null {
+  const head = table('head', 512)
+  const hhea = table('hhea', 512)
   if (!head || head.length < 20 || !hhea || hhea.length < 36) return null
   const unitsPerEm = head.readUInt16BE(18)
   const numberOfHMetrics = hhea.readUInt16BE(34)
   if (unitsPerEm === 0 || numberOfHMetrics === 0) return null
-  const hmtx = readTable(fd, tables, 'hmtx', HMTX_MAX)
-  const cmapRaw = readTable(fd, tables, 'cmap', CMAP_MAX)
+  const hmtx = table('hmtx', HMTX_MAX)
+  const cmapRaw = table('cmap', CMAP_MAX)
   if (!hmtx || hmtx.length < 4 * numberOfHMetrics || !cmapRaw) return null
   const cmap = parseCmap(cmapRaw)
   if (!cmap) return null
@@ -163,11 +193,18 @@ function faceAdvances(face: FaceRef): ParsedFace | null {
   if (hit !== undefined) return hit
   let parsed: ParsedFace | null
   try {
-    const fd = openSync(face.path, 'r')
-    try {
-      parsed = parseFaceAdvances(fd, face.offset)
-    } finally {
-      closeSync(fd)
+    if (/\.woff2$/i.test(face.path)) {
+      const sfnt = woff2ToSfnt(readFileSync(face.path))
+      const table = sfnt && bufferTables(sfnt)
+      parsed = table ? parseFaceAdvances(table) : null
+    } else {
+      const fd = openSync(face.path, 'r')
+      try {
+        const table = fileTables(fd, face.offset)
+        parsed = table ? parseFaceAdvances(table) : null
+      } finally {
+        closeSync(fd)
+      }
     }
   } catch {
     return null // transient open/read failure: not cached, retried next call
@@ -194,6 +231,23 @@ export function advanceWidths(
   if (!candidates?.length) return null
   const want = styleTokensOf(style)
   const face = [...candidates].sort((a, b) => styleScore(b, want) - styleScore(a, want))[0]!
+  return faceAdvanceWidths(face, text, sizePt)
+}
+
+/**
+ * Same as advanceWidths for one font file (first face of a collection, or a
+ * single-face .woff2): the face a @font-face `src: url()` names, outside the
+ * installed-font index.
+ */
+export function fileAdvanceWidths(path: string, text: string, sizePt: number): number[] | null {
+  return faceAdvanceWidths(
+    { path, offset: 0, style: '', families: [], canonical: '', familyRecords: [] },
+    text,
+    sizePt,
+  )
+}
+
+function faceAdvanceWidths(face: FaceRef, text: string, sizePt: number): number[] | null {
   const parsed = faceAdvances(face)
   if (!parsed) return null
   const scale = (sizePt * 20) / parsed.unitsPerEm

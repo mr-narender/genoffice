@@ -9,6 +9,7 @@ import {
   type FindTarget,
   aiPanelInitiallyOpen,
   rememberAiPanelOpen,
+  useAiSidebarEnabled,
 } from '@genoffice/ui'
 import {
   pollUntilReady,
@@ -16,7 +17,12 @@ import {
 } from '@genoffice/electron-utils/headless-export'
 import { useI18n } from './i18n/locale'
 import { parseDocText, serializeDocText, type Envelope } from './document/envelope'
-import { SourceEditor, type CursorInfo, type SourceEditorHandle } from './source/SourceEditor'
+import {
+  SourceEditor,
+  type CursorInfo,
+  type SourceRange,
+  type SourceEditorHandle,
+} from './source/SourceEditor'
 import { PreviewFrame, type PreviewFrameHandle } from './preview/PreviewFrame'
 import { instrumentForPreview } from './preview/instrument'
 import type { ComputedSnapshot, ElementRect, FromInspector } from './preview/inspector-protocol'
@@ -26,10 +32,10 @@ import { AiAskPopover, type AnchorRect, type AskMode } from './components/AiAskP
 import {
   EDIT_QUEUE_MAX,
   buildSelectionInstruction,
-  excerptOf,
   resolveQueueItem,
   type EditQueueItem,
 } from './ai/edit-queue'
+import { buildProjection } from './ai/redact'
 import { Breadcrumb, type NodeState } from './components/Breadcrumb'
 import {
   Ribbon,
@@ -40,6 +46,8 @@ import {
 } from './components/Ribbon'
 import { CropDialog, CutoutDialog, type ImageDialogLabels } from '@genoffice/ui'
 import { FloatToolbar } from './components/FloatToolbar'
+import { RedactDialog } from './components/RedactDialog'
+import { redactClearPlan, redactMarkPlan, type RedactPlan } from './document/redact-edit'
 import {
   insertOp,
   insertPresetHtml,
@@ -47,6 +55,8 @@ import {
   TEXT_INSERT_KINDS,
   type InsertKind,
 } from './document/insert-presets'
+import { isDocEmpty } from './document/blank'
+import { documentSkeleton } from './document/skeleton'
 import { moveTarget } from './document/move-target'
 import { StylePanel } from './components/StylePanel'
 import { floatPosition, parseDeclarations } from './document/float-position'
@@ -61,7 +71,9 @@ import { compileOps, type HtmlOp, type OpError } from './document/ops'
 import { injectBrief, parseBrief, type Brief } from './document/brief'
 import { applyPatches } from './document/patch'
 import { adoptImageRewrites } from './document/image-rewrites'
-import { deriveAutoFileName, deriveNameFromPrompt, derivePageTitleName } from './document/auto-name'
+import { deriveAutoFileName, deriveNameFromPrompt } from './document/auto-name'
+import { localFileName, modelSaveAsName } from './file-naming'
+import { runGuardedPrint } from './print-guard'
 import type { ExportFormat, SaveMode } from '../shared/ipc'
 
 type LoadStatus = 'loading' | 'ready' | 'error'
@@ -136,6 +148,8 @@ export default function App() {
   const [draftHtml, setDraftHtml] = useState<string | null>(null)
   const [historyState, setHistoryState] = useState({ undo: false, redo: false })
   const [aiOpen, setAiOpen] = useState(() => aiPanelInitiallyOpen('htmlapp.showAi'))
+  // the sidebar switch is a soft hide; it closes the panel when it turns off
+  const aiSidebarEnabled = useAiSidebarEnabled(setAiOpen)
   const [aiPreset, setAiPreset] = useState<AiPreset | null>(null)
   const [editQueue, setEditQueue] = useState<EditQueueItem[]>([])
   const [askMode, setAskMode] = useState<AskMode | null>(null)
@@ -193,12 +207,23 @@ export default function App() {
     src: string
     image: string
   } | null>(null)
+  /** the range awaiting a label, with the selection text it was opened on */
+  const [redactDialog, setRedactDialog] = useState<(SourceRange & { seed: string }) | null>(null)
 
   const editorRef = useRef<SourceEditorHandle>(null)
   const previewRef = useRef<PreviewFrameHandle>(null)
   const envelopeRef = useRef<Envelope>(DEFAULT_ENVELOPE)
   const textRef = useRef('')
   const savedTextRef = useRef('')
+  /** text last read from or written to disk; a watcher tick that reads the same text is a touch, not an edit */
+  const diskTextRef = useRef<string | null>(null)
+  const overwriteRef = useRef(false)
+  const [diskNotice, setDiskNoticeState] = useState<'changed' | 'conflict' | null>(null)
+  const diskNoticeRef = useRef<'changed' | 'conflict' | null>(null)
+  const setDiskNotice = (next: 'changed' | 'conflict' | null) => {
+    diskNoticeRef.current = next
+    setDiskNoticeState(next)
+  }
   const savingRef = useRef(false)
   const statusRef = useRef<LoadStatus>('loading')
   const pushedTextRef = useRef<string | null>(null)
@@ -259,6 +284,7 @@ export default function App() {
         ])
         const raw = pending ? await window.htmlApi.readFile(pending) : ''
         if (cancelled) return
+        diskTextRef.current = raw
         const doc = parseDocText(raw)
         envelopeRef.current = doc.envelope
         textRef.current = doc.text
@@ -522,6 +548,72 @@ export default function App() {
     [applyOps, getMap, flushPending, pushPreview],
   )
 
+  /**
+   * Land a redaction plan. The marks the op vocabulary can express go through
+   * `runManual`, so they are validated, journaled and undoable like any toolbar
+   * edit; the one insertion that no op can address (the comment in front of a
+   * `<script>` literal) is spliced through the same patch primitive and the same
+   * commit path, one step earlier in the pipeline.
+   */
+  const applyRedaction = useCallback(
+    (plan: RedactPlan | null): boolean => {
+      if (!plan) return false
+      if (plan.ops.length > 0) return runManual(plan.ops, 'keep')
+      if (plan.patches.length === 0) return false
+      // pending style pokes land first: they move the offsets the plan was built on
+      flushPending()
+      const base = textRef.current
+      editorRef.current?.applyPatches(plan.patches, false)
+      commitText(applyPatches(base, plan.patches), true)
+      return true
+    },
+    [commitText, flushPending, runManual],
+  )
+
+  /**
+   * The source pane's "hide this from the model" command.
+   *
+   * An already-marked region is taken off rather than labelled again, which is
+   * what makes coming back to a mark undo it. The seed is collapsed to one line
+   * because a selection can cross lines and the label goes into a single-line
+   * field — and because a label is meant to name the span, not quote it. The raw
+   * selection is kept alongside it: a mark may only be written over the exact text
+   * the reader was looking at when they opened the dialog.
+   */
+  const onRedactSelection = useCallback(
+    (range: SourceRange) => {
+      flushPending()
+      const base = textRef.current
+      const clear = redactClearPlan(base, getMap(), range.from, range.to)
+      if (clear) {
+        applyRedaction(clear)
+        return
+      }
+      setRedactDialog({ ...range, seed: range.text.replace(/\s+/g, ' ').trim() })
+    },
+    [applyRedaction, flushPending, getMap],
+  )
+
+  /** the label is in: write the mark, unless the range moved out from under the dialog */
+  const confirmRedaction = useCallback(
+    (label: string) => {
+      const range = redactDialog
+      setRedactDialog(null)
+      if (!range) return
+      flushPending()
+      const base = textRef.current
+      if (base.slice(range.from, range.to) !== range.text) return
+      applyRedaction(redactMarkPlan(base, getMap(), range.from, range.to, label))
+      editorRef.current?.focus()
+    },
+    [applyRedaction, flushPending, getMap, redactDialog],
+  )
+
+  const cancelRedaction = useCallback(() => {
+    setRedactDialog(null)
+    editorRef.current?.focus()
+  }, [])
+
   // ── selection model: one current element shared by the preview, the source pane, the toolbar and the AI ──
 
   const selectSidRef = useRef<
@@ -563,8 +655,9 @@ export default function App() {
     const src = textRef.current
     // one pin per element; several queued edits on the same element share it and list their ordinals
     const bySid = new Map<number, string[]>()
+    const proj = map && buildProjection(src, map)
     items.forEach((item, i) => {
-      const target = map && resolveQueueItem(src, map, item).target
+      const target = proj && resolveQueueItem(proj, map, item).target
       if (target) bySid.set(target.sid, [...(bySid.get(target.sid) ?? []), String(i + 1)])
     })
     const marks = [...bySid].map(([sid, ordinals]) => ({ sid, label: ordinals.join('·') }))
@@ -593,9 +686,10 @@ export default function App() {
         }
         case 'gx:markClick': {
           const map = getMap()
+          const proj = buildProjection(textRef.current, map)
           // a shared pin opens the most recent edit on that element; the others stay reachable from the queue card
           const item = editQueueRef.current
-            .filter((q) => resolveQueueItem(textRef.current, map, q).target?.sid === msg.sid)
+            .filter((q) => resolveQueueItem(proj, map, q).target?.sid === msg.sid)
             .at(-1)
           if (!item) return
           selectSid(item.sid, { reveal: true })
@@ -796,6 +890,14 @@ export default function App() {
     if (rel && selectedSidRef.current === sid)
       runManual([{ op: 'set_attr', sid, name: 'src', value: rel }])
   }
+  /** ribbon Insert > Insert skeleton: a standards-mode page in the UI language, for a still-blank document */
+  const insertSkeleton = useCallback(() => {
+    // the menu is disabled once the page has content, and re-checked here so
+    // the action cannot fire from a stale render (a keyboard path, a queued click)
+    if (!isDocEmpty(textRef.current)) return
+    replaceAll(documentSkeleton(lang), false)
+  }, [lang, replaceAll])
+
   /** ribbon Insert menu: a starter element after the selection (or at the end of the body), then straight into editing */
   const insertElement = async (kind: InsertKind, opts: InsertOptions = {}) => {
     let imageSrc: string | undefined
@@ -902,7 +1004,8 @@ export default function App() {
     return {
       sid: selectedEntry.sid,
       tag: selectedEntry.tag,
-      excerpt: excerptOf(text, selectedEntry),
+      // user-facing popover: the raw source text, unlike the queue's model-facing excerpt
+      excerpt: sourceText(text, selectedEntry).trim() || `<${selectedEntry.tag}>`,
       start: selectedEntry.range[0],
     }
   }, [selectedEntry, text])
@@ -928,7 +1031,7 @@ export default function App() {
     setEditQueue((prev) => prev.filter((q) => !qids.includes(q.qid)))
   const queueFocus = (qid: string) => {
     const item = editQueue.find((q) => q.qid === qid)
-    const target = item && resolveQueueItem(text, getMap(), item).target
+    const target = item && resolveQueueItem(buildProjection(text, getMap()), getMap(), item).target
     if (target) selectSid(target.sid, { reveal: true })
   }
   const askSendNow = (instruction: string) => {
@@ -1086,8 +1189,13 @@ export default function App() {
   }
 
   const doSave = useCallback(
-    async (mode: SaveMode, suggestedName?: string): Promise<boolean> => {
+    async (mode: SaveMode, suggestedName?: string, proposedName?: string): Promise<boolean> => {
       if (statusRef.current !== 'ready') return false
+      if (diskNoticeRef.current && !overwriteRef.current) {
+        // the user has not chosen between the two versions yet; autosave must not pick for them
+        setDiskNotice('conflict')
+        return false
+      }
       // uncommitted live style pokes belong to the document being saved
       flushPending()
       // a menu save or ⌘S during an autosave queues behind it instead of being dropped;
@@ -1098,14 +1206,32 @@ export default function App() {
       try {
         const textAtSave = textRef.current
         const serialized = serializeDocText({ text: textAtSave, envelope: envelopeRef.current })
+        // A page that has never been saved is offered a name derived from its
+        // own content: the model's, when the reader asked for one, and the
+        // page's own title otherwise. It prefills the save dialog rather than
+        // replacing it — the reader still chooses where the file goes. A plain
+        // Save of a page that already has a path needs no name at all, and a
+        // Save As of one opens on the file's own name: a name the reader asked
+        // for arrives as `proposedName`, before the save begins, and a prompt
+        // left over from an earlier request is nobody's default.
+        const untitled = !pathRef.current
+        const defaultName = proposedName
+          ? proposedName
+          : untitled
+            ? localFileName(textAtSave, provisionalNameRef.current)
+            : undefined
         const result = await window.htmlApi.save({
           text: serialized,
           imageSources: [],
           mode,
           suggestedName,
-          defaultName: provisionalNameRef.current ?? undefined,
+          defaultName,
+          overwrite: overwriteRef.current,
         })
         if (result.ok && 'path' in result) {
+          diskTextRef.current = serialized
+          overwriteRef.current = false
+          setDiskNotice(null)
           const adopted = adoptImageRewrites(textAtSave, textRef.current, result.imageRewrites)
           if (adopted.liveText !== textRef.current) {
             editorRef.current?.setDoc(adopted.liveText)
@@ -1123,6 +1249,7 @@ export default function App() {
           pushPreview(adopted.liveText)
           return true
         }
+        if (!result.ok && result.conflict) setDiskNotice('conflict')
         setSaveState(result.ok ? 'idle' : 'failed')
         return false
       } catch (err) {
@@ -1135,6 +1262,64 @@ export default function App() {
     },
     [commitText, flushPending, pushPreview],
   )
+
+  /** another program wrote the file: swap the text in and show it as the saved state */
+  const reloadFromDisk = useCallback(
+    (raw: string) => {
+      diskTextRef.current = raw
+      overwriteRef.current = false
+      setDiskNotice(null)
+      const doc = parseDocText(raw)
+      envelopeRef.current = doc.envelope
+      editorRef.current?.setDoc(doc.text)
+      commitText(doc.text, false)
+      savedTextRef.current = doc.text
+      setSavedText(doc.text)
+      setSaveState('idle')
+      pushPreview(doc.text)
+    },
+    [commitText, pushPreview],
+  )
+
+  const reloadNow = useCallback(async () => {
+    const current = pathRef.current
+    if (!current) return
+    try {
+      window.htmlApi.ackFileChangedOnDisk()
+      reloadFromDisk(await window.htmlApi.readFile(current))
+    } catch (err) {
+      console.error('[html] reload from disk failed:', err)
+    }
+  }, [reloadFromDisk])
+
+  const keepMine = useCallback(() => {
+    overwriteRef.current = true
+    setDiskNotice(null)
+    window.htmlApi.ackFileChangedOnDisk()
+  }, [])
+
+  const overwriteNow = useCallback(() => {
+    overwriteRef.current = true
+    setDiskNotice(null)
+    void doSave('save')
+  }, [doSave])
+
+  /**
+   * Ask the model to name this page, on request, then open Save As with its
+   * answer prefilled.
+   *
+   * The stem goes into the dialog rather than renaming the file on disk: a file
+   * that may be open elsewhere, referenced from a note, or synced is not
+   * something to move behind the reader's back. A declined or empty answer
+   * leaves the dialog on the page's current name, so this is a no-op rather
+   * than a failure.
+   */
+  const nameWithAi = useCallback(async () => {
+    if (statusRef.current !== 'ready') return
+    const stem = await modelSaveAsName(textRef.current, getMap())
+    if (!stem) return
+    await doSave('saveAs', undefined, stem)
+  }, [doSave, getMap])
 
   const zoomIn = useCallback(() => setZoom((z) => clampZoom(Math.round(z) + ZOOM_STEP)), [])
   const zoomOut = useCallback(() => setZoom((z) => clampZoom(Math.round(z) - ZOOM_STEP)), [])
@@ -1190,6 +1375,26 @@ export default function App() {
     } finally {
       exportingRef.current = false
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- t is not referentially stable
+  }, [])
+
+  const printingRef = useRef(false)
+  const runPrint = useCallback(async () => {
+    if (statusRef.current !== 'ready') return false
+    return runGuardedPrint(
+      printingRef,
+      async () => {
+        // serialize inside the gate so a throw still releases the flag
+        flushPending()
+        return window.htmlApi.printHtml({
+          html: serializeDocText({ text: textRef.current, envelope: envelopeRef.current }),
+        })
+      },
+      (error) => {
+        console.error('[html] print failed:', error)
+        setNotice(t('printFailed', { error }))
+      },
+    )
     // eslint-disable-next-line react-hooks/exhaustive-deps -- t is not referentially stable
   }, [])
 
@@ -1255,7 +1460,38 @@ export default function App() {
       })()
     })
     const offRenamed = window.htmlApi.onFileRenamed((next) => setPath(next))
+    const offDisk = window.htmlApi.onFileChangedOnDisk((changedPath) => {
+      // the watcher keeps refusing saves until the change is acknowledged; a
+      // change parked behind the bar stays unacknowledged until the user decides
+      let awaitingUser = false
+      void (async () => {
+        try {
+          if (changedPath !== pathRef.current || statusRef.current !== 'ready') return
+          const raw = await window.htmlApi.readFile(changedPath)
+          if (changedPath !== pathRef.current || raw === diskTextRef.current) return
+          // uncommitted style pokes are edits too, even though the text still equals the saved text
+          const dirtyNow =
+            textRef.current !== savedTextRef.current ||
+            Object.keys(pendingStylesRef.current).length > 0 ||
+            savingRef.current
+          if (dirtyNow) {
+            diskTextRef.current = raw
+            setDiskNotice('changed')
+            awaitingUser = true
+            return
+          }
+          reloadFromDisk(raw)
+        } catch (err) {
+          console.error('[html] reload after external change failed:', err)
+        } finally {
+          if (!awaitingUser) window.htmlApi.ackFileChangedOnDisk()
+        }
+      })()
+    })
     const offExport = window.htmlApi.onExportRequest((format) => void runExport(format))
+    // Shell menu Print / ⌘P. The menu owns the accelerator, so this subscription
+    // is the only route the keystroke takes; without it ⌘P did nothing at all.
+    const offPrint = window.htmlApi.onPrintRequest(() => void runPrint())
     const offTheme = window.htmlApi.onThemeChanged(() => {
       // let main.tsx flip data-theme first
       window.setTimeout(
@@ -1276,7 +1512,8 @@ export default function App() {
         event.preventDefault()
         openFind(false)
       } else if (key === 'h' && !event.shiftKey) {
-        // Word's replace shortcut; macOS Cmd+H is the system hide role and never reaches here
+        // Word's replace shortcut: Ctrl+H on Windows/Linux, Control+H on macOS —
+        // its ⌘H belongs to the system Hide role, so the menu keeps that key
         event.preventDefault()
         openFind(true)
       } else if (key === '=' || key === '+') {
@@ -1306,11 +1543,23 @@ export default function App() {
       offReadText()
       offClose()
       offRenamed()
+      offDisk()
       offExport()
+      offPrint()
       offTheme()
       window.removeEventListener('keydown', onKeyDown, true)
     }
-  }, [doSave, runExport, cycleView, zoomIn, zoomOut, flushPending, openFind])
+  }, [
+    doSave,
+    runExport,
+    runPrint,
+    cycleView,
+    zoomIn,
+    zoomOut,
+    flushPending,
+    openFind,
+    reloadFromDisk,
+  ])
 
   // pinch / ctrl+wheel over the stage chrome around the frame; wheel inside the frame arrives as gx:zoom
   useEffect(() => {
@@ -1372,8 +1621,7 @@ export default function App() {
       // falling back to the name of the request that started it
       if (!mutated || pathRef.current) return
       const text = textRef.current
-      const name =
-        derivePageTitleName(text) || provisionalNameRef.current || deriveAutoFileName(text)
+      const name = localFileName(text, provisionalNameRef.current)
       if (name) void doSave('save', name)
     },
     clearHighlights: () => editorRef.current?.clearHighlights(),
@@ -1440,6 +1688,7 @@ export default function App() {
         dirty={dirty}
         onSave={() => void doSave('save')}
         onSaveAs={() => void doSave('saveAs')}
+        onNameWithAi={() => void nameWithAi()}
         onFind={() => openFind(false)}
         canUndo={historyState.undo}
         canRedo={historyState.redo}
@@ -1459,6 +1708,8 @@ export default function App() {
         onToggleAi={() => setAiOpen((v) => !v)}
         canInsert={canvasMode === 'edit'}
         onInsert={(kind, opts) => void insertElement(kind, opts)}
+        onInsertSkeleton={insertSkeleton}
+        canInsertSkeleton={canvasMode === 'edit' && isDocEmpty(textRef.current)}
         onAiPreset={(text) => {
           flushPending()
           setAiOpen(true)
@@ -1469,8 +1720,12 @@ export default function App() {
       />
 
       <div className="app-main">
-        <div className={`ai-dock${aiOpen ? '' : ' collapsed'}`}>
-          {!aiOpen && (
+        <div
+          className={`ai-dock${aiOpen ? '' : ' collapsed'}${
+            !aiSidebarEnabled && !aiOpen ? ' ai-dock-off' : ''
+          }`}
+        >
+          {!aiOpen && aiSidebarEnabled && (
             <button
               className="ai-rail"
               data-tip={t('aiOpenAssistant')}
@@ -1495,6 +1750,17 @@ export default function App() {
           />
         </div>
         <div className="app-content">
+          {diskNotice && (
+            <div className="disk-notice" role="status">
+              <span>{t(diskNotice === 'changed' ? 'diskChangedMsg' : 'diskConflictMsg')}</span>
+              <button type="button" onClick={() => void reloadNow()}>
+                {t('diskReload')}
+              </button>
+              <button type="button" onClick={diskNotice === 'changed' ? keepMine : overwriteNow}>
+                {t(diskNotice === 'changed' ? 'diskKeepMine' : 'diskOverwrite')}
+              </button>
+            </div>
+          )}
           {findTarget && (
             <FindPanel
               target={findTarget}
@@ -1613,6 +1879,7 @@ export default function App() {
                 onChange={onEditorChange}
                 onCursor={onCursor}
                 onBeforeReplace={flushPending}
+                onRedact={onRedactSelection}
               />
             </div>
           </div>
@@ -1699,6 +1966,13 @@ export default function App() {
           onSendNow={askSendNow}
           onRemove={() => askMode.kind === 'edit' && queueRemove(askMode.qid)}
           queueFull={editQueue.length >= EDIT_QUEUE_MAX}
+        />
+      )}
+      {redactDialog && (
+        <RedactDialog
+          seed={redactDialog.seed}
+          onSubmit={confirmRedaction}
+          onCancel={cancelRedaction}
         />
       )}
       {pictureDialog?.kind === 'cutout' && (

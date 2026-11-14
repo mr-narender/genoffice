@@ -1,12 +1,27 @@
 import type { zh } from './zh'
 
 export const pt = {
+  redactMenuLabel: 'Ocultar a seleção da IA',
+  redactDialogDesc:
+    'As palavras continuam no documento e no arquivo; o modelo vê apenas o marcador. Dê-lhe um nome para que saiba o que representa.',
+  redactDialogScope:
+    'Isso se aplica apenas à IA deste aplicativo. A CLI, as ferramentas MCP e a exportação sem interface leem o arquivo diretamente e ainda veem essas palavras.',
+  redactDialogPlaceholder: 'Nome do marcador, ex.: telefone do cliente',
+  redactCancel: 'Cancelar',
+  redactInsert: 'Ocultar',
+  diskChangedMsg: 'Este arquivo foi alterado por outro programa.',
+  diskConflictMsg: 'Este arquivo mudou no disco; salvar substituirá essas alterações.',
+  diskReload: 'Recarregar',
+  diskKeepMine: 'Manter o meu',
+  diskOverwrite: 'Substituir mesmo assim',
+
   loading: 'Carregando…',
   loadFailed: 'Não foi possível abrir o arquivo',
   untitled: 'Sem título',
   saveFailed: 'Falha ao salvar: {error}',
   saveFailedStatus: 'Falha ao salvar',
   exportFailed: 'Falha na exportação',
+  printFailed: 'Falha ao imprimir: {error}',
   exportHtmlSkipped:
     'Exportado, mas {count} recurso(s) não puderam ser incorporados (ex.: {first})',
   viewPreview: 'Visualizar',
@@ -55,6 +70,7 @@ export const pt = {
   openExternal: 'Link aberto no navegador',
   save: 'Salvar (⌘S)',
   saveAs: 'Salvar Como…',
+  aiNameFile: 'Nomear com IA…',
   ribbonCollapse: 'Recolher a Faixa de Opções',
   ribbonExpand: 'Expandir a Faixa de Opções',
   ribbonGroupInsert: 'Inserir',
@@ -85,6 +101,7 @@ export const pt = {
   alignLeft: 'Alinhar à esquerda',
   alignCenter: 'Centralizar',
   alignRight: 'Alinhar à direita',
+  alignJustify: 'Justificar',
   fontSizeDec: 'Diminuir tamanho da fonte',
   fontSizeInc: 'Aumentar tamanho da fonte',
   typography: 'Tipografia',
@@ -121,6 +138,7 @@ export const pt = {
   insertImageUrl: 'Imagem da URL…',
   insertConfirm: 'Inserir',
   insertMore: 'Mais',
+  insertSkeleton: 'Inserir esqueleto',
   insertTableSize: 'Tabela {r}×{c}',
   insertTablePickSize: 'Escolher o tamanho da tabela',
   insertPlaceholderTableHeader: 'Cabeçalho {n}',

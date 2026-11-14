@@ -19,12 +19,21 @@ import { XMLParser } from 'fast-xml-parser'
 import type { Transform, TextAlign } from './types'
 import { type EaScript, type Theme, eaScriptOfLang, resolveFontRef } from './theme'
 import { resolveColorNode } from './color'
-import { asXmlNode, decodeNumericCharRefs, xmlArray, type XmlNode } from './xml-utils'
+import {
+  asXmlNode,
+  decodeNumericCharRefs,
+  percentPoints,
+  xmlArray,
+  type XmlNode,
+} from './xml-utils'
+
+/** Spec (and PowerPoint UI) ceiling for <a:buAutoNum startAt>. */
+export const MAX_AUTO_NUM_START = 32767
 
 const phParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
-  isArray: (name) => ['p:sp'].includes(name),
+  isArray: (name) => ['p:sp', 'p:graphicFrame', 'p:pic'].includes(name),
 })
 
 /** Default run/paragraph style for one indent level (from lstStyle's lvlNpPr/defRPr). */
@@ -54,6 +63,9 @@ export interface LevelTextStyle {
   csFont?: string
   /** East Asian script of the level's defRPr lang/altLang (steers empty-ea theme refs on runs without a lang of their own) */
   eaScript?: EaScript
+  /** Line-breaking language of a level whose defRPr carries lang/altLang: its East Asian
+   *  script, or 'none' for a non-East-Asian tag (so an inherited en-US still counts as a tag) */
+  eaLang?: Exclude<EaScript, 'han'> | 'none'
   align?: TextAlign
   /** Bullet default (master bodyStyle levels commonly use buChar '•') */
   bullet?: {
@@ -85,6 +97,10 @@ export interface LevelTextStyle {
   spaceAfter?: number
   spaceBeforePct?: number
   spaceAfterPct?: number
+  /** <a:lvlNpPr hangingPunct/latinLnBrk/eaLnBrk> line-break switches; absent = inherit */
+  hangingPunct?: boolean
+  latinLnBrk?: boolean
+  eaLnBrk?: boolean
 }
 
 /** Default styles for the 9 levels (index = level, 0-based). */
@@ -126,6 +142,23 @@ export interface PlaceholderMap {
 
 const TITLE_TYPES = new Set(['title', 'ctrTitle'])
 const BODY_TYPES = new Set(['body', 'subTitle', 'obj', ''])
+/** Placeholders a slide never renders text into. They can still carry a lstStyle, so the
+ *  idx-only step below must skip them — a master's `dt idx="2"` must not hand its date
+ *  style to a body placeholder that merely shares idx="2". */
+const FUNCTION_TYPES = new Set([
+  'dt',
+  'ftr',
+  'sldNum',
+  'sldImg',
+  'hdr',
+  'clipArt',
+  'dgm',
+  'media',
+  'oleObj',
+  'chart',
+  'tbl',
+  'pic',
+])
 
 const ANCHOR_MAP: Record<string, PlaceholderGeom['anchor']> = {
   t: 'top',
@@ -174,19 +207,36 @@ export function parsePlaceholderMap(
   } catch {
     return { entries }
   }
-  // Path: p:sldLayout / p:sldMaster → p:cSld → p:spTree → p:sp[]
+  // Path: p:sldLayout / p:sldMaster → p:cSld → p:spTree → p:sp[] + p:graphicFrame[] + p:pic[]
   const root = asXmlNode(doc['p:sldLayout'] ?? doc['p:sldMaster'])
   const spTreeRaw = asXmlNode(root['p:cSld'])['p:spTree']
   if (!spTreeRaw) return { entries }
   const spTree = asXmlNode(spTreeRaw)
-  for (const sp of xmlArray(spTree['p:sp'])) {
-    const phRaw = asXmlNode(asXmlNode(sp['p:nvSpPr'])['p:nvPr'])['p:ph']
+  const shapes: Array<{ node: XmlNode; nvKey: string; frame: boolean }> = [
+    ...xmlArray(spTree['p:sp']).map((node) => ({
+      node: asXmlNode(node),
+      nvKey: 'p:nvSpPr',
+      frame: false,
+    })),
+    ...xmlArray(spTree['p:graphicFrame']).map((node) => ({
+      node: asXmlNode(node),
+      nvKey: 'p:nvGraphicFramePr',
+      frame: true,
+    })),
+    ...xmlArray(spTree['p:pic']).map((node) => ({
+      node: asXmlNode(node),
+      nvKey: 'p:nvPicPr',
+      frame: false,
+    })),
+  ]
+  for (const { node: sp, nvKey, frame } of shapes) {
+    const phRaw = asXmlNode(asXmlNode(sp[nvKey])['p:nvPr'])['p:ph']
     if (!phRaw) continue
     const ph = asXmlNode(phRaw)
     const type = String(ph['@_type'] ?? 'body')
     const idx = ph['@_idx'] != null ? String(ph['@_idx']) : ''
     const spPr = asXmlNode(sp['p:spPr'])
-    const transform = parseXfrmNode(spPr['a:xfrm'])
+    const transform = frame ? parseXfrmNode(sp['p:xfrm']) : parseXfrmNode(spPr['a:xfrm'])
     const textStyle = parseLstStyleLevels(asXmlNode(sp['p:txBody'])['a:lstStyle'], theme, src)
     const bodyPrNode = asXmlNode(asXmlNode(sp['p:txBody'])['a:bodyPr'])
     const anchor = ANCHOR_MAP[String(bodyPrNode['@_anchor'] ?? '')]
@@ -238,10 +288,9 @@ const ALIGN_MAP: Record<string, TextAlign> = {
   just: 'justify',
 }
 
-/** <a:spcPct val="150000"/> → 150 (%). */
+/** <a:spcPct val="150000"/> or val="150%" → 150 (%). */
 function spcPctVal(node: unknown): number | undefined {
-  const v = asXmlNode(asXmlNode(node)['a:spcPct'])['@_val']
-  return v != null ? parseInt(String(v), 10) / 1000 : undefined
+  return percentPoints(asXmlNode(asXmlNode(node)['a:spcPct'])['@_val'])
 }
 
 /** <a:spcPts val="2400"/> → 24 (pt). */
@@ -294,7 +343,8 @@ function parseLvlPPr(
     const an = asXmlNode(pPr['a:buAutoNum'])
     if (an['@_type'] != null) out.bullet.numType = String(an['@_type'])
     const startAt = parseInt(String(an['@_startAt']), 10)
-    if (Number.isFinite(startAt) && startAt > 1) out.bullet.startAt = startAt
+    if (Number.isFinite(startAt) && startAt > 1)
+      out.bullet.startAt = Math.min(startAt, MAX_AUTO_NUM_START)
   } else if (pPr['a:buBlip'] !== undefined) {
     out.bullet = { type: 'blip' }
     const embed = asXmlNode(asXmlNode(pPr['a:buBlip'])['a:blip'])['@_r:embed']
@@ -321,6 +371,11 @@ function parseLvlPPr(
   if (pPr['@_indent'] != null) {
     const v = parseInt(String(pPr['@_indent']), 10)
     if (!Number.isNaN(v)) out.indent = v
+  }
+  for (const k of ['hangingPunct', 'latinLnBrk', 'eaLnBrk'] as const) {
+    const v = pPr[`@_${k}`]
+    if (v === '1' || v === 'true') out[k] = true
+    else if (v === '0' || v === 'false') out[k] = false
   }
   Object.assign(out, parseDefRPrStyle(pPr['a:defRPr'], theme))
   return Object.keys(out).length ? out : undefined
@@ -361,6 +416,7 @@ export function parseDefRPrStyle(
   }
   const eaScript = eaScriptOfLang(defRPr['@_altLang']) ?? eaScriptOfLang(defRPr['@_lang'])
   if (eaScript) out.eaScript = eaScript
+  if (defRPr['@_altLang'] != null || defRPr['@_lang'] != null) out.eaLang = eaScript ?? 'none'
   const latinAttr = typefaceAttr(defRPr['a:latin'])
   const latin = resolveFontRef(latinAttr, theme, eaScript)
   if (latin) out.latinFont = latin
@@ -430,7 +486,12 @@ export function parseMasterTextStyles(
   }
 }
 
-/** Find the lstStyle in a layer's map by placeholder (type, idx). Same match order as geometry inheritance. */
+/** Find the lstStyle in a layer's map by placeholder (type, idx). The idx-only step is
+ *  what ECMA's idx matching needs for legacy decks (slide `<p:ph idx="1"/>` vs layout
+ *  `<p:ph type="obj" idx="1"/>`), so it stays — but it skips FUNCTION_TYPES, since those
+ *  never render slide text and would otherwise donate their style by index collision.
+ *  findInMap's geometry step applies the same skip, so style and geometry resolve to the
+ *  same placeholder. */
 function findStyleInMap(
   map: PlaceholderMap | undefined,
   type: string | undefined,
@@ -441,16 +502,24 @@ function findStyleInMap(
   const i = idx ?? ''
   const styled = map.entries.filter((e) => e.textStyle)
   let hit = styled.find((e) => e.type === t && e.idx === i)
-  if (!hit && i !== '') hit = styled.find((e) => e.idx === i)
+  if (!hit && i !== '') hit = styled.find((e) => e.idx === i && !FUNCTION_TYPES.has(e.type))
   if (!hit) hit = styled.find((e) => e.type === t)
   if (!hit && TITLE_TYPES.has(t)) hit = styled.find((e) => TITLE_TYPES.has(e.type))
   if (!hit && BODY_TYPES.has(t)) hit = styled.find((e) => BODY_TYPES.has(e.type))
   return hit?.textStyle
 }
 
-/** Find the bodyPr anchor in a layer's map by placeholder (type, idx). Unlike
- *  findStyleInMap there is no idx-only step: master placeholders reuse idx values
- *  across types (a dt idx="2" must not anchor a body idx="2" to the bottom). */
+/** The layer has the placeholder this one inherits from (same type and idx). Its bodyPr
+ *  decides even when it leaves an attribute unset — the chain then continues to the
+ *  master, not to a same-type sibling (a layout's anchor="b" body idx="1" must not reach
+ *  the slide's idx="2" content placeholder whose own layout entry has no anchor). */
+function hasExactEntry(map: PlaceholderMap, t: string, i: string): boolean {
+  return i !== '' && map.entries.some((e) => e.type === t && e.idx === i)
+}
+
+/** Find the bodyPr anchor in a layer's map by placeholder (type, idx). No idx-only
+ *  step: master placeholders reuse idx values across types (a dt idx="2" must not
+ *  anchor a body idx="2" to the bottom). */
 function findAnchorInMap(
   map: PlaceholderMap | undefined,
   type: string | undefined,
@@ -461,6 +530,7 @@ function findAnchorInMap(
   const i = idx ?? ''
   const anchored = map.entries.filter((e) => e.anchor)
   let hit = anchored.find((e) => e.type === t && e.idx === i)
+  if (!hit && hasExactEntry(map, t, i)) return undefined
   if (!hit) hit = anchored.find((e) => e.type === t)
   if (!hit && TITLE_TYPES.has(t)) hit = anchored.find((e) => TITLE_TYPES.has(e.type))
   if (!hit && BODY_TYPES.has(t)) hit = anchored.find((e) => BODY_TYPES.has(e.type))
@@ -478,6 +548,7 @@ function findInsetsInMap(
   const i = idx ?? ''
   const carriers = map.entries.filter((e) => e.insets)
   let hit = carriers.find((e) => e.type === t && e.idx === i)
+  if (!hit && hasExactEntry(map, t, i)) return undefined
   if (!hit) hit = carriers.find((e) => e.type === t)
   if (!hit && TITLE_TYPES.has(t)) hit = carriers.find((e) => TITLE_TYPES.has(e.type))
   if (!hit && BODY_TYPES.has(t)) hit = carriers.find((e) => BODY_TYPES.has(e.type))
@@ -522,6 +593,7 @@ function findAnchorCtrInMap(
   const i = idx ?? ''
   const marked = map.entries.filter((e) => e.anchorCtr !== undefined)
   let hit = marked.find((e) => e.type === t && e.idx === i)
+  if (!hit && hasExactEntry(map, t, i)) return undefined
   if (!hit) hit = marked.find((e) => e.type === t)
   if (!hit && TITLE_TYPES.has(t)) hit = marked.find((e) => TITLE_TYPES.has(e.type))
   if (!hit && BODY_TYPES.has(t)) hit = marked.find((e) => BODY_TYPES.has(e.type))
@@ -616,6 +688,7 @@ export function mergeTextStyleChain(
       src.csFont = from
     }
     if (out.eaScript == null && lvl.eaScript != null) out.eaScript = lvl.eaScript
+    if (out.eaLang == null && lvl.eaLang != null) out.eaLang = lvl.eaLang
     if (out.align == null && lvl.align != null) {
       out.align = lvl.align
       src.align = from
@@ -623,6 +696,9 @@ export function mergeTextStyleChain(
     if (out.bullet == null && lvl.bullet != null) out.bullet = lvl.bullet
     if (out.marL == null && lvl.marL != null) out.marL = lvl.marL
     if (out.indent == null && lvl.indent != null) out.indent = lvl.indent
+    if (out.hangingPunct == null && lvl.hangingPunct != null) out.hangingPunct = lvl.hangingPunct
+    if (out.latinLnBrk == null && lvl.latinLnBrk != null) out.latinLnBrk = lvl.latinLnBrk
+    if (out.eaLnBrk == null && lvl.eaLnBrk != null) out.eaLnBrk = lvl.eaLnBrk
     // Line/paragraph spacing inherit as attribute pairs (pct and pts are two value forms of the same lnSpc/spcBef/spcAft node)
     if (
       out.lineHeight == null &&
@@ -667,9 +743,10 @@ function findInMap(
   // 1. Exact (type, idx)
   let hit = geo.find((e) => e.type === t && e.idx === i)
   if (hit) return hit.transform!
-  // 2. By idx (when idx is non-empty)
+  // 2. By idx (when idx is non-empty), skipping function placeholders so style and
+  //    geometry agree — see findStyleInMap
   if (i !== '') {
-    hit = geo.find((e) => e.idx === i)
+    hit = geo.find((e) => e.idx === i && !FUNCTION_TYPES.has(e.type))
     if (hit) return hit.transform!
   }
   // 3. By type

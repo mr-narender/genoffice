@@ -55,7 +55,10 @@ export const FORMAT_FAMILIES: readonly FormatFamily[] = [
   {
     family: 'docx',
     label: 'Word document',
-    editorOpen: ['docx'],
+    // .odt/.ott, legacy Word .doc/.dot and .hwpx/.hwp open as converted copies and save as
+    // .docx, so they are open-only formats: they must not appear in editorSave
+    // (GenOffice never writes ODF, Word 97-2003 or HWP)
+    editorOpen: ['docx', 'odt', 'ott', 'doc', 'dot', 'hwpx', 'hwp'],
     editorSave: ['docx'],
     editorExport: ['pdf'],
     mcp: { generate: 'docx', save: ['docx'], read: 'docx' },
@@ -64,8 +67,9 @@ export const FORMAT_FAMILIES: readonly FormatFamily[] = [
     family: 'xlsx',
     label: 'spreadsheet',
     // .tsv opens as a converted copy and saves as .xlsx, so it is an open-only
-    // format: it must not appear in editorSave
-    editorOpen: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv'],
+    // format: it must not appear in editorSave. .ods is open-only for the same
+    // reason, and GenOffice never writes ODF.
+    editorOpen: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv', 'ods', 'ots'],
     // the interactive Save As also offers .xlsm/.csv; the explicit-path save the
     // MCP bridge uses writes .xlsx only (sheets-main.ts forces the extension),
     // so mcp.save stays xlsx until that pipeline is widened
@@ -76,7 +80,9 @@ export const FORMAT_FAMILIES: readonly FormatFamily[] = [
   {
     family: 'pptx',
     label: 'presentation',
-    editorOpen: ['pptx'],
+    // .odp/.otp and legacy .ppt open as converted copies and save as .pptx —
+    // open-only for the same reason as .odt/.ods/.doc
+    editorOpen: ['pptx', 'odp', 'otp', 'ppt'],
     editorSave: ['pptx'],
     editorExport: ['pdf'],
     mcp: { generate: 'pptx', save: ['pptx'] },
