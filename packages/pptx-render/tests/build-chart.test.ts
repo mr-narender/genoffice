@@ -30,58 +30,75 @@ const lineModel: ChartModel = {
 }
 
 describe('buildChartNode', () => {
-  it('renders a valid 130,000-point line series with its full value range', () => {
-    const values = Array<number>(130_000).fill(10)
-    values[0] = -5
-    values[values.length - 1] = 30
-    const model: ChartModel = {
-      kind: 'line',
-      categories: Array<string>(values.length).fill(''),
-      series: [{ values, marker: false }],
-      catAxis: { tickLblHidden: true },
-    }
-    const node = buildChartNode('large', 'large', model, box, vp, metrics)!
-    const points = node.polylines[0]!.points
-    expect(points).toHaveLength(values.length * 2)
-    expect(points[1]).toBeGreaterThan(points[points.length - 1]!)
-    expect(node.labels.some((label) => label.text === '30')).toBe(true)
-  })
+  // 130,000-element series are real CPU work (up to ~5 s on a loaded CI
+  // runner), so vitest's default 5 s budget flakes; this matches the 60 s
+  // budget of build-chart-series-bounds.test.ts for the same workload
+  const TIMEOUT = 60_000
 
-  it('renders 130,000 horizontal bars without spreading their values', () => {
-    const values = Array<number>(130_000).fill(10)
-    const model: ChartModel = {
-      kind: 'bar',
-      barDir: 'bar',
-      categories: Array<string>(values.length).fill(''),
-      series: [{ values }],
-      catAxis: { tickLblHidden: true },
-    }
-    expect(buildChartNode('large-bars', 'large-bars', model, box, vp, metrics)?.bars).toHaveLength(
-      values.length,
-    )
-  })
+  it(
+    'renders a valid 130,000-point line series with its full value range',
+    () => {
+      const values = Array<number>(130_000).fill(10)
+      values[0] = -5
+      values[values.length - 1] = 30
+      const model: ChartModel = {
+        kind: 'line',
+        categories: Array<string>(values.length).fill(''),
+        series: [{ values, marker: false }],
+        catAxis: { tickLblHidden: true },
+      }
+      const node = buildChartNode('large', 'large', model, box, vp, metrics)!
+      const points = node.polylines[0]!.points
+      expect(points).toHaveLength(values.length * 2)
+      expect(points[1]).toBeGreaterThan(points[points.length - 1]!)
+      expect(node.labels.some((label) => label.text === '30')).toBe(true)
+    },
+    TIMEOUT,
+  )
 
-  it('renders 130,000 scatter points without spreading axis values', () => {
-    const values = Array<number>(130_000).fill(10)
-    const model: ChartModel = {
-      kind: 'scatter',
-      scatterStyle: 'marker',
-      categories: [],
-      series: [{ values }],
-    }
-    expect(
-      buildChartNode('large-scatter', 'large-scatter', model, box, vp, metrics)?.markers,
-    ).toHaveLength(values.length)
-  })
+  it(
+    'renders 130,000 horizontal bars without spreading their values',
+    () => {
+      const values = Array<number>(130_000).fill(10)
+      const model: ChartModel = {
+        kind: 'bar',
+        barDir: 'bar',
+        categories: Array<string>(values.length).fill(''),
+        series: [{ values }],
+        catAxis: { tickLblHidden: true },
+      }
+      expect(
+        buildChartNode('large-bars', 'large-bars', model, box, vp, metrics)?.bars,
+      ).toHaveLength(values.length)
+    },
+    TIMEOUT,
+  )
+
+  it(
+    'renders 130,000 scatter points without spreading axis values',
+    () => {
+      const values = Array<number>(130_000).fill(10)
+      const model: ChartModel = {
+        kind: 'scatter',
+        scatterStyle: 'marker',
+        categories: [],
+        series: [{ values }],
+      }
+      expect(
+        buildChartNode('large-scatter', 'large-scatter', model, box, vp, metrics)?.markers,
+      ).toHaveLength(values.length)
+    },
+    TIMEOUT,
+  )
 
   it('builds line chart: polylines within plot, markers, gridlines, legend', () => {
     const node = buildChartNode('r_1', 'el1', lineModel, box, vp, metrics)!
     expect(node.type).toBe('chart')
-    expect(node.polylines).toHaveLength(2)
-    expect(node.markers.length).toBe(8)
+    // 2 series polylines + 2 legend line keys (with their markers)
+    expect(node.polylines).toHaveLength(4)
+    expect(node.markers.length).toBe(10)
     expect(node.gridLines.length).toBeGreaterThan(2)
-    // Legend: 2 swatches + at least 2 texts (more with tick/category labels)
-    expect(node.swatches).toHaveLength(2)
+    expect(node.swatches).toHaveLength(0)
     // All polyline points are inside the chart box
     for (const p of node.polylines) {
       for (let i = 0; i < p.points.length; i += 2) {
@@ -157,11 +174,13 @@ describe('buildChartNode', () => {
     // The bar series yields only 3 bars (not 6), the line series yields 1 polyline
     expect(node.bars).toHaveLength(3)
     expect(node.bars.every((b) => b.color === '#4472C4')).toBe(true)
-    expect(node.polylines).toHaveLength(1)
+    // series polyline + the line series' legend key
+    expect(node.polylines).toHaveLength(2)
     expect(node.polylines[0]!.color).toBe('#ED7D31')
     expect(node.polylines[0]!.points).toHaveLength(6)
-    // The legend includes both series
-    expect(node.swatches).toHaveLength(2)
+    // The legend includes both series: bar swatch + line key
+    expect(node.swatches).toHaveLength(1)
+    expect(node.polylines[1]!.points).toHaveLength(4)
   })
 
   it('combo dual axis: line maps to the right secondary value-axis range, right axis line and tick labels drawn', () => {
@@ -1321,5 +1340,32 @@ describe('per-point picture fills', () => {
       kind: 'image',
       dataUrl: 'data:image/png;base64,AAAA',
     })
+  })
+})
+
+describe('legend top slot under a title with a manual plot layout', () => {
+  const base: ChartModel = {
+    kind: 'bar',
+    barDir: 'col',
+    categories: ['T1', 'T2'],
+    series: [
+      { name: 'Y1', color: '#5B9BD5', values: [1, 2] },
+      { name: 'Y2', color: '#ED7D31', values: [2, 3] },
+    ],
+    title: 'Total output',
+    titlePt: 30,
+    legendPos: 't',
+    plotLayout: { x: 0.05, y: 0.14, w: 0.95, h: 0.73 },
+  }
+  const legendY = (model: ChartModel) =>
+    buildChartNode('lg', 'lg', model, box, vp, metrics)!.labels.find((l) => l.text === 'Y1')!.y
+  const titleH = ptToPx(30, vp.scale) * (0.5 + 1.17) - 1
+
+  it('keeps the auto-placed legend below the title row', () => {
+    expect(legendY(base)).toBeGreaterThanOrEqual(titleH)
+  })
+
+  it('an overlay title reserves nothing', () => {
+    expect(legendY({ ...base, titleOverlay: true })).toBeLessThan(titleH)
   })
 })

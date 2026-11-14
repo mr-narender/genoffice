@@ -12,12 +12,25 @@ import {
   parseToolInput,
   readCappedResponseText,
   sseErrorText,
-  sseLines,
+  sseDataEvents,
   throwIfCreditsNotice,
   throwIfToolCountOverBudget,
   throwIfToolJsonOverBudget,
+  openAiUsage,
   type StreamCallbacks,
 } from './shared'
+import type { AiTokenUsage } from '../types'
+
+interface ChatUsage {
+  prompt_tokens?: unknown
+  completion_tokens?: unknown
+  prompt_tokens_details?: { cached_tokens?: unknown } | null
+}
+
+function chatUsage(raw: ChatUsage | undefined): AiTokenUsage | undefined {
+  if (!raw) return undefined
+  return openAiUsage(raw.prompt_tokens, raw.completion_tokens, raw.prompt_tokens_details)
+}
 
 function openAiMessages(
   system: string,
@@ -61,7 +74,13 @@ function openAiMessages(
       })
     } else {
       for (const r of m.results) {
-        out.push({ role: 'tool', tool_call_id: r.id, content: r.output })
+        // OpenAI has no structured is_error flag (Anthropic sends one); prefix the
+        // content so the model can tell a failed call from a successful one and retry.
+        out.push({
+          role: 'tool',
+          tool_call_id: r.id,
+          content: r.isError ? `Error: ${r.output}` : r.output,
+        })
       }
     }
   }
@@ -79,6 +98,7 @@ function emitOpenAiJsonMessage(bodyText: string, cb: StreamCallbacks): void {
       }
       finish_reason?: string | null
     }>
+    usage?: ChatUsage
     error?: { message?: string } | string
   }
   try {
@@ -123,6 +143,8 @@ function emitOpenAiJsonMessage(bodyText: string, cb: StreamCallbacks): void {
   for (const call of toolCalls) cb.onToolCall(call)
   if (!emitted) throw new Error(`The model returned no content: ${httpBodyDetail(bodyText)}`)
   if (choice?.finish_reason === 'length') cb.onStopReason?.('max_tokens')
+  const usage = chatUsage(msg.usage as ChatUsage | undefined)
+  if (usage) cb.onUsage?.(usage)
 }
 
 /** Per-endpoint request shaping resolved from the provider registry. */
@@ -132,6 +154,24 @@ export interface OpenAiRequestOptions {
   useMaxCompletionTokens?: boolean | undefined
   /** vendor-specific fields merged into the request body (e.g. DeepSeek's `thinking`) */
   bodyExtras?: Record<string, unknown> | undefined
+  /** echo `reasoning_content` back on assistant turns; absent = the shipped family heuristic */
+  echoReasoning?: boolean | undefined
+  /** OpenAI-style reasoning effort for the families that accept the field
+   * (gpt-5.x chat, o-series, grok); absent = the model's default. Emitted
+   * after `bodyExtras` so the user's stored pick outranks a profile's extras,
+   * the same rule the toggle fields follow. */
+  reasoningEffort?: string | undefined
+  /** static headers a user-hosted endpoint needs (merged last, so they win) */
+  headers?: Record<string, string> | undefined
+  /** stream idle budget override for slow local servers */
+  idleTimeoutMs?: number | undefined
+}
+
+const usageRejectedGateways = new Set<string>()
+
+/** test hook */
+export function resetUsageRejectedGateways(): void {
+  usageRejectedGateways.clear()
 }
 
 export async function streamOpenAiCompatible(
@@ -144,9 +184,23 @@ export async function streamOpenAiCompatible(
   cb: StreamCallbacks,
   options: OpenAiRequestOptions = {},
 ): Promise<void> {
-  const wd = createStreamWatchdog(cb.signal)
+  const wd = createStreamWatchdog(cb.signal, undefined, options.idleTimeoutMs)
   return wd.guard(() =>
-    openAiCompatibleTurn(baseUrl, config, system, messages, tools, maxTokens, cb, wd, options),
+    openAiCompatibleTurn(baseUrl, config, system, messages, tools, maxTokens, cb, wd, {
+      ...options,
+      requestUsage: !usageRejectedGateways.has(baseUrl),
+    }).catch((e) => {
+      // Some gateways reject the (spec) stream_options field outright; a 400 that
+      // names it is retried once without it, and the gateway is remembered so
+      // later turns skip the extra round trip — those providers never report usage.
+      if (!/HTTP 4\d\d:[\s\S]*stream_options/i.test(e instanceof Error ? e.message : String(e)))
+        throw e
+      usageRejectedGateways.add(baseUrl)
+      return openAiCompatibleTurn(baseUrl, config, system, messages, tools, maxTokens, cb, wd, {
+        ...options,
+        requestUsage: false,
+      })
+    }),
   )
 }
 
@@ -159,7 +213,7 @@ async function openAiCompatibleTurn(
   maxTokens: number,
   cb: StreamCallbacks,
   wd: StreamWatchdog,
-  options: OpenAiRequestOptions,
+  options: OpenAiRequestOptions & { requestUsage?: boolean | undefined },
 ): Promise<void> {
   const onBytes = () => {
     wd.touch()
@@ -173,13 +227,20 @@ async function openAiCompatibleTurn(
       ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
       ...gensparkAttributionHeaders(baseUrl),
       ...opencodeSessionHeaders(baseUrl, cb.sessionId),
+      // user-hosted endpoints may route on static headers; merged last so a
+      // deliberate profile header beats an inferred one
+      ...options.headers,
     },
     body: JSON.stringify({
       model: config.model,
       ...(options.useMaxCompletionTokens
         ? { max_completion_tokens: maxTokens }
         : { max_tokens: maxTokens }),
-      messages: openAiMessages(system, messages, modelEchoesReasoning(config.model)),
+      messages: openAiMessages(
+        system,
+        messages,
+        options.echoReasoning ?? modelEchoesReasoning(config.model),
+      ),
       ...(tools.length > 0
         ? {
             tools: tools.map((t) => ({
@@ -190,7 +251,12 @@ async function openAiCompatibleTurn(
         : {}),
       ...(options.omitTemperature ? {} : { temperature: 0.3 }),
       ...options.bodyExtras,
+      ...(options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
       stream: true,
+      // OpenAI-class providers only report usage in a stream when asked (a final
+      // chunk with empty choices carries it); strict gateways that reject the
+      // field are retried once without it by streamOpenAiCompatible.
+      ...(options.requestUsage ? { stream_options: { include_usage: true } } : {}),
     }),
   })
   // headers arrived: ping the renderer watchdog too, or a slow first chunk could trip it
@@ -212,6 +278,7 @@ async function openAiCompatibleTurn(
   let sawFinish = false
   let sawDone = false
   let emitted = false
+  let turnUsage: AiTokenUsage | undefined
   const flushTools = () => {
     const entries = [...pendingTools.entries()].sort(([a], [b]) => a - b)
     const lastIndex = entries.at(-1)?.[0]
@@ -231,39 +298,37 @@ async function openAiCompatibleTurn(
     }
     pendingTools.clear()
   }
-  for await (const line of sseLines(response.body, onBytes)) {
-    if (!line.startsWith('data:')) continue
-    const payload = line.slice(5).trim()
-    if (!payload) continue
-    if (payload === '[DONE]') {
+  for await (const sse of sseDataEvents(response.body, onBytes)) {
+    if (sse.raw === '[DONE]') {
       sawDone = true
       break
     }
-    // A truncated frame or a non-JSON keep-alive from a proxy should skip
-    // that event, not kill the entire AI turn with a parser error.
-    let event
-    try {
-      event = JSON.parse(payload) as {
-        choices?: Array<{
-          delta?: {
-            content?: unknown
-            /** DeepSeek/MiniMax native and LiteLLM-normalized thinking stream; OpenRouter uses `reasoning` */
-            reasoning_content?: string
-            reasoning?: string
-            tool_calls?: Array<{
-              index: number
-              id?: string
-              function?: { name?: string; arguments?: string }
-            }>
-          }
-          finish_reason?: string | null
-        }>
-        error?: { message?: string } | string
-      }
-    } catch {
-      continue
+    // A truncated frame or a non-JSON keep-alive from a proxy skips that event
+    // rather than killing the turn.
+    if (sse.json === undefined) continue
+    const event = sse.json as {
+      choices?: Array<{
+        delta?: {
+          content?: unknown
+          /** DeepSeek/MiniMax native and LiteLLM-normalized thinking stream; OpenRouter uses `reasoning` */
+          reasoning_content?: string
+          reasoning?: string
+          tool_calls?: Array<{
+            index: number
+            id?: string
+            function?: { name?: string; arguments?: string }
+          }>
+        }
+        finish_reason?: string | null
+      }>
+      /** usage chunk (requested via stream_options): empty choices + the counts */
+      usage?: ChatUsage
+      error?: { message?: string } | string
     }
     if (event.error) throw new Error(sseErrorText(event.error, 'Model stream error'))
+    // The usage chunk arrives with empty choices right before [DONE]; some
+    // providers (DeepSeek et al) attach usage to the last content chunk instead.
+    turnUsage = chatUsage(event.usage) ?? turnUsage
     const choice = event.choices?.[0]
     if (!choice) continue
     const reasoning = choice.delta?.reasoning_content ?? choice.delta?.reasoning
@@ -339,6 +404,7 @@ async function openAiCompatibleTurn(
     throw new Error('The model returned no content (empty stream)')
   }
   if (stopReason) cb.onStopReason?.(stopReason)
+  if (turnUsage) cb.onUsage?.(turnUsage)
 }
 
 export async function chatOpenAiCompatible(
@@ -357,6 +423,7 @@ export async function chatOpenAiCompatible(
       ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
       ...gensparkAttributionHeaders(baseUrl),
       ...opencodeSessionHeaders(baseUrl),
+      ...options.headers,
     },
     body: JSON.stringify({
       model: config.model,
@@ -366,6 +433,7 @@ export async function chatOpenAiCompatible(
       ],
       ...(options.omitTemperature ? {} : { temperature: 0.3 }),
       ...options.bodyExtras,
+      ...(options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
     }),
   })
   wd.touch()

@@ -7,6 +7,7 @@ import { xlsxToText } from '../src/xlsx'
 import { resolveTarget } from '../src/opc'
 import {
   buildDocxFixture,
+  buildPdfFixture,
   buildPptxFixture,
   buildXlsxFixture,
   writeFixture,
@@ -15,6 +16,40 @@ import {
 function legacyFixture(name: string): string {
   return fileURLToPath(new URL(`fixtures/${name}`, import.meta.url))
 }
+
+describe('parseFileToText: magic-byte sniffing', () => {
+  it('rejects a ZIP named .pdf with a content-mismatch error', async () => {
+    const zip = new JSZip()
+    zip.file('test.txt', 'hello')
+    const path = writeFixture('fake.pdf', await zip.generateAsync({ type: 'uint8array' }))
+    const result = await parseFileToText(path)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('Content mismatch')
+  })
+
+  it('rejects a PDF named .docx with a content-mismatch error', async () => {
+    const path = writeFixture('fake.docx', buildPdfFixture('hello'))
+    const result = await parseFileToText(path)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('Content mismatch')
+  })
+
+  it('parses DOCX bytes saved under a .doc name', async () => {
+    const path = writeFixture('docx-as.doc', await buildDocxFixture())
+    const result = await parseFileToText(path)
+    expect(result.ok).toBe(true)
+    expect(result.text).toContain('hello docx')
+  })
+
+  it('still rejects a ZIP named .ppt with a content-mismatch error', async () => {
+    const zip = new JSZip()
+    zip.file('test.txt', 'hello')
+    const path = writeFixture('fake.ppt', await zip.generateAsync({ type: 'uint8array' }))
+    const result = await parseFileToText(path)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('Content mismatch')
+  })
+})
 
 describe('parseFileToText: doc', () => {
   it('extracts body text from a Word 97-2003 document', async () => {
@@ -355,6 +390,67 @@ describe('parseFileToText: pptx', () => {
     )
   })
 
+  it.each([1, 2])(
+    'reads notes inside %i nested shape groups without reading page numbers',
+    async (depth) => {
+      const zip = await JSZip.loadAsync(await buildPptxFixture())
+      zip.file(
+        'ppt/slides/_rels/slide1.xml.rels',
+        notesRelationship('../notesSlides/notesSlide1.xml'),
+      )
+      const xml = notesSlideXml(['Grouped note 0042', 'Second paragraph'], '99')
+        .replace('<p:spTree>', `<p:spTree>${'<p:grpSp>'.repeat(depth)}`)
+        .replace('</p:spTree>', `${'</p:grpSp>'.repeat(depth)}</p:spTree>`)
+      zip.file('ppt/notesSlides/notesSlide1.xml', xml)
+      const text = await pptxToText(await zip.generateAsync({ type: 'uint8array' }))
+      expect(text).toContain('### Notes\nGrouped note 0042\nSecond paragraph')
+      expect(text).not.toContain('99')
+      expect(text.match(/Grouped note 0042/g)).toHaveLength(1)
+    },
+  )
+
+  it('reads one compatibility branch of grouped notes', async () => {
+    const zip = await JSZip.loadAsync(await buildPptxFixture())
+    zip.file(
+      'ppt/slides/_rels/slide1.xml.rels',
+      notesRelationship('../notesSlides/notesSlide1.xml'),
+    )
+    const xml = notesSlideXml(['Fallback notes'], '99')
+      .replace(
+        '<p:spTree>',
+        '<p:spTree><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="p"><p:grpSp/></mc:Choice><mc:Fallback><p:grpSp>',
+      )
+      .replace('</p:spTree>', '</p:grpSp></mc:Fallback></mc:AlternateContent></p:spTree>')
+    zip.file('ppt/notesSlides/notesSlide1.xml', xml)
+    const text = await pptxToText(await zip.generateAsync({ type: 'uint8array' }))
+    expect(text).toContain('### Notes\nFallback notes')
+    expect(text).not.toContain('99')
+    expect(text.match(/Fallback notes/g)).toHaveLength(1)
+  })
+
+  it.each(['single quotes', 'shape attributes', 'alternate prefixes'])(
+    'reads speaker notes with %s',
+    async (variant) => {
+      const zip = await JSZip.loadAsync(await buildPptxFixture())
+      zip.file(
+        'ppt/slides/_rels/slide1.xml.rels',
+        notesRelationship('../notesSlides/notesSlide1.xml'),
+      )
+      let xml = notesSlideXml(['Discuss revenue &amp; costs', 'Keep 0042 intact'], '1')
+      if (variant === 'single quotes') xml = xml.replaceAll('"', "'")
+      if (variant === 'shape attributes') xml = xml.replaceAll('<p:sp>', '<p:sp useBgFill="0">')
+      if (variant === 'alternate prefixes')
+        xml = xml.replaceAll('p:', 'presentation:').replaceAll('xmlns:p=', 'xmlns:presentation=')
+      zip.file('ppt/notesSlides/notesSlide1.xml', xml)
+      const result = await parseFileToText(
+        writeFixture(`notes-${variant}.pptx`, await zip.generateAsync({ type: 'uint8array' })),
+      )
+      expect(result.ok).toBe(true)
+      expect(result.text).toContain('### Notes\nDiscuss revenue & costs\nKeep 0042 intact')
+      expect(result.text).not.toContain('Keep 0042 intact\n1')
+    },
+  )
+
   it('follows presentation order with positional numbering and excludes orphan slides', async () => {
     const zip = await presentationFixture(
       "<p:sldId id='265' r:id='rId10'/><p:sldId id='256' r:id='rId1'/>",
@@ -614,7 +710,7 @@ describe('parseFileToText: xlsx', () => {
     )
     const text = await xlsxToText(await zip.generateAsync({ type: 'uint8array' }))
     expect(text).toBe(
-      '# Calc\n1 | =SUM(A1:A3) | =A1*2\n2 | =A2+1 | 4\n3 | =A2+1 | 30\n |  | =A3*10',
+      '# Calc\n1 | =SUM(A1:A3) | =A1*2\n2 | =A2+1 | 4\n3 | =A3+1 | 30\n |  | =A4*10',
     )
   })
 
@@ -709,10 +805,41 @@ describe('parseFileToText: xlsx', () => {
     const bytes = await zip.generateAsync({ type: 'uint8array' })
     const text = await xlsxToText(bytes)
     // Only the valid index 0 survives; every malformed shared ref degrades to
-    // empty (trailing empty slots are trimmed from the line since they carry
-    // no column information — see the xlsx text-output cap).
+    // empty, and trailing empty slots are trimmed from the line.
     expect(text).toContain('First')
     expect(text).not.toContain('Second')
+    expect(text).not.toMatch(/First \|/)
+    expect(text).not.toMatch(/ \| $/m)
+  })
+
+  it('collapses long empty runs before a far-right cell instead of emitting 16k separators', async () => {
+    const zip = new JSZip()
+    zip.file(
+      'xl/workbook.xml',
+      '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+    )
+    zip.file(
+      'xl/_rels/workbook.xml.rels',
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+        '</Relationships>',
+    )
+    zip.file(
+      'xl/worksheets/sheet1.xml',
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+        '<row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c>' +
+        '<c r="XFD1" t="inlineStr"><is><t>z</t></is></c></row>' +
+        '<row r="2"><c r="A2" t="inlineStr"><is><t>b</t></is></c>' +
+        '<c r="D2" t="inlineStr"><is><t>d</t></is></c><c r="XFD2"/></row>' +
+        '</sheetData></worksheet>',
+    )
+    const text = await xlsxToText(await zip.generateAsync({ type: 'uint8array' }))
+    expect(text).toContain('a | (16382 empty) | z')
+    // Short gaps keep their column positions; an empty far cell is dropped.
+    expect(text).toMatch(/^b \| {2}\| {2}\| d$/m)
+    expect(text.length).toBeLessThan(200)
   })
 
   it('appends cells with malformed refs instead of dropping their text', async () => {
@@ -799,6 +926,48 @@ describe('parseFileToText: xlsx', () => {
     const text = await xlsxToText(bytes)
     expect(text).toContain('first |  | third')
     expect(text).not.toContain('| third |')
+  })
+
+  it('keeps both values of a duplicated ref and stays linear on many duplicates', async () => {
+    const sheet = (cells: string) =>
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+      `<row r="1">${cells}</row></sheetData></worksheet>`
+    const build = async (cells: string) => {
+      const zip = new JSZip()
+      zip.file(
+        'xl/workbook.xml',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+          '<sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+      )
+      zip.file(
+        'xl/_rels/workbook.xml.rels',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+          '</Relationships>',
+      )
+      zip.file('xl/worksheets/sheet1.xml', sheet(cells))
+      return zip.generateAsync({ type: 'uint8array' })
+    }
+    const small = await xlsxToText(
+      await build('<c r="A1"><v>x</v></c><c r="A1"><v>y</v></c><c r="C1"><v>c</v></c>'),
+    )
+    expect(small).toContain('y | x |  | c')
+    // An empty duplicate must not wipe the values already stacked in its slot.
+    const stacked = await xlsxToText(
+      await build('<c r="A1"><v>x</v></c><c r="A1"/><c r="A1"><v>y</v></c>'),
+    )
+    expect(stacked).toContain('y | x')
+
+    const many = Array.from({ length: 150_000 }, (_, i) => `<c r="A1"><v>${i}</v></c>`).join('')
+    const started = performance.now()
+    const text = await xlsxToText(await build(many))
+    expect(performance.now() - started).toBeLessThan(8_000)
+    expect(text).toContain('149999 | 149998 | ')
+    expect(text).toMatch(/\| 1 \| 0$/m)
   })
 
   it('clamps wild column refs instead of padding millions of cells', async () => {

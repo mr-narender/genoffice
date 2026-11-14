@@ -44,6 +44,9 @@ export function eotToSfnt(bytes: Uint8Array): Uint8Array | null {
     if (!inflated) return null
     sfnt = inflated
   }
+  // FontDataSize can be 1..3 and still pass the checks above; a DataView over a
+  // shorter buffer throws RangeError, so refuse before reading the magic.
+  if (sfnt.length < 4) return null
   const magic = new DataView(sfnt.buffer, sfnt.byteOffset, 4).getUint32(0, false)
   if (!SFNT_MAGICS.includes(magic)) return null
   return sfnt
@@ -145,6 +148,7 @@ export function sfntCmapLookup(sfnt: Uint8Array): ((cp: number) => boolean) | nu
         const starts = ends + segCount * 2 + 2
         const deltas = starts + segCount * 2
         const rangeOffsets = deltas + segCount * 2
+        if (!inBounds(rangeOffsets, segCount * 2)) continue
         lookups.push((cp) => {
           if (cp > 0xffff) return false
           for (let k = 0; k < segCount; k++) {
@@ -164,6 +168,7 @@ export function sfntCmapLookup(sfnt: Uint8Array): ((cp: number) => boolean) | nu
         })
       } else if (format === 12) {
         const nGroups = dv.getUint32(sub + 12, false)
+        if (!inBounds(sub + 16, nGroups * 12)) continue
         lookups.push((cp) => {
           for (let k = 0; k < nGroups; k++) {
             const g = sub + 16 + k * 12

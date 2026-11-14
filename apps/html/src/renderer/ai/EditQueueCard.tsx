@@ -5,6 +5,7 @@
  */
 import { useState } from 'react'
 import type { ReactElement } from 'react'
+import { useImeEnterGuard } from '@genoffice/ui'
 import { useI18n } from '../i18n/locale'
 import type { ParseMap } from '../document/parse-map'
 import {
@@ -14,6 +15,7 @@ import {
   truncate,
   type EditQueueItem,
 } from './edit-queue'
+import { buildProjection } from './redact'
 
 interface Props {
   items: EditQueueItem[]
@@ -46,12 +48,13 @@ export function EditQueueCard({
   /** null = follow the length-based default; set once the user clicks the chevron */
   const [manualFold, setManualFold] = useState<boolean | null>(null)
   const [editingQid, setEditingQid] = useState<string | null>(null)
+  const ime = useImeEnterGuard()
   const [draft, setDraft] = useState('')
   const [confirmDiscard, setConfirmDiscard] = useState(false)
 
   if (items.length === 0) return null
   const folded = manualFold ?? items.length >= AUTO_COLLAPSE_FROM
-  const resolved = items.map((item) => resolveQueueItem(text, map, item))
+  const resolved = items.map((item) => resolveQueueItem(buildProjection(text, map), map, item))
   const liveCount = resolved.filter((r) => r.target !== null).length
 
   return (
@@ -101,13 +104,15 @@ export function EditQueueCard({
                       autoFocus
                       maxLength={EDIT_INSTRUCTION_MAX}
                       onChange={(e) => setDraft(e.target.value)}
+                      onCompositionStart={ime.handleCompositionStart}
+                      onCompositionEnd={ime.handleCompositionEnd}
                       onBlur={() => {
                         const next = draft.trim()
                         if (next) onEditInstruction(item.qid, next)
                         setEditingQid(null)
                       }}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                        if (e.key === 'Enter' && !ime.isImeConfirm(e.nativeEvent)) {
                           e.preventDefault()
                           e.currentTarget.blur()
                         } else if (e.key === 'Escape') {

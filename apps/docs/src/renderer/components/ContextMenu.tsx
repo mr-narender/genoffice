@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Editor } from '@tiptap/core'
 import type { Command } from '@tiptap/pm/state'
 import { NodeSelection, TextSelection } from '@tiptap/pm/state'
@@ -7,23 +7,34 @@ import {
   addColumnBefore,
   addRowAfter,
   addRowBefore,
-  deleteColumn,
   deleteRow,
   deleteTable,
   mergeCells,
   splitCell,
 } from '@tiptap/pm/tables'
 import { platformShortcuts } from '@genoffice/i18n'
+import { redactTextBetween, type RedactableNode } from '../ai/redact-view'
+import type { TextboxDisplay } from '@genoffice/docx-engine'
 
 import { useI18n, type StringKey } from '../i18n/locale'
 import { wordRangeAtCaret } from '../editor/comments'
+import {
+  bringForward,
+  bringToFront,
+  sendBackward,
+  sendToBack,
+  setFloatingWrap,
+  shapeWrapOf,
+} from '../editor/floating-z-order'
 import { pasteFromClipboard } from '../editor/paste-actions'
 import { setTableAutoFit } from '../editor/table-properties'
 import { distributeSelectedColumns } from '../editor/table-sizing'
 import {
+  deleteTableColumn,
   distributeRowsEvenly,
   inTableOrSelected,
   selectTablePart,
+  enterSelectedTable,
   setCellAlignment,
   setCellTextDirection,
   splitTableAtSelection,
@@ -34,11 +45,15 @@ import {
 } from '../editor/table-ops'
 import type { TableDialogKind } from './TableDialogs'
 import { IconSparkle } from './icons'
+import { IconCellAlign } from './table-icons'
 import { spellcheckEnabled } from '../spellcheck-pref'
 import { applySpellingSuggestion } from '../editor/spell-replace'
 import { linkRangeAt, linkTarget, removeLink } from '../editor/link-actions'
 import { fieldRangeAt, toggleFieldCodes, type FieldRange } from '../editor/field-codes'
+import { hasRedactionIn } from '../editor/redaction'
 import type { SpellLanguages } from '../../shared/ipc'
+import { TRANSLATE_LANGS, appLangKey } from './translate-langs'
+import type { RevisionRange } from '../editor/revisions'
 
 export { FontDialog } from './FontDialog'
 
@@ -60,6 +75,10 @@ export interface ContextMenuState {
   spell?: { word: string; suggestions: string[] } | null
   /** hyperlink under the pointer as rendered (a TOC line counts: Word treats its entries as links) */
   link?: { href: string; toc?: boolean; tocTitle?: string } | null
+  /** thread of the comment balloon the click landed on */
+  commentId?: string | null
+  /** opened from a margin balloon: `pos` is that item's anchor, not a pointer hit */
+  balloon?: boolean
 }
 
 interface EditorContextMenuProps {
@@ -81,28 +100,39 @@ interface EditorContextMenuProps {
   onChangeListLevel?: (ilvl: number) => void
   /** F9 update fields (shown when the cursor is on an inline field) */
   onUpdateFields?: () => void
+  /** Update Table of Contents (shown when the click landed on a TOC line, Word parity) */
+  onUpdateToc?: () => void
   /** Edit Field…: open the field-code dialog for that field */
   onEditField?: (field: FieldRange) => void
   /** Open Hyperlink: browser for http(s), in-document jump for #bookmark */
   onOpenLink?: (href: string) => void
+  /** Ask for a label, then withhold the selection from the model */
+  onRedact?: () => void
+  /** Stop withholding a selection that already carries the mark, keeping the text */
+  onUnredact?: () => void
   /** Word's table dialogs (Split Cells… / Insert Cells… / Delete Cells… / Table Properties…) */
   onTableDialog?: (kind: TableDialogKind) => void
   /** section content width the AutoFit / Distribute commands fit the grid into */
   sectionContentWidthPx?: number
   /** re-mark existing text after the session dictionary or languages changed */
   onRespell?: () => void
+  /** tracked changes under the pointer; null while protection disables accept/reject */
+  revisions?: {
+    at: RevisionRange[]
+    any: boolean
+    onRange: (action: 'accept' | 'reject', target: RevisionRange) => void
+    onAll: (action: 'accept' | 'reject') => void
+  } | null
+  /** comment thread under the pointer (Word: Reply / Delete / Resolve stay listed, greyed off a comment) */
+  comment?: {
+    id: string | null
+    onReply: (id: string) => void
+    onDelete: (id: string) => void
+    onResolve: (id: string) => void
+  } | null
+  /** Track Changes toggle; null while protection or a forced lock removes the choice */
+  trackChanges?: { on: boolean; onToggle: () => void } | null
 }
-
-/** target languages mirrored from the Review → Translate dropdown; the localized label also goes into the LLM prompt */
-const TRANSLATE_TARGETS: Array<{ labelKey: StringKey }> = [
-  { labelKey: 'appLangEnglish' },
-  { labelKey: 'appLangSimplifiedChinese' },
-  { labelKey: 'appLangJapanese' },
-  { labelKey: 'appLangKorean' },
-  { labelKey: 'appLangFrench' },
-  { labelKey: 'appLangGerman' },
-  { labelKey: 'appLangSpanish' },
-]
 
 const MENU_WIDTH = 240
 
@@ -124,6 +154,36 @@ const CTX_TEXT_DIRECTIONS: Array<[CellTextDirection, StringKey]> = [
   ['btLr', 'ribbonTextDirectionRotate270'],
 ]
 
+/** A context-menu submenu that stays inside the window: opened from an item near
+ * the bottom edge it shifts up; one too tall for the whole window anchors to the
+ * top edge and scrolls the rest (the Translate menu's twenty languages were
+ * unreachable on a laptop). */
+function CtxSubmenu({ children }: { children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [fit, setFit] = useState<{ top: number; maxHeight?: number } | null>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const limit = window.innerHeight - 8
+    if (rect.bottom <= limit) return
+    // current top sits at -5px inside the item wrap: viewport top = rect.top
+    const shifted = limit - rect.height - rect.top - 5
+    const raised = 3 - rect.top // do not rise above the window's top margin
+    if (shifted >= raised) setFit({ top: shifted })
+    else setFit({ top: raised, maxHeight: limit - 8 })
+  }, [])
+  return (
+    <div
+      ref={ref}
+      className="ctx-submenu ctx-submenu-scroll"
+      style={fit ? { top: fit.top, maxHeight: fit.maxHeight } : undefined}
+    >
+      {children}
+    </div>
+  )
+}
+
 export function EditorContextMenu({
   editor,
   menu,
@@ -141,11 +201,17 @@ export function EditorContextMenu({
   onAdjustListIndents,
   onChangeListLevel,
   onUpdateFields,
+  onUpdateToc,
   onEditField,
   onOpenLink,
+  onRedact,
+  onUnredact,
   onTableDialog,
   sectionContentWidthPx = 624,
   onRespell,
+  revisions,
+  comment,
+  trackChanges,
 }: EditorContextMenuProps) {
   const { t, lang } = useI18n()
   const ref = useRef<HTMLDivElement>(null)
@@ -225,7 +291,15 @@ export function EditorContextMenu({
   const field = fieldRangeAt(editor.state, clickPos)
   const canComment = hasSelection || wordRangeAtCaret(editor) !== null
   const canEdit = editor.isEditable
-  const selectedText = hasSelection ? editor.state.doc.textBetween(from, to, ' ').trim() : ''
+  // Whether stopping the withholding is an option here. Decided from the live
+  // selection rather than from a list kept alongside the document, so it cannot
+  // drift from the marks the editor is actually carrying. A bare caret answers
+  // false on its own, so no selection test is needed here either.
+  const isRedactedSelection = hasRedactionIn(editor, from, to)
+  // the presets quote the selection back to the model, so it reads the projection
+  const selectedText = hasSelection
+    ? redactTextBetween(editor.getJSON() as RedactableNode, from, to, ' ').trim()
+    : ''
   // Synonyms targets a word / short phrase, not long selections
   const synonymText = selectedText.length > 0 && selectedText.length <= 20 ? selectedText : ''
 
@@ -284,52 +358,39 @@ export function EditorContextMenu({
     enterFirstCell()
     command(editor.state, editor.view.dispatch)
   }
+  /** per-cell formatting: a whole-table selection means every cell, not the first one */
+  const runTableCells = (command: Command) => {
+    editor.view.focus()
+    enterSelectedTable(editor.state, editor.view.dispatch)
+    command(editor.state, editor.view.dispatch)
+  }
 
-  const protAttrs = editor.getAttributes('docProtected')
+  // only the object itself (right-click selects it as a node): a text range
+  // that merely spans a picture keeps the text menu
+  const protAttrs =
+    editor.state.selection instanceof NodeSelection &&
+    editor.state.selection.node.type.name === 'docProtected'
+      ? editor.state.selection.node.attrs
+      : null
   const isImage = protAttrs?.blockType === 'image'
   const isFloating =
     isImage ||
     (Array.isArray(protAttrs?.textboxes) && (protAttrs.textboxes as unknown[]).length > 0)
-  const currentWrap = (protAttrs?.imageWrap as string | null) ?? null
-  const setWrap = (wrap: string | null) => {
-    const clearedPosition =
-      wrap === null
-        ? { imagePosH: null, imagePosV: null, imageOffsetXEmu: null, imageOffsetYEmu: null }
-        : {}
-    editor
-      .chain()
-      .focus()
-      .updateAttributes('docProtected', { imageWrap: wrap, ...clearedPosition })
-      .run()
-  }
-  // Stacking order among overlapping floating pictures. z-order only has a
-  // visible effect on floating (front/behind) images, so the menu enables it
-  // there; a bring-forward on an inline image also floats it (Word parity).
-  const currentZOrder = Number((protAttrs?.imageZOrder as number | null) ?? 0)
-  const isFloatingWrap = currentWrap === 'front' || currentWrap === 'behind'
-  const setZOrder = (z: number) => {
-    const attrs: Record<string, unknown> = { imageZOrder: z }
-    // an inline image has no paint order; floating it (in front) makes the
-    // reorder meaningful, matching Word's "Bring to Front" on an inline picture
-    if (!isFloatingWrap) attrs.imageWrap = 'front'
-    editor.chain().focus().updateAttributes('docProtected', attrs).run()
-  }
-  /** z-order of every floating anchor in the document (Word's to-front/to-back are document-global) */
-  const floatingZOrders = (): number[] => {
-    const zs: number[] = [currentZOrder]
-    editor.state.doc.descendants((n) => {
-      if (
-        n.type.name === 'docProtected' &&
-        (n.attrs.imageWrap === 'front' || n.attrs.imageWrap === 'behind')
-      )
-        zs.push(Number(n.attrs.imageZOrder ?? 0))
-    })
-    return zs
-  }
-  const bringToFront = () => setZOrder(Math.max(...floatingZOrders()) + 1)
-  const sendToBack = () => setZOrder(Math.min(...floatingZOrders()) - 1)
-  const bringForward = () => setZOrder(currentZOrder + 1)
-  const sendBackward = () => setZOrder(currentZOrder - 1)
+  const boxes = protAttrs?.textboxes as TextboxDisplay[] | undefined
+  // a run picture (in line or floating) wraps through its own node
+  const runPicture =
+    editor.state.selection instanceof NodeSelection &&
+    editor.state.selection.node.type.name === 'docInlineImage' &&
+    !editor.state.selection.node.attrs.rule
+      ? editor.state.selection.node
+      : null
+  // Word's picture menu: clipboard, the picture, wrap / arrange, link, comment
+  const onPicture = !!menu.imageSrc || !!runPicture || isImage
+  const currentWrap = runPicture
+    ? ((runPicture.attrs.wrap as string | null) ?? null)
+    : boxes?.length
+      ? shapeWrapOf(boxes[0])
+      : ((protAttrs?.imageWrap as string | null) ?? null)
 
   const clipboard = (action: 'cut' | 'copy') => {
     editor.commands.focus()
@@ -390,7 +451,7 @@ export function EditorContextMenu({
             <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
               {item(t('appSpellLanguage'), { submenuKey: 'spellLang' })}
               {submenu === 'spellLang' && (
-                <div className="ctx-submenu ctx-submenu-scroll">
+                <CtxSubmenu>
                   {spellLangOrder.map((code) => (
                     <button key={code} className="ctx-item" onClick={() => toggleLanguage(code)}>
                       <span className="ctx-label">
@@ -399,17 +460,10 @@ export function EditorContextMenu({
                       </span>
                     </button>
                   ))}
-                </div>
+                </CtxSubmenu>
               )}
             </div>
           )}
-          <div className="ctx-sep" />
-        </>
-      )}
-      {menu.imageSrc && (
-        <>
-          {item(t('appViewImage'), { onClick: run(() => onViewImage(menu.imageSrc!)) })}
-          {item(t('appSaveImageAs'), { onClick: run(() => onSaveImageAs(menu.imageSrc!)) })}
           <div className="ctx-sep" />
         </>
       )}
@@ -428,20 +482,41 @@ export function EditorContextMenu({
         disabled: !canEdit,
         onClick: run(() => void pasteFromClipboard(editor)),
       })}
-      {item(t('appPastePlain'), {
-        disabled: !canEdit,
-        onClick: run(() => void pasteFromClipboard(editor, 'text')),
-      })}
-      <div className="ctx-sep" />
-      {item(t('appFontMenu'), { key: '⌘D', onClick: run(onFontDialog) })}
-      {item(t('appParagraphMenu'), { key: '⌥⌘M', onClick: run(onParagraphDialog) })}
-      {inTable && (
+      {!onPicture &&
+        item(t('appPastePlain'), {
+          disabled: !canEdit,
+          onClick: run(() => void pasteFromClipboard(editor, 'text')),
+        })}
+      {menu.imageSrc && (
+        <>
+          <div className="ctx-sep" />
+          {item(t('appViewImage'), { onClick: run(() => onViewImage(menu.imageSrc!)) })}
+          {item(t('appSaveImageAs'), { onClick: run(() => onSaveImageAs(menu.imageSrc!)) })}
+        </>
+      )}
+      {!onPicture && (
+        <>
+          <div className="ctx-sep" />
+          {item(t('appFontMenu'), { key: '⌘D', onClick: run(onFontDialog) })}
+          {item(t('appParagraphMenu'), { key: '⌥⌘M', onClick: run(onParagraphDialog) })}
+          {menu.link?.toc && onUpdateToc && (
+            <>
+              <div className="ctx-sep" />
+              {item(t('ribbonTocUpdate'), {
+                disabled: !canEdit,
+                onClick: run(() => onUpdateToc()),
+              })}
+            </>
+          )}
+        </>
+      )}
+      {inTable && !onPicture && (
         <>
           <div className="ctx-sep" />
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonInsert'), { submenuKey: 'tableInsert', disabled: !canEdit })}
             {submenu === 'tableInsert' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {(
                   [
                     ['ribbonInsertAbove', addRowBefore],
@@ -463,17 +538,17 @@ export function EditorContextMenu({
                     <span className="ctx-label">{t('ribbonInsertCells')}</span>
                   </button>
                 )}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonTableDeleteMenu'), { submenuKey: 'tableDelete', disabled: !canEdit })}
             {submenu === 'tableDelete' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {(
                   [
                     ['ribbonDeleteRow', deleteRow],
-                    ['ribbonDeleteColumn', deleteColumn],
+                    ['ribbonDeleteColumn', deleteTableColumn],
                     ['ribbonDeleteTable', deleteTable],
                   ] as Array<[StringKey, Command]>
                 ).map(([labelKey, command]) => (
@@ -490,13 +565,13 @@ export function EditorContextMenu({
                     <span className="ctx-label">{t('ribbonDeleteCells')}</span>
                   </button>
                 )}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonSelect'), { submenuKey: 'tableSelect' })}
             {submenu === 'tableSelect' && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {(
                   [
                     ['row', 'ribbonSelectRow'],
@@ -513,7 +588,7 @@ export function EditorContextMenu({
                     <span className="ctx-label">{t(labelKey)}</span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           {item(t('ribbonMergeCells'), {
@@ -535,7 +610,7 @@ export function EditorContextMenu({
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonDistribute'), { submenuKey: 'tableDistribute', disabled: !canEdit })}
             {submenu === 'tableDistribute' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 <button
                   className="ctx-item"
                   onClick={run(() => {
@@ -551,45 +626,48 @@ export function EditorContextMenu({
                 >
                   <span className="ctx-label">{t('ribbonDistributeColumns')}</span>
                 </button>
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonCellAlignment'), { submenuKey: 'tableAlign', disabled: !canEdit })}
             {submenu === 'tableAlign' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {CTX_CELL_ALIGN.map(([v, h, labelKey]) => (
                   <button
                     key={`${v}-${h}`}
                     className="ctx-item"
-                    onClick={run(() => runTable(setCellAlignment(v, h)))}
+                    onClick={run(() => runTableCells(setCellAlignment(v, h)))}
                   >
+                    <span className="ctx-ico">
+                      <IconCellAlign v={v} h={h} size={14} />
+                    </span>
                     <span className="ctx-label">{t(labelKey)}</span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonTextDirection'), { submenuKey: 'tableTextDir', disabled: !canEdit })}
             {submenu === 'tableTextDir' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {CTX_TEXT_DIRECTIONS.map(([dir, labelKey]) => (
                   <button
                     key={dir}
                     className="ctx-item"
-                    onClick={run(() => runTable(setCellTextDirection(dir)))}
+                    onClick={run(() => runTableCells(setCellTextDirection(dir)))}
                   >
                     <span className="ctx-label">{t(labelKey)}</span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('ribbonAutoFit'), { submenuKey: 'tableAutoFit', disabled: !canEdit })}
             {submenu === 'tableAutoFit' && canEdit && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {(
                   [
                     ['contents', 'ribbonAutoFitContents'],
@@ -605,7 +683,7 @@ export function EditorContextMenu({
                     <span className="ctx-label">{t(labelKey)}</span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
           {onTableDialog &&
@@ -618,7 +696,7 @@ export function EditorContextMenu({
             })}
         </>
       )}
-      {(field || editor.isActive('instrField')) && onUpdateFields && (
+      {!onPicture && (field || editor.isActive('instrField')) && onUpdateFields && (
         <>
           <div className="ctx-sep" />
           {item(t('appUpdateField'), { key: 'F9', onClick: run(() => onUpdateFields()) })}
@@ -635,96 +713,130 @@ export function EditorContextMenu({
           )}
         </>
       )}
-      {editor.isActive('docListItem') && !!editor.getAttributes('docListItem').numId && (
+      {!onPicture &&
+        editor.isActive('docListItem') &&
+        !!editor.getAttributes('docListItem').numId && (
+          <>
+            <div className="ctx-sep" />
+            {item(t('appRestartNumbering'), {
+              disabled: !onRestartNumbering,
+              onClick: run(() => onRestartNumbering?.()),
+            })}
+            {item(t('appContinueNumbering'), {
+              disabled: !onContinueNumbering,
+              onClick: run(() => onContinueNumbering?.()),
+            })}
+            {item(t('appSetNumberingValue'), {
+              disabled: !onSetNumberingValue || !canEdit,
+              onClick: run(() => onSetNumberingValue?.()),
+            })}
+            {item(t('appAdjustListIndents'), {
+              disabled: !onAdjustListIndents || !canEdit,
+              onClick: run(() => onAdjustListIndents?.()),
+            })}
+            <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
+              {item(t('appChangeListLevel'), {
+                disabled: !onChangeListLevel || !canEdit,
+                submenuKey: 'listLevel',
+              })}
+              {submenu === 'listLevel' && onChangeListLevel && canEdit && (
+                <CtxSubmenu>
+                  {Array.from({ length: 9 }, (_, i) => (
+                    <button
+                      key={i}
+                      className="ctx-item"
+                      aria-current={
+                        (Number(editor.getAttributes('docListItem').ilvl) || 0) === i
+                          ? 'true'
+                          : undefined
+                      }
+                      onClick={run(() => onChangeListLevel(i))}
+                    >
+                      <span className="ctx-label" style={{ paddingLeft: i * 8 }}>
+                        {t('appParaOutlineLevelN', { n: String(i + 1) })}
+                      </span>
+                    </button>
+                  ))}
+                </CtxSubmenu>
+              )}
+            </div>
+          </>
+        )}
+      {!onPicture && (
         <>
           <div className="ctx-sep" />
-          {item(t('appRestartNumbering'), {
-            disabled: !onRestartNumbering,
-            onClick: run(() => onRestartNumbering?.()),
-          })}
-          {item(t('appContinueNumbering'), {
-            disabled: !onContinueNumbering,
-            onClick: run(() => onContinueNumbering?.()),
-          })}
-          {item(t('appSetNumberingValue'), {
-            disabled: !onSetNumberingValue || !canEdit,
-            onClick: run(() => onSetNumberingValue?.()),
-          })}
-          {item(t('appAdjustListIndents'), {
-            disabled: !onAdjustListIndents || !canEdit,
-            onClick: run(() => onAdjustListIndents?.()),
+          {item(t('appSynonyms'), {
+            disabled: !synonymText,
+            ai: true,
+            onClick: run(() => onAiPreset(t('appSynonymsPrompt', { text: synonymText }))),
           })}
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
-            {item(t('appChangeListLevel'), {
-              disabled: !onChangeListLevel || !canEdit,
-              submenuKey: 'listLevel',
+            {item(t('appTranslate'), {
+              disabled: !hasSelection,
+              submenuKey: 'translate',
+              ai: true,
             })}
-            {submenu === 'listLevel' && onChangeListLevel && canEdit && (
-              <div className="ctx-submenu">
-                {Array.from({ length: 9 }, (_, i) => (
+            {submenu === 'translate' && hasSelection && (
+              <CtxSubmenu>
+                {TRANSLATE_LANGS.map(({ code }) => (
                   <button
-                    key={i}
+                    key={code}
                     className="ctx-item"
-                    aria-current={
-                      (Number(editor.getAttributes('docListItem').ilvl) || 0) === i
-                        ? 'true'
-                        : undefined
-                    }
-                    onClick={run(() => onChangeListLevel(i))}
+                    onClick={run(() =>
+                      onAiPreset(
+                        t('appTranslateSelectionPrompt', {
+                          lang: t(appLangKey(code)),
+                          text: selectedText,
+                        }),
+                      ),
+                    )}
                   >
-                    <span className="ctx-label" style={{ paddingLeft: i * 8 }}>
-                      {t('appParaOutlineLevelN', { n: String(i + 1) })}
+                    <span className="ctx-label">
+                      {t('appTranslateTo', { lang: t(appLangKey(code)) })}
                     </span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
+          {/* Withholding a span. No AI badge: the item spends the words rather
+          than using the model, and the badge would read "Uses AI".
+          Text only, deliberately. A picture alone in a paragraph is a *block*
+          node (docProtected), which takes no marks at all, and a picture
+          beside text is an inline atom whose mark is dropped by the docx save
+          (convert.ts reads the run's node attrs, never the node's marks) — so
+          offering it for a picture would hide it for one session and then lose
+          the decision on the next save, with nothing to tell the reader. */}
+          {onRedact &&
+            item(t('redactMenuLabel'), {
+              disabled: !canEdit || !hasSelection,
+              onClick: run(onRedact),
+            })}
+          {/* The other half of the item above, and its mirror: offered only when the
+          selection really carries the mark. Without this the sole way to stop
+          withholding a span was to delete the words, which loses the reader's
+          own text to undo a decision they made in the editor. Same reason as
+          the item beside it for no AI badge — this one only moves a mark. */}
+          {onUnredact &&
+            isRedactedSelection &&
+            item(t('redactShowLabel'), {
+              disabled: !canEdit,
+              onClick: run(onUnredact),
+            })}
         </>
       )}
-      <div className="ctx-sep" />
-      {item(t('appSynonyms'), {
-        disabled: !synonymText,
-        ai: true,
-        onClick: run(() => onAiPreset(t('appSynonymsPrompt', { text: synonymText }))),
-      })}
-      <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
-        {item(t('appTranslate'), { disabled: !hasSelection, submenuKey: 'translate', ai: true })}
-        {submenu === 'translate' && hasSelection && (
-          <div className="ctx-submenu">
-            {TRANSLATE_TARGETS.map((target) => (
-              <button
-                key={target.labelKey}
-                className="ctx-item"
-                onClick={run(() =>
-                  onAiPreset(
-                    t('appTranslateSelectionPrompt', {
-                      lang: t(target.labelKey),
-                      text: selectedText,
-                    }),
-                  ),
-                )}
-              >
-                <span className="ctx-label">
-                  {t('appTranslateTo', { lang: t(target.labelKey) })}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-      {isFloating && (
+      {(isFloating || runPicture) && (
         <>
           <div className="ctx-sep" />
           <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
             {item(t('appWrapTextMenu'), { submenuKey: 'wrap' })}
             {submenu === 'wrap' && (
-              <div className="ctx-submenu">
+              <CtxSubmenu>
                 {WRAP_OPTIONS.map((opt) => (
                   <button
                     key={String(opt.value)}
                     className="ctx-item"
-                    onClick={run(() => setWrap(opt.value))}
+                    onClick={run(() => setFloatingWrap(editor, opt.value))}
                   >
                     <span className="ctx-label">
                       {currentWrap === opt.value ? '✓ ' : ''}
@@ -732,28 +844,31 @@ export function EditorContextMenu({
                     </span>
                   </button>
                 ))}
-              </div>
+              </CtxSubmenu>
             )}
           </div>
-          <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
-            {item(t('appArrangeMenu'), { submenuKey: 'arrange' })}
-            {submenu === 'arrange' && (
-              <div className="ctx-submenu">
-                <button className="ctx-item" onClick={run(bringToFront)}>
-                  <span className="ctx-label">{t('appBringToFront')}</span>
-                </button>
-                <button className="ctx-item" onClick={run(bringForward)}>
-                  <span className="ctx-label">{t('appBringForward')}</span>
-                </button>
-                <button className="ctx-item" onClick={run(sendBackward)}>
-                  <span className="ctx-label">{t('appSendBackward')}</span>
-                </button>
-                <button className="ctx-item" onClick={run(sendToBack)}>
-                  <span className="ctx-label">{t('appSendToBack')}</span>
-                </button>
-              </div>
-            )}
-          </div>
+          {/* stacking ranks live on block anchors and shapes, not on run pictures */}
+          {isFloating && (
+            <div className="ctx-item-wrap" onMouseLeave={() => setSubmenu(null)}>
+              {item(t('appArrangeMenu'), { submenuKey: 'arrange' })}
+              {submenu === 'arrange' && (
+                <CtxSubmenu>
+                  <button className="ctx-item" onClick={run(() => bringToFront(editor))}>
+                    <span className="ctx-label">{t('appBringToFront')}</span>
+                  </button>
+                  <button className="ctx-item" onClick={run(() => bringForward(editor))}>
+                    <span className="ctx-label">{t('appBringForward')}</span>
+                  </button>
+                  <button className="ctx-item" onClick={run(() => sendBackward(editor))}>
+                    <span className="ctx-label">{t('appSendBackward')}</span>
+                  </button>
+                  <button className="ctx-item" onClick={run(() => sendToBack(editor))}>
+                    <span className="ctx-label">{t('appSendToBack')}</span>
+                  </button>
+                </CtxSubmenu>
+              )}
+            </div>
+          )}
         </>
       )}
       <div className="ctx-sep" />
@@ -774,6 +889,49 @@ export function EditorContextMenu({
         item(t('appHyperlinkMenu'), { key: '⌘K', disabled: !canEdit, onClick: run(onLink) })
       )}
       {item(t('appNewComment'), { disabled: !canComment, onClick: run(onNewComment) })}
+      {comment && !onPicture && (
+        <>
+          <div className="ctx-sep" />
+          {item(t('appCtxReplyComment'), {
+            disabled: !comment.id,
+            onClick: run(() => comment.id && comment.onReply(comment.id)),
+          })}
+          {item(t('appCtxDeleteComment'), {
+            disabled: !comment.id,
+            onClick: run(() => comment.id && comment.onDelete(comment.id)),
+          })}
+          {item(t('appCtxResolveComment'), {
+            disabled: !comment.id,
+            onClick: run(() => comment.id && comment.onResolve(comment.id)),
+          })}
+        </>
+      )}
+      {!onPicture && (revisions?.any || trackChanges) && (
+        <>
+          <div className="ctx-sep" />
+          {revisions && revisions.at.length > 0 && (
+            <>
+              {item(t('appCtxAcceptChange'), {
+                onClick: run(() => revisions.onRange('accept', revisions.at[0])),
+              })}
+              {item(t('appCtxRejectChange'), {
+                onClick: run(() => revisions.onRange('reject', revisions.at[0])),
+              })}
+            </>
+          )}
+          {revisions?.any && (
+            <>
+              {item(t('ribbonAcceptAll'), { onClick: run(() => revisions.onAll('accept')) })}
+              {item(t('ribbonRejectAll'), { onClick: run(() => revisions.onAll('reject')) })}
+            </>
+          )}
+          {trackChanges &&
+            item(`${trackChanges.on ? '✓ ' : ''}${t('ribbonTrackChanges')}`, {
+              key: '⇧⌘E',
+              onClick: run(trackChanges.onToggle),
+            })}
+        </>
+      )}
     </div>
   )
 }

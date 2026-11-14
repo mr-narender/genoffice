@@ -1,20 +1,34 @@
-import { aiPanelWidthAtPointer, AiPanelSideButton } from '@genoffice/ui'
+import {
+  aiPanelWidthAtPointer,
+  AiPanelSideButton,
+  AiModelPicker,
+  type AiModelPickerBridge,
+  AiSkillChips,
+  AiSkillsMenu,
+  useImeEnterGuard,
+} from '@genoffice/ui'
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import {
   AgentLoop,
   composeSkills,
+  withAttachedSkills,
   IPC_STREAM_SILENCE_TIMEOUT_MS,
   type AgentImage,
   type ToolDisplay,
 } from '@genoffice/agent-core'
 import type { RenderSlide } from '@genoffice/pptx-render'
-import {
-  cloudToolsEnabled,
-  imageGenerationAvailable,
-  mediaAnalysisAvailable,
-} from '@genoffice/ai-provider/browser'
+import { imageGenerationAvailable, mediaAnalysisAvailable } from '@genoffice/ai-provider/browser'
 import type { AiSettings, AttachmentAddResult, AttachmentMeta } from '../../shared/ipc'
 import { ATTACHMENT_IMAGE_EXTS } from '../../shared/ipc'
+import {
+  AI_PANEL_WIDTH_DEFAULT,
+  AttachmentCardIcon,
+  clampAiPanelWidth,
+  fileImageIcon,
+  formatAttachmentSize,
+  SentAttachments,
+  truncateCardName,
+} from '@genoffice/ui'
 import {
   createSlidesSkill,
   type DeckAccess,
@@ -38,26 +52,29 @@ import {
   isQcEnabled,
   isUnsupportedImageInputError,
   mergeQcPages,
+  NO_SCREENSHOT_NOTE,
   qcSlidePage,
   QC_MAX_PAGES,
+  screenshotAllowed,
   settingsSupportVision,
 } from './slide-qc'
 import { useI18n, t as tGlobal, aiLangDirective, type TFunc } from '../i18n/locale'
-import { AiScopeQuote, Markdown, useAiPanelPrefs, type AiScopeQuoteData } from '@genoffice/ui'
+import {
+  AiQueueStrip,
+  AI_QUEUE_LABELS,
+  AiScopeQuote,
+  AiUsageChip,
+  Markdown,
+  addTokenUsage,
+  useAiPanelPrefs,
+  useChatRunQueue,
+  type AiScopeQuoteData,
+  type AiTokenUsageView,
+} from '@genoffice/ui'
 import { GensparkMark } from '../components/icons'
 import sendEnterOn from '../assets/send-enter-on.png'
 import sendEnterOff from '../assets/send-enter-off.png'
 import sendStop from '../assets/send-stop.png'
-import attachIcon from '../assets/attach-icon.png'
-import filePdfIcon from '../assets/file-pdf.png'
-import fileWordIcon from '../assets/file-word.png'
-import fileExcelIcon from '../assets/file-excel.png'
-import filePptIcon from '../assets/file-ppt.png'
-import fileImageIcon from '../assets/file-image.png'
-import fileVideoIcon from '../assets/file-video.png'
-import fileVoiceIcon from '../assets/file-voice.png'
-import fileDocumentIcon from '../assets/file-document.png'
-import fileGeneralIcon from '../assets/file-general.png'
 import { IconNewChat, IconSidebarCollapseLeft } from '../components/icons'
 
 interface ToolActivity {
@@ -88,121 +105,6 @@ const PASTE_MIME_EXT: Record<string, string> = {
 
 /** File-type icons for attachment cards (Genspark attachment icon set); exts the
  *  attachment allowlist doesn't accept yet are mapped ahead so they light up when added */
-const ATTACHMENT_CARD_ICON_GROUPS: [icon: string, exts: string[]][] = [
-  [fileWordIcon, ['doc', 'docx']],
-  [fileExcelIcon, ['xls', 'xlsx', 'xlsm', 'csv', 'tsv']],
-  [filePptIcon, ['ppt', 'pptx']],
-  [filePdfIcon, ['pdf']],
-  [fileImageIcon, ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'heic']],
-  [fileVideoIcon, ['mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v']],
-  [fileVoiceIcon, ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus']],
-  [
-    fileDocumentIcon,
-    [
-      'txt',
-      'md',
-      'markdown',
-      'rtf',
-      'log',
-      'json',
-      'yaml',
-      'yml',
-      'xml',
-      'html',
-      'htm',
-      'js',
-      'ts',
-      'tsx',
-      'jsx',
-      'py',
-      'java',
-      'c',
-      'h',
-      'cpp',
-      'go',
-      'rs',
-      'rb',
-      'sh',
-      'sql',
-      'css',
-    ],
-  ],
-]
-
-const ATTACHMENT_CARD_ICONS: Record<string, string> = Object.fromEntries(
-  ATTACHMENT_CARD_ICON_GROUPS.flatMap(([icon, exts]) => exts.map((ext) => [ext, icon])),
-)
-
-function AttachmentCardIcon({ ext }: { ext: string }) {
-  return <img src={ATTACHMENT_CARD_ICONS[ext] ?? fileGeneralIcon} alt="" aria-hidden />
-}
-
-/** Card name slot width: 190 card - 2 border - 8/14 padding - 40 icon - 10 gap */
-const CARD_NAME_MAX_WIDTH = 116
-let cardNameCtx: CanvasRenderingContext2D | null = null
-
-/** Ellipsize like the design: cut at the limit, strip trailing -_./spaces so
- *  punctuation never sits against the …; CSS text-overflow stays as fallback */
-function truncateCardName(name: string): string {
-  cardNameCtx ??= document.createElement('canvas').getContext('2d')
-  if (!cardNameCtx) return name
-  // must match the stack the card name actually renders with (body font in styles.css)
-  cardNameCtx.font =
-    "500 13px 'Segoe UI', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif"
-  if (cardNameCtx.measureText(name).width <= CARD_NAME_MAX_WIDTH) return name
-  let lo = 1
-  let hi = name.length
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1
-    if (cardNameCtx.measureText(`${name.slice(0, mid)}…`).width <= CARD_NAME_MAX_WIDTH) lo = mid
-    else hi = mid - 1
-  }
-  return `${name.slice(0, lo).replace(/[-_.\s]+$/, '')}…`
-}
-
-/** Read-only echo of the attachments a user message consumed from the composer
- *  (image previews when the file is still readable; otherwise the placeholder icon) */
-function SentAttachments({
-  atts,
-  previews,
-}: {
-  atts: AttachmentMeta[]
-  previews: Record<string, string>
-}) {
-  return (
-    <div className="ai-msg-attachments">
-      {atts.map((a) =>
-        ATTACHMENT_IMAGE_EXTS.has(a.ext) ? (
-          <span key={a.path} className="ai-attachment-thumb" title={a.name}>
-            {previews[a.path] ? (
-              <img src={previews[a.path]} alt={a.name} />
-            ) : (
-              <span className="ai-attachment-thumb-pending" aria-hidden>
-                <img src={fileImageIcon} alt="" />
-              </span>
-            )}
-          </span>
-        ) : (
-          <span key={a.path} className="ai-attachment-card" title={a.name}>
-            <span className="ai-attachment-card-icon">
-              <AttachmentCardIcon ext={a.ext} />
-            </span>
-            <span className="ai-attachment-card-meta">
-              <span className="ai-attachment-card-name">{truncateCardName(a.name)}</span>
-              <span className="ai-attachment-card-size">{formatAttachmentSize(a.sizeBytes)}</span>
-            </span>
-          </span>
-        ),
-      )}
-    </div>
-  )
-}
-
-function formatAttachmentSize(bytes: number): string {
-  return bytes >= 1024 * 1024
-    ? `${(bytes / (1024 * 1024)).toFixed(2)} MB`
-    : `${(bytes / 1024).toFixed(2)} KB`
-}
 
 /** Cap on tool args/output persisted to the transcript (the store layer has another 16k truncation fallback) */
 const PERSIST_TOOL_FIELD_MAX = 16_000
@@ -231,8 +133,12 @@ interface ChatEntry {
   snapshotId?: number
   /** attachments consumed from the composer by this user message (read-only echo chips) */
   attachments?: AttachmentMeta[]
+  /** skills the user attached to this message from the composer menu */
+  skills?: string[]
   /** the selection this user message targeted, frozen at send */
   scope?: AiScopeQuoteData
+  /** tokens the provider billed for this reply, summed across its turns (absent when unreported) */
+  usage?: AiTokenUsageView
 }
 
 /** Empty deck → generation starters; deck with content → polish starters */
@@ -267,6 +173,8 @@ interface AiPanelProps {
   } | null
   /** false shows only the collapsed rail; the component stays mounted so panel state survives */
   open?: boolean
+  /** the sidebar setting is off: render nothing while collapsed instead of the rail */
+  hideRail?: boolean
   /** expand from the collapsed rail */
   onExpand?: () => void
   onCollapse?: () => void
@@ -334,20 +242,17 @@ function AiTypingIndicator({ label }: { readonly label: string }) {
   )
 }
 
-/** Resizable panel width: always opens at the default (drag-resize lasts for
- * the session only); min/max match the Excel panel */
-const PANEL_WIDTH_DEFAULT = 360
-const PANEL_WIDTH_MIN = 280
-
-// A persisted width used to be restored here; drop the stale key so old
-// (possibly bug-shrunken) values never come back
+// Resizable panel width: always opens at the default (drag-resize lasts for
+// the session only). A persisted width used to be restored here; the stale
+// key is dropped so old (possibly bug-shrunken) values never come back.
 localStorage.removeItem('slides-ai-panel-width')
 
-function clampPanelWidth(w: number): number {
-  // The viewport can be transiently tiny (a WebContentsView is 0×0 until the
-  // shell lays it out), so never let the ceiling drop below the minimum
-  const max = Math.max(PANEL_WIDTH_MIN, Math.min(720, Math.round(window.innerWidth * 0.6)))
-  return Math.min(Math.max(w, PANEL_WIDTH_MIN), max)
+const MODEL_BRIDGE: AiModelPickerBridge = {
+  getSettings: () => window.slidesApi.getAiSettings(),
+  setSettings: (settings) => window.slidesApi.setAiSettings(settings),
+  onSettingsChanged: (handler) => window.slidesApi.onAiSettingsChanged(handler),
+  gskLoggedIn: () => window.slidesApi.aiGskStatus().then((s) => !!s?.loggedIn),
+  openModelSettings: () => window.slidesApi.openAiModelSettings().catch(() => {}),
 }
 
 export function AiPanel({
@@ -362,6 +267,7 @@ export function AiPanel({
   settings,
   preset,
   open = true,
+  hideRail = false,
   onExpand,
   onCollapse,
   onPathChange,
@@ -383,11 +289,27 @@ export function AiPanel({
   // must honor it like the shared AiComposer does.
   const { spellcheck } = useAiPanelPrefs()
   const [busy, setBusy] = useState(false)
+  /** messages queued while a reply runs; the pump re-runs them through runWith on settle */
+  const msgQueue = useChatRunQueue<{
+    attachments: AttachmentMeta[]
+    scope: AiScopeQuoteData | undefined
+  }>({
+    busy,
+    submit: (text, meta) => {
+      // the QC pass edits the deck with busy=false: refuse and let the pump retry
+      if (qcRunningRef.current || runStartingRef.current) return false
+      const loop = loopRef.current
+      if (!loop || loop.busy) return false
+      runWith(text, text, { attachments: meta.attachments, scope: meta.scope })
+      return true
+    },
+  })
   const [chat, setChat] = useState<ChatEntry[]>([])
   /** Past conversation restored from JSONL (read-only transcript, not fed to the model) */
   const [historicChat, setHistoricChat] = useState<ChatEntry[]>([])
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
   const [attachments, setAttachments] = useState<AttachmentMeta[]>([])
+  const [attachedSkills, setAttachedSkills] = useState<string[]>([])
   const [attachNotice, setAttachNotice] = useState<string | null>(null)
   /** data-URL previews for image attachments, keyed by path (Genspark composer thumbnails) */
   const [attachmentPreviews, setAttachmentPreviews] = useState<Record<string, string>>({})
@@ -451,8 +373,8 @@ export function AiPanel({
   // preferred = the user's chosen width (session only); panelWidth = what fits
   // the current window. Deriving the display width from the preference means a
   // transiently small window never permanently shrinks the panel.
-  const preferredWidthRef = useRef(PANEL_WIDTH_DEFAULT)
-  const [panelWidth, setPanelWidth] = useState(() => clampPanelWidth(preferredWidthRef.current))
+  const preferredWidthRef = useRef(AI_PANEL_WIDTH_DEFAULT)
+  const [panelWidth, setPanelWidth] = useState(() => clampAiPanelWidth(preferredWidthRef.current))
   const asideRef = useRef<HTMLElement>(null)
 
   // The .ai-dock wrapper owns the animated width (Excel-parity 180ms slide);
@@ -467,7 +389,7 @@ export function AiPanel({
   // Re-derive the display width on window resize (max is 60% of the window);
   // growing the window back restores the preferred width
   useEffect(() => {
-    const onResize = () => setPanelWidth(clampPanelWidth(preferredWidthRef.current))
+    const onResize = () => setPanelWidth(clampAiPanelWidth(preferredWidthRef.current))
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
@@ -477,6 +399,7 @@ export function AiPanel({
   >([])
   const logRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const ime = useImeEnterGuard()
   /** Stop following once the user scrolls up; re-attach when near the bottom */
   const stickToBottomRef = useRef(true)
   /** Current chat's projectId/chatId, set after resolve succeeds */
@@ -523,6 +446,8 @@ export function AiPanel({
   }, [])
   const imagesRef = useRef(images)
   imagesRef.current = images
+  const attachedSkillsRef = useRef(attachedSkills)
+  attachedSkillsRef.current = attachedSkills
   const attachmentsRef = useRef(attachments)
   attachmentsRef.current = attachments
   /** attachments consumed by the most recent send — retry resends the same set */
@@ -553,6 +478,10 @@ export function AiPanel({
   >([])
   /** Last streamed text of the current turn: the only copy left when a run dies before onDone */
   const streamedTextRef = useRef('')
+  /** tokens billed so far in the in-flight run (summed across turns) */
+  const runUsageRef = useRef<AiTokenUsageView | undefined>(undefined)
+  /** tokens billed across the panel's session (the composer chip) */
+  const [sessionUsage, setSessionUsage] = useState<AiTokenUsageView | undefined>(undefined)
 
   // ── Chat history persistence ──────────────────────────────────────────────
   /** Resolve chatId and load history on first mount (AiPanel resets by key; no need to watch currentFilePath changes) */
@@ -769,7 +698,7 @@ export function AiPanel({
   if (!loopRef.current) {
     // The three slides generation steps (style/planning/per-page HTML) force the high-quality model (only with the anthropic provider;
     // other providers keep the user setting, avoiding passing nonexistent model names). Chat/fine-tuning still uses the user's configured model.
-    const SLIDES_GEN_MODEL = 'claude-opus-4-7'
+    const SLIDES_GEN_MODEL = 'claude-opus-5-5'
     // Return on demand a settings copy with the generation model overridden (deep copy, doesn't pollute settingsRef).
     const settingsForGen = (): AiSettings => {
       const cur = settingsRef.current
@@ -1008,24 +937,9 @@ export function AiPanel({
           setActiveClarify(questions)
         })
       },
-      isCloudPageGenEnabled: async () => {
-        // Cloud page generation runs on Genspark's own slide model and spends
-        // Genspark credits, so it is gated by the "Genspark cloud tools" toggle
-        // plus the main-process account status only — the chat provider does not
-        // gate it (search/media gate per capability, not per chat provider). A
-        // free-plan or credits-exhausted account is covered by the mid-run
-        // fallback to the local pipeline instead of disabling cloud up front.
-        const cur = settingsRef.current
-        if (!cloudToolsEnabled(cur)) return false
-        try {
-          return !!(await window.slidesApi.cloudGenStatus())?.enabled
-        } catch {
-          return false
-        }
-      },
-      // Local single-page generation (no gsk needed, e.g. BYOK): one LLM request through the
-      // app's own AI transport writes a structured JSON slide spec, and the main process builds
-      // it directly into a one-slide pptx with pptx-engine primitives — no HTML intermediate.
+      // Single-page generation: one LLM request through the app's own AI transport writes a
+      // structured JSON slide spec, and the main process builds it directly into a one-slide
+      // pptx with pptx-engine primitives.
       generatePageLocal: async (args) => {
         const W = args.canvasW
         const H = args.canvasH
@@ -1052,6 +966,8 @@ export function AiPanel({
           '\n' +
           '## Visuals and assets\n' +
           '- Photos may only use URLs from the "available images" list, at most as many image elements as URLs. With no available images, fill with typography/color blocks/shapes — never fake photos.\n' +
+          "- Use a photo only when it genuinely matches this page's content and improves it — an irrelevant or generic stock photo is worse than none. When in doubt, skip the image and compose with typography/color blocks/shapes instead.\n" +
+          '- At most 3 image elements on one page; one strong, relevant image beats several weak ones.\n' +
           '- Icon-like decoration uses the allowed shapes only (at most 4-5 per page, strongly content-related). **Never use emoji**.\n' +
           '- Data visuals: compose bars/rings/timelines from rect/donut/line shapes with sizes proportional to the real values from the brief.\n' +
           '- Solid colors only (alpha allowed) — no gradients. **No placeholders of any kind**: all copy comes from the brief’s real content.\n' +
@@ -1067,12 +983,13 @@ export function AiPanel({
         const ctxBlock = args.context
           ? `\n\nReference material (all real names/figures/facts come from here; do not invent):\n${args.context.slice(0, 4000)}`
           : ''
+        const skeletonBlock = args.skeleton ? `\n\n${args.skeleton}` : ''
         const userMsg =
           `This is the deck's unified style (this page must follow it strictly to stay consistent across pages):\n${args.style}\n\n` +
           (args.topic ? `Deck topic: ${args.topic}\n` : '') +
           `Deck-wide narrative Core Hook: ${args.coreHook}\n\n` +
           `Now design page ${args.pageIndex}/${args.totalPages}.\n` +
-          `Title: ${args.title}\nLayout: ${args.layout}\nContent brief (use real data/facts): ${args.brief}${imgBlock}${ctxBlock}\n\n` +
+          `Title: ${args.title}\nLayout: ${args.layout}\nContent brief (use real data/facts): ${args.brief}${imgBlock}${ctxBlock}${skeletonBlock}\n\n` +
           "Return only this page's spec JSON."
         // One repair round: feed the exact validation error back so the model can fix its JSON
         let lastErr = ''
@@ -1097,35 +1014,6 @@ export function AiPanel({
           }
         }
         return { ok: false, error: lastErr || tGlobal('aiErrUnknown') }
-      },
-      // Cloud single-page generation (gsk slide_generate): the cloud service owns HTML writing +
-      // pptx conversion; the deck-level style/outline stay local.
-      generatePageCloud: async (args) => {
-        try {
-          const briefParts = [args.brief]
-          if (args.layout) briefParts.push(`Layout intent: ${args.layout}`)
-          if (args.context)
-            briefParts.push(
-              `Reference material (all real names/figures/facts come from here; do not invent):\n${args.context.slice(0, 4000)}`,
-            )
-          const res = await window.slidesApi.cloudGeneratePage({
-            brief: briefParts.join('\n\n'),
-            title: args.title,
-            styleSkill: args.style,
-            deckContext: {
-              ...(args.topic ? { topic: args.topic } : {}),
-              core_hook: args.coreHook,
-              page_index: args.pageIndex,
-              total_pages: args.totalPages,
-            },
-            images: args.images.map((u) => ({ url: u })),
-            width: args.canvasW,
-            height: args.canvasH,
-          })
-          return res ?? { ok: false, error: tGlobal('aiErrUnknown') }
-        } catch (e) {
-          return { ok: false, error: e instanceof Error ? e.message : String(e) }
-        }
       },
       // ── In-tool planning: given topic+page count, the LLM produces a structured outline (batched recursion scheduled by the skill).
       // Fixes "missing pages at the input side" at the root: the main agent doesn't hand-write dozens of pages of pages JSON.
@@ -1406,6 +1294,11 @@ export function AiPanel({
           patchLastAssistant({ streaming: false })
           setChat((prev) => [...prev, { role: 'assistant', text: '', streaming: true }])
         },
+        onUsage: (usage) => {
+          runUsageRef.current = addTokenUsage(runUsageRef.current, usage)
+          setSessionUsage((prev) => addTokenUsage(prev, usage))
+          patchLastAssistant({ usage: runUsageRef.current })
+        },
         onDone: ({ text, cancelled, turnLimit, truncated }) => {
           const baseText = turnLimit
             ? [text, tGlobal('aiTurnLimit')].filter(Boolean).join('\n\n')
@@ -1470,11 +1363,14 @@ export function AiPanel({
             return next
           })
           // Signed-out failures get an inline sign-in button; detected via
-          // gsk status rather than matching the localized error text
+          // gsk status rather than matching the localized error text — but only
+          // when Genspark is the provider: a BYOK user's error (e.g. their own
+          // provider's rate limit) must not advertise a Genspark sign-in (genoffice#1948)
           void window.slidesApi
             .aiGskStatus()
             .then((status) => {
               if (status.loggedIn) return
+              if ((settingsRef.current?.provider ?? 'genspark') !== 'genspark') return
               setChat((prev) => {
                 const next = [...prev]
                 const last = next.at(-1)
@@ -1549,7 +1445,32 @@ export function AiPanel({
     // `open` dep: re-measure after expand restores a draft
   }, [input, open])
 
-  const run = () => runWith(input.trim())
+  const run = () => runWith(input.trim(), undefined, { attachSkills: true })
+
+  /** Enter while a reply runs: the draft joins the queue above the composer */
+  const enqueueDraft = () => {
+    const text = input.trim()
+    if (!text) return
+    // snapshot + consume the composer attachments exactly like a send does
+    const attachments = attachmentsRef.current
+    if (attachments.length > 0) {
+      const seen = new Set(sentAttachmentsRef.current.map((a) => a.path))
+      sentAttachmentsRef.current = [
+        ...sentAttachmentsRef.current,
+        ...attachments.filter((a) => !seen.has(a.path)),
+      ]
+      setAttachments([])
+      attachmentsRef.current = []
+    }
+    const scope =
+      selectedRef.current.length > 0
+        ? {
+            label: `${t('aiScopeSlide', { n: current + 1 })} · ${t('aiScopeSelection', { count: selectedRef.current.length })}`,
+          }
+        : undefined
+    msgQueue.enqueue(text, { attachments, scope })
+    setInput('')
+  }
 
   /** Image attachments read as base64, sent multimodally with this user message (≤5MB per image, max 20; isomorphic to docs) */
   const MAX_IMAGES_PER_MESSAGE = 20
@@ -1580,9 +1501,19 @@ export function AiPanel({
   }
 
   /** Current slide rendered at pixelRatio 1 (vision-friendly size); null when rendering fails */
+  /**
+   * A rendered picture of the slide, when sending one is safe.
+   *
+   * A screenshot is the one outbound path that no text projection can reach:
+   * the renderer tints a withheld run, it does not replace it, so the words are
+   * in the bitmap. There is no mask to put over them — a picture has no spans.
+   * So a slide that withholds anything gets no picture, and the caller says so,
+   * rather than the model receiving an image it was never shown the text of.
+   */
   const captureSlideShot = async (pageIndex: number): Promise<AgentImage | null> => {
     const slide = slidesRef.current[pageIndex]
     if (!slide) return null
+    if (!screenshotAllowed(slide)) return null
     try {
       const [png] = await renderSlidesToPngBase64([slide], imagesRef.current, 1)
       return png ? { base64: png, mime: 'image/png' } : null
@@ -1600,6 +1531,8 @@ export function AiPanel({
       scope?: AiScopeQuoteData
       /** resend of the last message: quote what it quoted */
       retry?: boolean
+      /** only the composer's own send takes the attached skills along */
+      attachSkills?: boolean
     },
   ) => {
     const loop = loopRef.current
@@ -1623,6 +1556,9 @@ export function AiPanel({
       attachmentsRef.current = []
     }
     lastAttachmentsRef.current = sentAtts
+    // skills ride with this one message only: the chips clear like attachments do
+    const sentSkills = opts?.attachSkills ? attachedSkillsRef.current : []
+    if (sentSkills.length > 0) setAttachedSkills([])
     inputEditedSinceRunRef.current = false
     instructionRef.current = instruction
     lastInstructionRef.current = instruction
@@ -1631,6 +1567,7 @@ export function AiPanel({
     runToolsRef.current = []
     streamedTextRef.current = ''
     runSnapshotIdRef.current = null
+    runUsageRef.current = undefined
     stickToBottomRef.current = true
     // Internal orchestration prompts (like generate_deck step notes) skip the chat bubble and go only to the model
     const shown = displayText ?? instruction
@@ -1651,6 +1588,7 @@ export function AiPanel({
         role: 'user',
         text: shown,
         ...(sentAtts.length > 0 ? { attachments: sentAtts } : {}),
+        ...(sentSkills.length > 0 ? { skills: sentSkills } : {}),
         ...(scope ? { scope } : {}),
       },
       { role: 'assistant', text: '', streaming: true },
@@ -1663,12 +1601,16 @@ export function AiPanel({
       .then(async (images) => {
         // AI Beautify sends the current slide's rendering along, so the model sees what it edits;
         // the note rides on the model instruction only — the chat bubble stays the localized preset text
-        let modelInstruction = instruction
+        let modelInstruction = await withSkillBodies(instruction, sentSkills)
         if (opts?.slideShot && settingsSupportVision(settingsRef.current)) {
           const shot = await captureSlideShot(currentRef.current)
           if (shot) {
             images.push(shot)
             modelInstruction += `\n\n(Attached image: the current rendering of this slide, slideIndex ${currentRef.current}. Use it to spot visual issues the element inventory can't show.)`
+          } else {
+            // said rather than omitted: a model told nothing assumes it has the
+            // rendering and reasons about text it cannot see
+            modelInstruction += `\n\n(${NO_SCREENSHOT_NOTE})`
           }
         }
         // Clear the flag before run: loop.run sets running synchronously, leaving no re-entry window
@@ -1682,6 +1624,31 @@ export function AiPanel({
         void finishHistoryBatch().finally(() => setBusy(false))
       })
   }
+
+  /** the attached skills' full text in front of the request; a skill that vanished is skipped */
+  const withSkillBodies = async (instruction: string, names: readonly string[]) => {
+    if (names.length === 0) return instruction
+    const bodies = await Promise.all(
+      names.map(async (name) => {
+        try {
+          return { name, body: await window.slidesApi.skillText(name) }
+        } catch {
+          return null
+        }
+      }),
+    )
+    return withAttachedSkills(
+      instruction,
+      bodies.filter((b): b is { name: string; body: string } => b !== null),
+    )
+  }
+
+  const listSkillsForMenu = async () =>
+    (await window.slidesApi.skillsList()).map(({ name, description }) => ({ name, description }))
+  const toggleSkill = (name: string) =>
+    setAttachedSkills((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name],
+    )
 
   /** One page of a queue submission — runWith's bookkeeping minus the composer and the user bubble */
   const runQueuePage = (instruction: string) =>
@@ -1699,6 +1666,7 @@ export function AiPanel({
       runToolsRef.current = []
       streamedTextRef.current = ''
       runSnapshotIdRef.current = null
+      runUsageRef.current = undefined
       stickToBottomRef.current = true
       setChat((prev) => [
         ...prev.map((e) =>
@@ -1902,6 +1870,7 @@ export function AiPanel({
   }
 
   const cancel = () => {
+    msgQueue.hold()
     dismissClarify()
     qcAbortRef.current?.abort()
     loopRef.current?.cancel()
@@ -1917,6 +1886,7 @@ export function AiPanel({
     })
 
   const newChat = () => {
+    msgQueue.clear()
     dismissClarify()
     qcAbortRef.current?.abort()
     loopRef.current?.reset()
@@ -1932,6 +1902,7 @@ export function AiPanel({
     // Unsent composer attachments would otherwise ride into the next chat's
     // file context (availableAttachments merges sent + live), mirroring docs.
     setAttachments([])
+    setAttachedSkills([])
     setAttachNotice(null)
     sentAttachmentsRef.current = []
     readAttachmentPathsRef.current.clear()
@@ -1999,7 +1970,7 @@ export function AiPanel({
     document.body.style.cursor = 'col-resize'
     document.body.style.userSelect = 'none'
     const onMove = (ev: PointerEvent) => {
-      const w = clampPanelWidth(aiPanelWidthAtPointer(ev.clientX))
+      const w = clampAiPanelWidth(aiPanelWidthAtPointer(ev.clientX))
       preferredWidthRef.current = w
       setPanelWidth(w)
     }
@@ -2027,6 +1998,7 @@ export function AiPanel({
 
   // collapsed: rail only — after all hooks, so the instance and its state survive
   if (!open) {
+    if (hideRail) return null
     return (
       <button
         className="ai-rail"
@@ -2107,6 +2079,9 @@ export function AiPanel({
                 {entry.role === 'user' && entry.attachments && entry.attachments.length > 0 && (
                   <SentAttachments atts={entry.attachments} previews={attachmentPreviews} />
                 )}
+                {entry.role === 'user' && entry.skills && (
+                  <AiSkillChips lang={lang} names={entry.skills} />
+                )}
                 {entry.tools && entry.tools.length > 0 && <ToolChipList tools={entry.tools} />}
                 {entry.text && (
                   <div dir="auto">
@@ -2174,6 +2149,9 @@ export function AiPanel({
               {entry.role === 'user' && entry.attachments && entry.attachments.length > 0 && (
                 <SentAttachments atts={entry.attachments} previews={attachmentPreviews} />
               )}
+              {entry.role === 'user' && entry.skills && (
+                <AiSkillChips lang={lang} names={entry.skills} />
+              )}
               {entry.role === 'assistant' && !entry.text && entry.streaming ? (
                 <span className="ai-typing-row">
                   <AiTypingIndicator
@@ -2188,6 +2166,11 @@ export function AiPanel({
                 <span dir="auto">{entry.text}</span>
               )}
               {entry.tools && entry.tools.length > 0 && <ToolChipList tools={entry.tools} />}
+              {entry.role === 'assistant' && entry.usage && (
+                <div className="ai-message-usage">
+                  <AiUsageChip usage={entry.usage} lang={lang} />
+                </div>
+              )}
               {entry.error && (
                 <div className="ai-msg-error">{t('aiMsgError', { error: entry.error })}</div>
               )}
@@ -2327,6 +2310,17 @@ export function AiPanel({
           )}
           {attachNotice && <div className="ai-attach-notice">{attachNotice}</div>}
           <div className="ai-input-box">
+            <AiQueueStrip
+              items={msgQueue.queued}
+              labels={AI_QUEUE_LABELS[lang]}
+              onUpdate={msgQueue.update}
+              onRemove={msgQueue.remove}
+              onClear={msgQueue.clear}
+              paused={msgQueue.paused}
+              onTogglePause={msgQueue.togglePaused}
+              onMove={msgQueue.move}
+            />
+            <AiSkillChips lang={lang} names={attachedSkills} onRemove={toggleSkill} />
             {attachments.length > 0 && (
               <div className="ai-attachments" onScroll={onAttachmentsScroll}>
                 {attachments.map((a) =>
@@ -2393,15 +2387,23 @@ export function AiPanel({
               spellCheck={spellcheck}
               data-slides-ai-input="true"
               data-deck-undo-ready={!busy && !inputEditedSinceRunRef.current ? 'true' : 'false'}
-              placeholder={t(deckEmpty ? 'aiInputPlaceholderGen' : 'aiInputPlaceholder')}
+              placeholder={
+                busy
+                  ? AI_QUEUE_LABELS[lang].queuePlaceholder
+                  : t(deckEmpty ? 'aiInputPlaceholderGen' : 'aiInputPlaceholder')
+              }
               onChange={(e) => {
                 inputEditedSinceRunRef.current = true
                 setInput(e.target.value)
               }}
+              onCompositionStart={ime.handleCompositionStart}
+              onCompositionEnd={ime.handleCompositionEnd}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  run()
+                  if (ime.isImeConfirm(e.nativeEvent)) return
+                  if (busy) enqueueDraft()
+                  else run()
                 } else if (e.key === 'Escape' && busy) {
                   e.preventDefault()
                   cancel()
@@ -2416,14 +2418,16 @@ export function AiPanel({
               rows={1}
             />
             <div className="ai-input-footer">
-              <button
-                className="ai-attach-btn"
-                onClick={pickAttachments}
-                data-tip={t('aiAttachTitle')}
-                aria-label={t('aiAttachTitle')}
-              >
-                <img src={attachIcon} alt="" aria-hidden />
-              </button>
+              <AiModelPicker bridge={MODEL_BRIDGE} lang={lang} />
+              {sessionUsage && <AiUsageChip usage={sessionUsage} session lang={lang} />}
+              <AiSkillsMenu
+                lang={lang}
+                listSkills={listSkillsForMenu}
+                selected={attachedSkills}
+                onToggle={toggleSkill}
+                onAddFile={() => void pickAttachments()}
+                onManage={() => void window.slidesApi.openSkillsSettings?.().catch(() => {})}
+              />
               {busy ? (
                 <button
                   className="ai-send-btn ai-stop-btn"

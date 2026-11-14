@@ -13,7 +13,10 @@ import { launchShell, closeAndSaveVideo, waitForPageWithUrl } from './helpers'
  */
 
 interface AidocsWindow {
-  __aidocs?: { editor?: unknown; save?: () => Promise<unknown> }
+  __aidocs?: {
+    editor?: unknown
+    save?: () => Promise<unknown>
+  }
 }
 
 async function minimalDocx(): Promise<Buffer> {
@@ -86,6 +89,9 @@ test.describe('docs layout breaks menu', () => {
       await page.keyboard.press('End')
       await openBreaks()
       await menuItem('Continuous').click()
+      // no wait for the break's own save: the section is modelled on insert, so a
+      // paper size for the whole document reaches it even while that save races
+      // the edits below
 
       await para('Beta').click()
       await page.keyboard.press('End')
@@ -134,13 +140,17 @@ test.describe('docs layout breaks menu', () => {
       expect(await page.evaluate(() => (window as unknown as AidocsWindow).__aidocs!.save!())).toBe(
         true,
       )
-      // The save lands in stages: waiting on an early marker hands the asserts
-      // below a half-written document (the second section's pgSz is what goes
-      // missing). Wait on the last thing this case expects instead, so every
-      // read after it sees the finished file.
+      // the break's own save may still be writing: wait for the complete file
       await expect
-        .poll(() => documentXml(docPath), { timeout: 15_000 })
-        .toContain('<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1800"')
+        .poll(
+          () =>
+            documentXml(docPath).then(
+              (x) =>
+                (x.match(/<w:pgSz w:w="15874" w:h="11339" w:orient="landscape"\/>/g) ?? []).length,
+            ),
+          { timeout: 15_000 },
+        )
+        .toBe(2)
       const xml = await documentXml(docPath)
       expect(xml).toContain('<w:br w:type="column"/>')
       expect(xml).toContain('<w:pageBreakBefore/>')

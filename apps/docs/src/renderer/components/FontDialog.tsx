@@ -3,10 +3,11 @@ import type { Editor } from '@tiptap/core'
 import type { Selection, Transaction } from '@tiptap/pm/state'
 import { Dropdown, isSymbolFontFamily, type DropdownOption } from '@genoffice/ui'
 import { useI18n, type StringKey } from '../i18n/locale'
-import { fontFamiliesFor } from '../font-list'
+import { fontFamiliesFor, systemFamiliesBesidesCandidates } from '../font-list'
 import { fontSizeLabel, fontSizeOptions, parseFontSize } from '../font-sizes'
 import { useSystemFontFamilies } from '../system-fonts'
-import { charScaleEm, cssFontFamily, wordKerns } from '../line-metrics'
+import { charScaleEm, wordKerns } from '../line-metrics'
+import { cssFontFamily } from '../text-layout/font-rules'
 import { useModalKeys } from './modal-keys'
 
 /**
@@ -126,7 +127,7 @@ export function setTextStyleWithScale(
       const merged = { ...(node.marks.find((m) => m.type === type)?.attrs ?? {}), ...attrs }
       if ('charScalePct' in attrs) {
         const pct = merged.charScalePct as number | null
-        merged.charScaleEm = pct && pct !== 100 ? charScaleEm(node.text, pct) : null
+        merged.charScaleEm = pct && pct !== 100 ? charScaleEm(node.text, pct, merged) : null
       }
       tr.addMark(Math.max(pos, from), Math.min(pos + node.nodeSize, to), type.create(merged))
     })
@@ -172,9 +173,12 @@ export function FontDialog({ editor, onClose }: { editor: Editor; onClose: () =>
   const modalKeys = useModalKeys(onClose)
   const fontFamilies = fontFamiliesFor(lang)
   const sizeOptions = fontSizeOptions(lang)
-  const { families: systemFontFamilies, load: loadSystemFonts } = useSystemFontFamilies()
+  const { families: allSystemFontFamilies, load: loadSystemFonts } = useSystemFontFamilies()
   // the dialog opens from a click, so activation is still live here
   useEffect(() => loadSystemFonts(), [loadSystemFonts])
+  // every candidate stays listed (the machine may genuinely lack some), so the
+  // system section is the candidates-deduped remainder: no builtin is listed twice
+  const systemFontFamilies = systemFamiliesBesidesCandidates(fontFamilies, allSystemFontFamilies)
   const textAttrs = editor.getAttributes('docTextStyle')
   const initialStyle = editor.isActive('bold')
     ? editor.isActive('italic')

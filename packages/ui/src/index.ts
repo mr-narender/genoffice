@@ -1,5 +1,12 @@
 export { AiPanelSideButton } from './AiPanelSideButton'
 export { AiComposer } from './AiComposer'
+export { AiQueueStrip } from './AiQueueStrip'
+export { useChatRunQueue, type ChatRunQueue, type QueuedChatMessage } from './chat-run-queue'
+export { AI_QUEUE_LABELS, type AiQueueStripLabels } from './strings-ai-queue'
+export { AI_SKILLS_LABELS, type AiSkillsLabels } from './strings-ai-skills'
+export { AiSkillsMenu, AiSkillChips, type AiSkillsMenuEntry } from './AiSkillsMenu'
+export { AiUsageChip, addTokenUsage, formatTokenCount, type AiTokenUsageView } from './AiUsageChip'
+export { AI_USAGE_LABELS, type AiUsageLabels } from './strings-ai-usage'
 export { AiScopeQuote, type AiScopeQuoteData } from './AiScopeQuote'
 export {
   AI_CUSTOM_FONT_MAX_PX,
@@ -20,6 +27,7 @@ export {
   aiPanelInitiallyOpen,
   rememberAiPanelOpen,
   useAiPanelPrefs,
+  useAiSidebarEnabled,
   aiPanelWidthAtPointer,
 } from './ai-panel-prefs-store'
 export {
@@ -33,8 +41,29 @@ export {
 } from './color-picker'
 export { installScreenTips } from './screentip'
 export {
+  SentAttachments,
+  truncateCardName,
+  formatAttachmentSize,
+  AttachmentCardIcon,
+  ATTACHMENT_IMAGE_EXTS,
+  fileImageIcon,
+  fileGeneralIcon,
+  fileDocumentIcon,
+  type AiAttachmentLike,
+} from './ai-attachments'
+export {
+  AI_PANEL_WIDTH_DEFAULT,
+  AI_PANEL_WIDTH_MIN,
+  AI_PANEL_WIDTH_MAX,
+  maxAiPanelWidth,
+  clampAiPanelWidth,
+  loadAiPanelWidth,
+  saveAiPanelWidth,
+} from './ai-panel-width'
+export {
   installPopoverDismiss,
   useDismissablePopover,
+  useEscapeToClose,
   type PopoverDismissOptions,
 } from './popover-dismiss'
 export { Dropdown, type DropdownOption } from './dropdown'
@@ -49,17 +78,28 @@ export {
   useRibbonCollapse,
   RibbonCollapseButton,
   RibbonExpandButton,
+  isRibbonCompactShortcut,
   isRibbonToggleShortcut,
   readRibbonCollapsed,
+  readRibbonDensity,
+  RIBBON_COMPACT_SHORTCUT,
   RIBBON_TOGGLE_SHORTCUT,
   type RibbonCollapse,
   type RibbonCollapseLabels,
+  type RibbonDensity,
 } from './ribbon-collapse'
 export { AiTypingIndicator } from './AiTypingIndicator'
 export { IconSend, IconStop, type IconProps } from './icons'
 export { Markdown, type MarkdownNav } from './Markdown'
+export { FILE_NAV_SCHEME, createFileNav, fileNavHref, parseFileNavHref } from './file-nav'
 export { isSymbolFontFamily } from './symbol-fonts'
-export { BUILTIN_FONT_FAMILIES, fontFamiliesFor } from './font-list'
+export { suggestFileName, type SuggestFileNameOptions } from './ai-naming-client'
+export {
+  BUILTIN_FONT_FAMILIES,
+  fontFamiliesFor,
+  partitionFontFamilies,
+  systemFamiliesBesidesCandidates,
+} from './font-list'
 export {
   WORDART_PRESETS,
   wordArtSolidColor,
@@ -117,3 +157,16 @@ export {
   notchStep,
   type ZoomWheelIntent,
 } from './wheel-zoom'
+export { AiModelPicker, type AiModelPickerBridge } from './AiModelPicker'
+export {
+  aiModelPickerGroups,
+  aiModelPickerSelection,
+  withAiModelSelection,
+  type AiModelPickerGroup,
+  type AiModelPickerSelection,
+} from './ai-model-picker-options'
+export { ProviderLogo } from './provider-logos'
+export { useRedactLabelField } from './use-redact-label'
+export type { RedactLabelField } from './use-redact-label'
+export { useScrollWindow } from './scroll-window'
+export { createImeEnterGuard, useImeEnterGuard, type ImeEnterGuard } from './ime-enter'
