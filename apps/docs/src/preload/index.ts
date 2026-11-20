@@ -1,6 +1,8 @@
-import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
-import { VIEW_IMAGE_CHANNEL } from '../shared/ipc'
+import { VIEW_IMAGE_CHANNEL, type MarkdownImage, type PdfInternalLink } from '../shared/ipc'
+import { toCommandMenuState, type CommandMenuState } from '../shared/commands'
+import type { KeyOverrides } from '../shared/keybindings'
 import type { AiPanelPrefs } from '@genoffice/ui'
 import type {
   AiChatRequest,
@@ -10,9 +12,14 @@ import type {
   DesktopApi,
   MenuCommand,
   AutoSaveDefault,
+  PrintJobOptions,
+  PrintPaper,
   ContextMenuRequest,
+  DocTheme,
   UiTheme,
   ZoteroRendererRequest,
+  MergeOutputRequest,
+  TemplatePreviewRect,
 } from '../shared/ipc'
 import type { ProjectApi } from '@genoffice/project-store'
 import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
@@ -34,11 +41,28 @@ const api: DesktopApi = {
     ipcRenderer.on('app:theme-changed', listener)
     return () => ipcRenderer.removeListener('app:theme-changed', listener)
   },
+  getDocumentTheme: async () => {
+    const result: unknown = await ipcRenderer.invoke('app:get-document-theme')
+    return result === 'dark' || result === 'light' ? result : 'follow'
+  },
+  onDocumentThemeChanged: (handler) => {
+    const listener = (_event: IpcRendererEvent, theme: DocTheme) => handler(theme)
+    ipcRenderer.on('app:document-theme-changed', listener)
+    return () => ipcRenderer.removeListener('app:document-theme-changed', listener)
+  },
   getAutoSaveDefault: () => ipcRenderer.invoke('app:get-auto-save-default'),
   onAutoSaveDefaultChanged: (handler) => {
     const listener = (_event: IpcRendererEvent, value: AutoSaveDefault) => handler(value)
     ipcRenderer.on('app:auto-save-default-changed', listener)
     return () => ipcRenderer.removeListener('app:auto-save-default-changed', listener)
+  },
+  getAuthorName: () => ipcRenderer.invoke('app:get-author-name'),
+  onAuthorNameChanged: (handler) => {
+    const listener = (_event: IpcRendererEvent, name: unknown) => {
+      if (typeof name === 'string') handler(name)
+    }
+    ipcRenderer.on('app:author-name-changed', listener)
+    return () => ipcRenderer.removeListener('app:author-name-changed', listener)
   },
   getAiPanelPrefs: () => ipcRenderer.invoke('app:get-ai-panel-prefs'),
   setAiPanelPrefs: (patch) => ipcRenderer.invoke('app:set-ai-panel-prefs', patch),
@@ -52,6 +76,7 @@ const api: DesktopApi = {
     ipcRenderer.on('app:chrome-pressed', listener)
     return () => ipcRenderer.removeListener('app:chrome-pressed', listener)
   },
+  zoteroAvailable: () => ipcRenderer.invoke('zotero:available'),
   zoteroCommand: (command) => ipcRenderer.invoke('zotero:command', command),
   onZoteroRequest: (handler) => {
     const listener = (_event: IpcRendererEvent, request: ZoteroRendererRequest) => handler(request)
@@ -116,9 +141,16 @@ const api: DesktopApi = {
   },
   spellAddWord: (word: string) => ipcRenderer.invoke('docs:spell-add-word', word),
   spellIgnoreWord: (word: string) => ipcRenderer.invoke('docs:spell-ignore-word', word),
+  spellResetIgnored: () => ipcRenderer.invoke('docs:spell-reset-ignored'),
   spellReplace: (word: string) => ipcRenderer.invoke('docs:spell-replace', word),
+  spellIsMisspelled: (word: string) => webFrame.isWordMisspelled(word),
+  spellSuggestions: (word: string) => webFrame.getWordSuggestions(word),
   spellLanguages: () => ipcRenderer.invoke('docs:spell-languages'),
   spellSetLanguages: (langs: string[]) => ipcRenderer.invoke('docs:spell-set-languages', langs),
+  saveTemplate: (defaultName: string, data: ArrayBuffer, preview?: TemplatePreviewRect) =>
+    ipcRenderer.invoke('docs:save-template', defaultName, data, preview),
+  openTemplate: (fromGallery?: string) => ipcRenderer.invoke('docs:open-template', fromGallery),
+  listTemplates: () => ipcRenderer.invoke('docs:list-templates'),
   saveDocxAs: (defaultName: string, data: ArrayBuffer, sourcePath?: string | null) =>
     ipcRenderer.invoke('docs:save-as', defaultName, data, sourcePath ?? null),
   saveDocxNew: (defaultName: string, data: ArrayBuffer) =>
@@ -135,14 +167,29 @@ const api: DesktopApi = {
   signalMcpReady: () => ipcRenderer.send('docs:mcp-ready'),
   getRecentFiles: () => ipcRenderer.invoke('docs:recent'),
   pickImage: () => ipcRenderer.invoke('docs:pick-image'),
+  pickDocx: () => ipcRenderer.invoke('docs:pick-docx'),
+  organizerOpen: () => ipcRenderer.invoke('docs:organizer-open'),
+  organizerSave: (path: string, data: ArrayBuffer) =>
+    ipcRenderer.invoke('docs:organizer-save', path, data),
+  openResultTab: (data: Uint8Array) => ipcRenderer.invoke('docs:open-result-tab', data),
+  renameDoc: (name: string) => ipcRenderer.invoke('docs:rename-doc', name),
+  moveDoc: () => ipcRenderer.invoke('docs:move-doc'),
+  fileInfo: () => ipcRenderer.invoke('docs:file-info'),
+  pickMergeDataSource: () => ipcRenderer.invoke('docs:merge-data-source'),
+  writeMergeOutput: (request: MergeOutputRequest) =>
+    ipcRenderer.invoke('docs:merge-output', request),
   fontMetrics: (family: string) => ipcRenderer.invoke('docs:font-metrics', family),
-  print: (scale?: number) => ipcRenderer.invoke('docs:print', scale),
+  fontAliases: (names: readonly string[]) => ipcRenderer.invoke('docs:font-aliases', names),
+  print: (scale?: number, job?: PrintJobOptions, paper?: PrintPaper) =>
+    ipcRenderer.invoke('docs:print', scale, job, paper),
+  listPrinters: () => ipcRenderer.invoke('docs:printers'),
   exportPdf: (
     defaultName: string,
     pageWidthTwips: number,
     pageHeightTwips: number,
     outPath?: string,
     scale?: number,
+    links?: PdfInternalLink[],
   ) =>
     ipcRenderer.invoke(
       'docs:export-pdf',
@@ -151,13 +198,24 @@ const api: DesktopApi = {
       pageHeightTwips,
       outPath,
       scale,
+      links,
     ),
   exportHtml: (defaultName: string, html: string, outPath?: string) =>
     ipcRenderer.invoke('docs:export-html', defaultName, html, outPath),
+  exportMarkdown: (
+    defaultName: string,
+    markdown: string,
+    images: MarkdownImage[],
+    outPath?: string,
+  ) => ipcRenderer.invoke('docs:export-markdown', defaultName, markdown, images, outPath),
   printPdfBuffer: (pageWidthTwips: number, pageHeightTwips: number, scale?: number) =>
     ipcRenderer.invoke('docs:print-pdf-buffer', pageWidthTwips, pageHeightTwips, scale),
-  saveMergedPdf: (defaultName: string, base64Parts: string[], outPath?: string) =>
-    ipcRenderer.invoke('docs:save-merged-pdf', defaultName, base64Parts, outPath),
+  saveMergedPdf: (
+    defaultName: string,
+    base64Parts: string[],
+    outPath?: string,
+    links?: PdfInternalLink[],
+  ) => ipcRenderer.invoke('docs:save-merged-pdf', defaultName, base64Parts, outPath, links),
   pickExportImagesTarget: () => ipcRenderer.invoke('docs:pick-export-images-target'),
   takeExportPdf: (pdfPath: string) => ipcRenderer.invoke('docs:take-export-pdf', pdfPath),
   writeExportImage: (dir: string, fileName: string, pngBase64: string) =>
@@ -170,11 +228,26 @@ const api: DesktopApi = {
   },
   getAiSettings: () => ipcRenderer.invoke('ai:get-settings'),
   setAiSettings: (settings: AiSettings) => ipcRenderer.invoke('ai:set-settings', settings),
+  onAiSettingsChanged: (handler) => {
+    const listener = () => handler()
+    ipcRenderer.on('ai:settings-changed', listener)
+    return () => ipcRenderer.removeListener('ai:settings-changed', listener)
+  },
+  openAiModelSettings: () => ipcRenderer.invoke('ai:open-model-settings'),
+  openSkillsSettings: () => ipcRenderer.invoke('ai:open-skills-settings'),
   aiChat: (request: AiChatRequest) => ipcRenderer.invoke('ai:chat', request),
   aiStream: (request: AiStreamRequest) => ipcRenderer.invoke('ai:stream', request),
+  skillsList: () => ipcRenderer.invoke('ai:skills-list'),
+  skillText: (name: string) => ipcRenderer.invoke('ai:skill-text', name),
+  runCli: (args: string[]) => ipcRenderer.invoke('ai:run-cli', args),
   aiStreamCancel: (requestId: string) => ipcRenderer.invoke('ai:stream-cancel', requestId),
   aiGskStatus: (withEmail?: boolean) => ipcRenderer.invoke('ai:gsk-status', withEmail),
   aiGskLogin: () => ipcRenderer.invoke('ai:gsk-login'),
+  onGskLoginLanded: (handler) => {
+    const listener = () => handler()
+    ipcRenderer.on('ai:gsk-login-landed', listener)
+    return () => ipcRenderer.removeListener('ai:gsk-login-landed', listener)
+  },
   webSearch: (query: string, maxResults?: number) =>
     ipcRenderer.invoke('ai:web-search', query, maxResults),
   imageSearch: (query: string, maxResults?: number) =>
@@ -193,9 +266,21 @@ const api: DesktopApi = {
   readAttachment: (path: string, offset: number, maxChars: number) =>
     ipcRenderer.invoke('files:read', path, offset, maxChars),
   readAttachmentImage: (path: string) => ipcRenderer.invoke('files:read-image', path),
+  kbList: () => ipcRenderer.invoke('kb:list'),
+  kbSearch: (query: { q: string; limit?: number }) => ipcRenderer.invoke('kb:search', query),
+  kbRead: (path: string, offset: number) => ipcRenderer.invoke('kb:read', { path, offset }),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   openNewTab: (openPath?: string | null) => ipcRenderer.invoke('win:new', openPath ?? null),
+  openSourcePath: (path: string) => ipcRenderer.invoke('home:open-path', path),
   listDocsTabs: () => ipcRenderer.invoke('win:list'),
+  arrangeAllWindows: () => ipcRenderer.invoke('win:arrange-all'),
+  gatherWindows: () => ipcRenderer.invoke('win:gather'),
+  detachedWindowCount: () => ipcRenderer.invoke('win:detached-count'),
+  onDetachedWindowsChanged: (handler: (count: number) => void) => {
+    const listener = (_event: IpcRendererEvent, count: number) => handler(count)
+    ipcRenderer.on('win:detached-changed', listener)
+    return () => ipcRenderer.removeListener('win:detached-changed', listener)
+  },
   focusDocsTab: (id: string) => ipcRenderer.invoke('win:focus', id),
   onAiStream: (handler: (chunk: AiStreamChunk) => void) => {
     const listener = (_event: IpcRendererEvent, chunk: AiStreamChunk) => handler(chunk)
@@ -213,11 +298,16 @@ const api: DesktopApi = {
     ipcRenderer.on('docs:close-check', listener)
     return () => ipcRenderer.removeListener('docs:close-check', listener)
   },
-  reportViewMenuState: (state: { aiSidebar: boolean; darkCanvas: boolean }) =>
-    ipcRenderer.send('docs:view-menu-state', {
-      aiSidebar: state?.aiSidebar === true,
-      darkCanvas: state?.darkCanvas === true,
-    }),
+  reportCommandState: (state: CommandMenuState) =>
+    ipcRenderer.send('docs:command-state', toCommandMenuState(state)),
+  keyCatalog: () => ipcRenderer.invoke('docs:key-catalog'),
+  getKeyOverrides: () => ipcRenderer.invoke('docs:key-overrides'),
+  setKeyOverrides: (overrides) => ipcRenderer.invoke('docs:set-key-overrides', overrides),
+  onKeyOverridesChanged: (handler) => {
+    const listener = (_event: IpcRendererEvent, overrides: KeyOverrides) => handler(overrides)
+    ipcRenderer.on('docs:key-overrides-changed', listener)
+    return () => ipcRenderer.removeListener('docs:key-overrides-changed', listener)
+  },
   reportCloseCheck: (state: { dirty: boolean; autoSave: boolean; filePath?: string | null }) =>
     ipcRenderer.send('docs:close-check-result', {
       dirty: state?.dirty === true,
@@ -237,9 +327,32 @@ const projectApi: ProjectApi = {
   appendChat: (args) => ipcRenderer.invoke('project:appendChat', args),
   loadChat: (args) => ipcRenderer.invoke('project:loadChat', args),
   rebindChat: (args) => ipcRenderer.invoke('project:rebindChat', args),
+  listChats: (args) => ipcRenderer.invoke('project:listChats', args),
+  deleteChat: (args) => ipcRenderer.invoke('project:deleteChat', args),
+}
+
+/**
+ * Model file naming: the transport half of `suggestFileName`.
+ *
+ * Inlined rather than imported — a preload entry must stay a single-file bundle,
+ * or the sandbox drops every global it exposed. The `ai:` channel is registered
+ * app-wide by the shell rather than by this app, the same arrangement the
+ * `project:*` bridge below already depends on.
+ *
+ * `content` crosses this bridge verbatim and the main process cannot see what
+ * this editor withheld, so what the caller hands over is exactly what the model
+ * sees. A caller that passed raw document text would undo its own redactions.
+ *
+ * The global is `aiNamingApi`, not `aiOffice`: `aiOffice` is the shell's home
+ * API, and a partial one in an editor window would shadow it there.
+ */
+const aiNamingApi = {
+  suggestFileName: (input: { content: string }) =>
+    ipcRenderer.invoke('ai:suggest-file-name', input),
 }
 
 contextBridge.exposeInMainWorld('desktop', api)
+contextBridge.exposeInMainWorld('aiNamingApi', aiNamingApi)
 contextBridge.exposeInMainWorld('projectApi', projectApi)
 
 // open documents dragged from the OS onto this tab as a new shell tab

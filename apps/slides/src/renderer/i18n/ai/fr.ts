@@ -18,6 +18,7 @@ export const fr = {
   aiQcStopped: 'Vérification de la mise en page arrêtée',
   aiQcCapped: '{count} page(s) restante(s) non vérifiée(s) (limite par exécution)',
   aiGskLoginBtn: 'Se connecter à Genspark',
+  aiGskLoginOk: 'Connecté à Genspark',
   aiPanelTitle: 'Genspark',
   aiOpenAssistant: "Ouvrir l'assistant IA",
   aiFactCheckBtn: 'Vérification IA',
@@ -112,6 +113,8 @@ export const fr = {
   aiErrUnknown: 'Erreur inconnue',
   aiErrStreamTimeout:
     "Délai de la requête IA dépassé : aucune réponse du réseau, l'exécution a été interrompue. Vérifiez votre connexion et réessayez",
+  aiErrRegion:
+    'Le fournisseur de ce modèle ne dessert pas votre région actuelle — choisissez un autre modèle ou changez de réseau',
   aiErrOverloaded: "Le service d'IA est actuellement surchargé — réessayez dans un instant",
   aiErrNetwork:
     'Problème réseau : impossible de joindre le service IA. Vérifiez votre connexion et réessayez',
@@ -225,5 +228,4 @@ export const fr = {
   aiSumSaveTemplate: 'Modèle de style « {name} » enregistré',
   aiSumTemplatesEmpty: 'Modèles de style (vide)',
   aiSumListTemplates: '{count} modèles de style listés',
-  aiPageCloudToLocal: 'Cloud indisponible — généré localement',
 } satisfies Record<keyof typeof zh, string>

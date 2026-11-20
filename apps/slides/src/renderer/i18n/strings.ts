@@ -30,6 +30,13 @@ export const strings = {
     ...paneStrings.vi,
     ...aiStrings.vi,
   },
+  tr: {
+    ...appStrings.tr,
+    ...ribbonStrings.tr,
+    ...paneStrings.tr,
+    ...aiStrings.tr,
+  },
+  hu: { ...appStrings.hu, ...ribbonStrings.hu, ...paneStrings.hu, ...aiStrings.hu },
   'zh-TW': {
     ...appStrings['zh-TW'],
     ...ribbonStrings['zh-TW'],

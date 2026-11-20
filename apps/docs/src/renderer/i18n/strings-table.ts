@@ -26,6 +26,58 @@ const en = {
   ribbonCellMargins: 'Default cell margins',
 }
 
+const ru: Record<keyof typeof en, string> = {
+  ribbonTableStyleOptions: 'Параметры стилей таблиц',
+  ribbonTableFirstRow: 'Строка заголовка',
+  ribbonTableLastRow: 'Строка итогов',
+  ribbonTableBandedRows: 'Чередующиеся строки',
+  ribbonTableFirstColumn: 'Первый столбец',
+  ribbonTableLastColumn: 'Последний столбец',
+  ribbonTableBandedColumns: 'Чередующиеся столбцы',
+  ribbonTablePresetGrid: 'Простая сетка',
+  ribbonTablePresetBlueHeader: 'Синий заголовок',
+  ribbonTablePresetBlueBanded: 'Синие полосы',
+  ribbonTablePresetGrayBanded: 'Серые полосы',
+  ribbonTablePresetGreenHeader: 'Зелёный заголовок',
+  ribbonAutoFit: 'Автоподбор',
+  ribbonAutoFitContents: 'Автоподбор по содержимому',
+  ribbonAutoFitWindow: 'Автоподбор по ширине окна',
+  ribbonFixedColumnWidth: 'Фиксированная ширина столбца',
+  ribbonRepeatHeaderRows: 'Повторять строки заголовков',
+  ribbonTableProperties: 'Свойства таблицы',
+  ribbonTableData: 'Таблица',
+  ribbonHorizontalPosition: 'Положение по горизонтали',
+  ribbonVerticalPosition: 'Положение по вертикали',
+  ribbonDistanceFromText: 'Расстояние от текста',
+  ribbonCellMargins: 'Поля ячеек по умолчанию',
+}
+
+const hu: Record<keyof typeof en, string> = {
+  ribbonTableStyleOptions: 'Táblázatstílus-beállítások',
+  ribbonTableFirstRow: 'Fejlécsor',
+  ribbonTableLastRow: 'Összegsor',
+  ribbonTableBandedRows: 'Sávos sorok',
+  ribbonTableFirstColumn: 'Első oszlop',
+  ribbonTableLastColumn: 'Utolsó oszlop',
+  ribbonTableBandedColumns: 'Sávos oszlopok',
+  ribbonTablePresetGrid: 'Egyszerű rács',
+  ribbonTablePresetBlueHeader: 'Kék fejléc',
+  ribbonTablePresetBlueBanded: 'Kék sávos',
+  ribbonTablePresetGrayBanded: 'Szürke sávos',
+  ribbonTablePresetGreenHeader: 'Zöld fejléc',
+  ribbonAutoFit: 'Automatikus illesztés',
+  ribbonAutoFitContents: 'Tartalomhoz igazítás',
+  ribbonAutoFitWindow: 'Ablakhoz igazítás',
+  ribbonFixedColumnWidth: 'Rögzített oszlopszélesség',
+  ribbonRepeatHeaderRows: 'Fejlécsorok ismétlése',
+  ribbonTableProperties: 'Táblázat tulajdonságai',
+  ribbonTableData: 'Táblázat',
+  ribbonHorizontalPosition: 'Vízszintes pozíció',
+  ribbonVerticalPosition: 'Függőleges pozíció',
+  ribbonDistanceFromText: 'Távolság a szövegtől',
+  ribbonCellMargins: 'Alapértelmezett cellamargók',
+}
+
 /**
  * New table controls deliberately fall back to English until each locale has
  * reviewed terminology. Keeping one complete key set prevents partially
@@ -41,7 +93,7 @@ export const tableStrings = defineStrings({
   es: en,
   th: en,
   id: en,
-  ru: en,
+  ru,
   ar: en,
   pt: en,
   it: en,
@@ -53,4 +105,6 @@ export const tableStrings = defineStrings({
   hi: en,
   'zh-TW': en,
   vi: en,
+  tr: en,
+  hu,
 })

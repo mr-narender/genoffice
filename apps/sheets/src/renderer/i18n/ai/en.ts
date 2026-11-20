@@ -5,6 +5,7 @@ export const en = {
   aiEmptyBuildTitle: 'Let AI build this workbook for you',
   aiEmptyBuildBody: 'Describe the table, data, or chart you need — AI creates it in place.',
   aiGskLoginBtn: 'Sign in to Genspark',
+  aiGskLoginOk: 'Signed in to Genspark',
   aiUndelivered: 'Not sent',
   aiRetry: 'Retry',
   aiOpenAssistant: 'Open AI assistant',
@@ -62,6 +63,8 @@ export const en = {
   aiUnknownError: 'Unknown error',
   aiTimeoutError:
     'AI request timed out: no response from the network, so the run was stopped. Check your connection and try again',
+  aiRegionError:
+    "This model's provider does not serve your current region — pick another model or change your network",
   aiOverloadedError: 'The AI service is busy right now — please try again in a moment',
   aiNetworkError:
     'Network problem: could not reach the AI service. Check your connection and try again',

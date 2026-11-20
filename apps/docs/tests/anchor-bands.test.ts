@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { syncAnchorBands, syncFloatShifts } from '../src/renderer/editor/pagination-gaps'
+import type { PageCut } from '../src/renderer/pagination-cuts'
 
 const rectOf = (top: number, height: number) =>
   ({ top, bottom: top + height, height, width: 100, left: 0, right: 100 }) as DOMRect
@@ -173,5 +174,129 @@ describe('syncFloatShifts with in-table gaps', () => {
     // the in-table gap height so it does not resolve one page too high
     syncFloatShifts(pm, [{ el: box, top: 250 }], 0, 1)
     expect(box.style.getPropertyValue('--page-float-dy')).toBe('100.0px')
+  })
+})
+
+describe('syncAnchorBands lifts the next anchor picture into the band', () => {
+  const rect = (left: number, top: number, width: number, height: number) =>
+    ({ left, top, width, height, right: left + width, bottom: top + height }) as DOMRect
+  /** wrapper of three behind-text photos: a side-by-side pair from 4px and a third at 402px on the left */
+  const gridWrapper = (): HTMLElement => {
+    const el = document.createElement('div')
+    el.className = 'doc-protected doc-protected-textboxes doc-protected-floating'
+    el.dataset.band = '777'
+    el.dataset.bands = '402:777 4:378 4:378'
+    el.style.minHeight = '777px'
+    el.getBoundingClientRect = () => rect(0, 0, 717, 777)
+    const strut = document.createElement('div')
+    strut.className = 'doc-anchor-strut'
+    strut.getBoundingClientRect = () => rect(0, 0, 717, 15)
+    el.appendChild(strut)
+    for (const [x, y, h] of [
+      [0, 402, 375],
+      [369, 4, 374],
+      [0, 4, 374],
+    ]) {
+      const box = document.createElement('div')
+      box.className = 'doc-textbox'
+      box.getBoundingClientRect = () => rect(x, y, 350, h)
+      el.appendChild(box)
+    }
+    return el
+  }
+  const floatImage = (): HTMLElement => {
+    const el = document.createElement('div')
+    el.className = 'doc-protected img-wrap-tight-right'
+    el.style.marginTop = '3.3px'
+    return el
+  }
+
+  it('hangs the picture one line below where the previous anchor line lands', () => {
+    const pm = document.createElement('div')
+    const w = gridWrapper()
+    const f = floatImage()
+    pm.append(w, f)
+    syncAnchorBands(pm, 1)
+    // the wrapper's line is blocked on both sides until 378, lands at 390 (26 x 15);
+    // the next paragraph starts at 405: margin 3.3 - (777 - 405)
+    expect(f.style.marginTop).toBe('-368.7px')
+    expect(f.dataset.anchorLiftBase).toBe('3.3')
+    syncAnchorBands(pm, 1)
+    expect(f.style.marginTop).toBe('-368.7px')
+  })
+
+  it('leaves a picture whose anchor line falls below the band alone', () => {
+    const pm = document.createElement('div')
+    const w = gridWrapper()
+    w.dataset.band = '380'
+    w.style.minHeight = '380px'
+    const f = floatImage()
+    pm.append(w, f)
+    syncAnchorBands(pm, 1)
+    expect(f.style.marginTop).toBe('3.3px')
+  })
+})
+
+describe('syncFloatShifts keeps a flow box on its anchor page', () => {
+  const rectOf2 = (top: number, height: number) =>
+    ({ top, height, bottom: top + height, left: 0, right: 100, width: 100 }) as DOMRect
+  const gap = {
+    kind: 'page' as const,
+    heightPx: 400,
+    marginBottomPx: 0,
+    marginTopPx: 0,
+    marginLeftPx: 0,
+    pullUpPx: 0,
+    repeatHeaderPx: 0,
+    flowTopPx: 30,
+  }
+  // cover paragraph (0..30) ends in a section break: page 1 keeps 770 px of
+  // blank body below it, page 2 starts at virtual 30
+  const cuts = [
+    { start: 0, end: 30, padPx: 770, gapOffsetPx: 0, flowOffsetPx: 0 },
+    { start: 30, end: 830, padPx: 0, gap, gapOffsetPx: 400, flowOffsetPx: 400 },
+  ] as unknown as PageCut[]
+  const setup = (boxTop: number) => {
+    const pm = document.createElement('div')
+    pm.getBoundingClientRect = () => rectOf2(0, 2000)
+    const wrap = document.createElement('div')
+    wrap.className = 'doc-protected doc-protected-floating'
+    const box = document.createElement('div')
+    box.className = 'doc-textbox'
+    box.getBoundingClientRect = () => rectOf2(boxTop, 100)
+    wrap.appendChild(box)
+    pm.append(wrap)
+    return { pm, box }
+  }
+
+  it('a title box offset past the section break stays on the cover page', () => {
+    const { pm, box } = setup(458)
+    syncFloatShifts(pm, [{ el: box, top: 458, height: 100, anchorTop: 0 }], 0, 1, 0, {
+      cuts,
+      carries: [],
+    })
+    expect(box.style.getPropertyValue('--page-float-dy')).toBe('')
+  })
+
+  it('a box the anchor page cannot hold still walks to its virtual page', () => {
+    const { pm, box } = setup(900)
+    syncFloatShifts(pm, [{ el: box, top: 900, height: 100, anchorTop: 0 }], 0, 1, 0, {
+      cuts,
+      carries: [],
+    })
+    expect(box.style.getPropertyValue('--page-float-dy')).toBe('400.0px')
+  })
+
+  it('a wrapNone box never leaves its anchor page', () => {
+    const { pm, box } = setup(900)
+    syncFloatShifts(
+      pm,
+      [{ el: box, top: 900, height: 100, anchorTop: 0, noSpill: true }],
+      0,
+      1,
+      0,
+      { cuts, carries: [] },
+    )
+    expect(box.style.getPropertyValue('--page-float-dy')).toBe('')
   })
 })

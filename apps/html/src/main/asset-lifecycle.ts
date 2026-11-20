@@ -1,17 +1,7 @@
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
-import {
-  copyFile,
-  lstat,
-  mkdir,
-  readFile,
-  readdir,
-  realpath,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { copyFileExclusive } from '@genoffice/electron-utils/copy-file'
 import { atomicWriteFile } from './atomic-write'
 
 export const ASSET_MANIFEST_FILENAME = '.genoffice-assets.json'
@@ -96,7 +86,12 @@ function replaceControlCharacters(value: string): string {
 }
 
 function sanitizeAssetName(input: string): string {
-  const raw = basename(input.replace(/\\/g, '/'))
+  // path.win32.basename reads a leading <letter>: as a drive prefix and
+  // strips it before the sanitizer ever sees the colon (a:b.png ->
+  // b.png on Windows, a_b.png elsewhere). Replace colons first so the
+  // sanitizer - not the platform's path semantics - decides what a
+  // colon becomes, identically on every platform.
+  const raw = basename(input.replace(/\\/g, '/').replace(/:/g, '_'))
   const rawExt = extname(raw)
   const ext = /^\.[a-z0-9]{1,10}$/i.test(rawExt) ? rawExt.toLowerCase() : ''
   const maxStem = 140 - ext.length
@@ -330,7 +325,7 @@ export async function copyImageIntoOwnedAssets(
   sourcePath: string,
 ): Promise<string> {
   return createOwnedAsset(documentPath, basename(sourcePath), (target) =>
-    copyFile(sourcePath, target, constants.COPYFILE_EXCL),
+    copyFileExclusive(sourcePath, target),
   )
 }
 
@@ -438,13 +433,20 @@ async function siblingHtmlReferences(
         // Refuse to load an unexpectedly huge sibling just for GC. Preserving
         // all candidates is the safe fallback when its references are unknown.
         if (info.size > 16 * 1024 * 1024) return new Set(ownedNames)
-        const scan = scanImageSources(await readFile(path, 'utf8'))
+        const text = await readFile(path, 'utf8')
+        const scan = scanImageSources(text)
         // A browser may still recover an image source from malformed HTML in a
         // way this deliberately small parser cannot prove. Keep every owned
         // candidate rather than collecting a possibly referenced file.
         if (scan.ambiguousHtml) return new Set(ownedNames)
         for (const { source } of scan.ranges) {
           const name = ownedNameForSource(source)
+          if (name && ownedNames.has(name)) references.add(name)
+        }
+        // A sibling may hold an asset open from a CSS url() the <img> scan
+        // cannot see; the same reference set drives its survival here.
+        for (const match of scanCssUrls(text)) {
+          const name = ownedNameForSource(match.source)
           if (name && ownedNames.has(name)) references.add(name)
         }
       } catch {
@@ -862,6 +864,53 @@ export function extractDocumentImageSources(html: string): string[] {
   return htmlImageSourceRanges(html, []).ranges.map((range) => range.source)
 }
 
+export interface CssUrlMatch {
+  start: number
+  end: number
+  source: string
+  /** the delimiter as written, so a rewrite reproduces it (`&quot;` inside a style attribute) */
+  quote: string
+}
+
+/**
+ * Every CSS url(...) reference: <style> rules and inline style attributes
+ * alike. A DOM serializer escapes the quotes inside a style attribute, so
+ * `url(&quot;…&quot;)` / `url(&#39;…&#39;)` count as quoted too.
+ */
+export function scanCssUrls(text: string): CssUrlMatch[] {
+  const out: CssUrlMatch[] = []
+  const re =
+    /url\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(&quot;|&#34;|&#39;|&apos;)([^\n]*?)\3|([^)"'\s]+))\s*\)/gi
+  for (const match of text.matchAll(re)) {
+    const source = match[1] ?? match[2] ?? match[4] ?? match[5] ?? ''
+    if (!source) continue
+    out.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      source,
+      quote: match[1] !== undefined ? '"' : match[2] !== undefined ? "'" : (match[3] ?? ''),
+    })
+  }
+  return out
+}
+
+/**
+ * Every local source a document still points at: <img src> plus CSS url().
+ * A style rule or an inline background-image holds an owned asset just as
+ * firmly as an <img> does, and single-file-html.ts inlines exactly these
+ * sources, so a CSS reference is a supported form rather than an accident.
+ * The asset GC decides what to collect from this set, so a reference form
+ * missing here is deleted from disk while the saved text still points at it.
+ */
+export function extractHtmlAssetReferences(html: string): string[] {
+  const sources = new Set<string>()
+  for (const source of extractHtmlImageSources(html)) {
+    if (source) sources.add(source)
+  }
+  for (const match of scanCssUrls(html)) sources.add(match.source)
+  return [...sources]
+}
+
 function encodeHtmlAttributeReplacement(value: string, quote: '"' | "'" | null): string {
   let encoded = ''
   for (const character of value) {
@@ -1008,7 +1057,7 @@ export async function prepareAssetsForSaveAs(
           if (reservedNames.has(name)) continue
           const target = join(targetAssetsDir, name)
           try {
-            await copyFile(safeSource, target, constants.COPYFILE_EXCL)
+            await copyFileExclusive(safeSource, target)
             copied = { name, sha256: await sha256File(target) }
             break
           } catch (error) {
