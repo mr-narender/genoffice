@@ -18,6 +18,7 @@ export const th = {
   aiQcStopped: 'หยุดการตรวจสอบเลย์เอาต์แล้ว',
   aiQcCapped: 'อีก {count} หน้าไม่ได้ตรวจสอบ (ขีดจำกัดต่อครั้ง)',
   aiGskLoginBtn: 'ลงชื่อเข้าใช้ Genspark',
+  aiGskLoginOk: 'ลงชื่อเข้าใช้ Genspark แล้ว',
   aiPanelTitle: 'Genspark',
   aiOpenAssistant: 'เปิดผู้ช่วย AI',
   aiFactCheckBtn: 'ตรวจสอบข้อเท็จจริง AI',
@@ -108,6 +109,8 @@ export const th = {
   aiErrUnknown: 'ข้อผิดพลาดที่ไม่รู้จัก',
   aiErrStreamTimeout:
     'คำขอ AI หมดเวลา: เครือข่ายไม่ตอบสนอง จึงหยุดการทำงาน โปรดตรวจสอบการเชื่อมต่อแล้วลองใหม่',
+  aiErrRegion:
+    'ผู้ให้บริการของโมเดลนี้ไม่ให้บริการในภูมิภาคปัจจุบันของคุณ — โปรดเลือกโมเดลอื่นหรือเปลี่ยนเครือข่าย',
   aiErrOverloaded: 'บริการ AI มีผู้ใช้งานจำนวนมากในขณะนี้ โปรดลองอีกครั้งในอีกสักครู่',
   aiErrNetwork:
     'เครือข่ายมีปัญหา ไม่สามารถเชื่อมต่อบริการ AI ได้ โปรดตรวจสอบการเชื่อมต่อแล้วลองใหม่',
@@ -221,5 +224,4 @@ export const th = {
   aiSumSaveTemplate: 'บันทึกเทมเพลตสไตล์ "{name}"',
   aiSumTemplatesEmpty: 'รายการเทมเพลตสไตล์ (ว่าง)',
   aiSumListTemplates: 'แสดงเทมเพลตสไตล์ {count} รายการ',
-  aiPageCloudToLocal: 'คลาวด์ไม่พร้อมใช้ — สร้างในเครื่อง',
 } satisfies Record<keyof typeof zh, string>

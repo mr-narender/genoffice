@@ -20,7 +20,12 @@ All application windows run with the full Electron renderer lockdown:
   enforces a protocol allowlist (http/https; pdf link annotations additionally
   allow mailto). `file:`, `javascript:`, and custom schemes are always rejected.
 - No API keys are hardcoded. AI requests are proxied through the signed-in
-  account by default; user-supplied keys stay in the OS-level settings store.
+  account by default; user-supplied keys stay in a settings file under the
+  app's own userData directory, written owner-only (0600) so other local
+  accounts cannot read them. (Encrypted-at-rest storage via safeStorage would
+  also seal backups and cloud-sync copies of that file, but the bundled CLI
+  reads the same file without Electron, so file permissions are the contract
+  both share.)
 
 ## Threat Model: AI-Generated Layout Scripts (slides)
 
@@ -72,11 +77,13 @@ main process), that is a vulnerability — please report it.
 Three pipelines render AI-generated or untrusted HTML in a hidden
 `BrowserWindow`. Every window is treated as hostile content: full renderer
 lockdown (`sandbox: true`, `contextIsolation: true`, `nodeIntegration: false`),
-no preload script, no IPC surface. The slides export drives the window
-exclusively through `executeJavaScript` and destroys it under a watchdog
-timeout; the HTML app's DOCX export and the docs altChunk conversion now do
-the same (`Promise.race` against a fixed timeout, then `destroy()`), so a
-page whose scripts never yield cannot strand the hidden window. HTML→DOCX
+no preload script, no IPC surface. The slides hidden windows only load the
+app's own renderer and print HTML (PDF export, print, headless export); the
+AI-HTML-to-pptx conversion runs inside the slides renderer, never in a hidden
+window. The HTML app's DOCX export and the docs altChunk conversion drive their
+windows exclusively through `executeJavaScript` under a watchdog timeout
+(`Promise.race` against a fixed timeout, then `destroy()`), so a page whose
+scripts never yield cannot strand the hidden window. HTML→DOCX
 conversion renders the page with scripts enabled and does not sanitize the
 markup before conversion — the output is a document, not a sandbox escape;
 report it as a vulnerability if you find a way from the converted page into

@@ -117,9 +117,10 @@ export function normalizeIr(raw: unknown): ValidatedIr[] {
       )
     }
     // Numeric geometry flows from page JS into division (renderer scale =
-    // maxPx / node.width) and image dimensions. Reject NaN/Infinity/negative
-    // here so a hostile page cannot produce corrupt-geometry docx.
-    for (const key of ['width', 'height', 'widthFrac', 'heightPx', 'xPx', 'yPx'] as const) {
+    // maxPx / node.width), image dimensions and a spacer's exact line height.
+    // Reject NaN/Infinity/negative here so a hostile page cannot produce
+    // corrupt-geometry docx.
+    for (const key of ['width', 'height', 'widthFrac', 'heightPx', 'xPx', 'yPx', 'px'] as const) {
       const v = candidate[key]
       if (v !== undefined && v !== null) {
         const n = Number(v)
@@ -131,6 +132,51 @@ export function normalizeIr(raw: unknown): ValidatedIr[] {
           )
         }
       }
+    }
+    // The generator walks these collections without a fallback: a paragraph and
+    // a heading render `runs`, a list renders `items` and each item's `runs`, a
+    // table renders `rows` and each row's `cells`, and a heading indexes
+    // HEADING_LEVELS with `level`. A missing one is a malformed node, not an
+    // empty one — without this the first dereference throws a TypeError from
+    // inside the renderer (or, for `level`, silently emits an undefined style),
+    // so refuse it at the same boundary that guards the spacer `px`.
+    const rejectShape = (what: string): never => {
+      throw new Error(
+        `html2docx: extractor returned malformed IR at index ${index} ` +
+          `(${what}); refusing to continue with compromised page JavaScript`,
+      )
+    }
+    if (candidate.type === 'para' || candidate.type === 'heading') {
+      if (!Array.isArray(candidate.runs)) rejectShape('missing array "runs"')
+      // `Math.min(node.level, 6) - 1` indexes HEADING_LEVELS: a missing or
+      // non-positive level lands on undefined instead of a heading style
+      const level = candidate.level
+      if (
+        candidate.type === 'heading' &&
+        (level === null ||
+          level === undefined ||
+          !Number.isFinite(Number(level)) ||
+          Number(level) < 1)
+      )
+        rejectShape('missing numeric "level"')
+    }
+    if (candidate.type === 'list') {
+      const items = candidate.items
+      if (!Array.isArray(items)) rejectShape('missing array "items"')
+      else
+        items.forEach((item: unknown, itemIndex: number) => {
+          const runs = Array.isArray(item) ? item : (item as { runs?: unknown } | null)?.runs
+          if (!Array.isArray(runs)) rejectShape(`list item ${itemIndex} missing array "runs"`)
+        })
+    }
+    if (candidate.type === 'table') {
+      const rows = candidate.rows
+      if (!Array.isArray(rows)) rejectShape('missing array "rows"')
+      else
+        rows.forEach((row: unknown, rowIndex: number) => {
+          if (!Array.isArray((row as { cells?: unknown } | null)?.cells))
+            rejectShape(`table row ${rowIndex} missing array "cells"`)
+        })
     }
     return item as ValidatedIr
   })
@@ -580,7 +626,11 @@ export async function convertHtmlToDocx(
               backdrop.setAttribute('style', backdrop.getAttribute('data-h2d-old-style') || '')
               backdrop.removeAttribute('data-h2d-old-style')
             }
-            for (const child of document.body.children as HTMLCollectionOf<HTMLElement>) {
+            // Page JS may append body children between set and restore; only
+            // stamped nodes were touched.
+            for (const child of document.querySelectorAll<HTMLElement>(
+              '[data-h2d-old-visibility]',
+            )) {
               child.style.visibility = child.getAttribute('data-h2d-old-visibility') || ''
               child.removeAttribute('data-h2d-old-visibility')
             }

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  csvGridShape,
+  csvRows,
   decodeCsvBuffer,
   isNumericCell,
   MAX_CSV_COLS,
@@ -150,6 +152,23 @@ describe('decodeCsvBuffer', () => {
   it('decodes UTF-16LE without a BOM from the NUL pattern', () => {
     expect(decodeCsvBuffer(utf16leBytes('a,b'))).toBe('a,b')
   })
+
+  it('decodes BOM-less UTF-16 CJK-only text in either byte order', () => {
+    const text = Array(6)
+      .fill(
+        '\u59d3\u540d\u90e8\u95e8\u804c\u4f4d\u5de5\u53f7\u5907\u6ce8\u90ae\u7bb1\u7535\u8bdd\u5730',
+      )
+      .join('\n')
+    const le = utf16leBytes(text)
+    const be = new Uint8Array(le.length)
+    for (let i = 0; i < le.length; i += 2) {
+      be[i] = le[i + 1]!
+      be[i + 1] = le[i]!
+    }
+    expect(decodeCsvBuffer(le)).toBe(text)
+    expect(decodeCsvBuffer(be)).toBe(text)
+    expect(decodeCsvBuffer(le, 'gb18030')).toBe(text)
+  })
 })
 
 describe('parseCsv row/col caps', () => {
@@ -203,5 +222,32 @@ describe('isNumericCell', () => {
     expect(isNumericCell('12a')).toBe(false)
     expect(isNumericCell('1,000')).toBe(false)
     expect(isNumericCell(' 123')).toBe(false)
+  })
+})
+
+describe('csvRows', () => {
+  it('yields the same rows as the whole-grid parse', () => {
+    const csv = 'name,note\n"Doe, John","says ""hi"""\nAlice,"line one\nline two"\n'
+    expect([...csvRows(csv, ',')]).toEqual(parseCsv(csv, ','))
+  })
+
+  it('drops the empty rows a trailing newline leaves behind', () => {
+    expect([...csvRows('a,b\n\n', ',')]).toEqual([['a', 'b']])
+    expect([...csvRows('a,b\n\n\nc\n', ',')]).toEqual([['a', 'b'], [''], [''], ['c']])
+    expect([...csvRows('a,b\n\nc', ',')]).toEqual([['a', 'b'], [''], ['c']])
+  })
+
+  it('enforces the row and column caps while it streams', () => {
+    expect(() => [...csvRows('a\n'.repeat(MAX_CSV_ROWS + 1), ',')]).toThrow(/too many rows/)
+    expect(() => [...csvRows('a,'.repeat(MAX_CSV_COLS) + 'b', ',')]).toThrow(/too many columns/)
+  })
+})
+
+describe('csvGridShape', () => {
+  it('reports the rows and the columns that carry a value', () => {
+    expect(csvGridShape('a,b,c\n1,2,3\n', ',')).toEqual({ rows: 2, columns: 3 })
+    // a trailing empty cell does not make the sheet wider
+    expect(csvGridShape('a,b,\n1,2,\n', ',')).toEqual({ rows: 2, columns: 2 })
+    expect(csvGridShape('', ',')).toEqual({ rows: 0, columns: 1 })
   })
 })

@@ -18,10 +18,11 @@ const RAW =
 const MODEL: ParaFormat = {
   borders: 'tb',
   borderLines: {
-    t: { color: 'FF0000', szPt: 1.5, spacePt: 1 },
-    b: { color: 'FF0000', szPt: 1.5, spacePt: 1 },
+    t: { color: 'FF0000', szPt: 1.5, spacePt: 1, val: 'dashed' },
+    b: { color: 'FF0000', szPt: 1.5, spacePt: 1, val: 'dashed' },
   },
   shadingFill: 'EEEEEE',
+  shadingPattern: { val: 'pct10' },
   spaceBefore: 240,
   spaceAfter: 120,
   indentLeft: 0,
@@ -83,17 +84,75 @@ describe('mergePPrFormat keeps unedited groups byte-identical', () => {
     expect(mergePPrFormat(raw, doc.blocks[0].format)).toBe(raw)
   })
 
-  it('changing only a border color rebuilds pBdr with the declared color/sz', () => {
+  it('changing only a border color rebuilds pBdr with the declared style, color and sz', () => {
     const out = mergePPrFormat(RAW, {
       ...MODEL,
       borderLines: {
-        t: { color: '00FF00', szPt: 1.5, spacePt: 1 },
-        b: { color: 'FF0000', szPt: 1.5, spacePt: 1 },
+        t: { color: '00FF00', szPt: 1.5, spacePt: 1, val: 'dashed' },
+        b: { color: 'FF0000', szPt: 1.5, spacePt: 1, val: 'dashed' },
       },
     })
-    expect(out).toContain('<w:top w:val="single" w:sz="12" w:space="1" w:color="00FF00"/>')
-    expect(out).toContain('<w:bottom w:val="single" w:sz="12" w:space="1" w:color="FF0000"/>')
-    expect(out).not.toContain('dashed')
+    expect(out).toContain('<w:top w:val="dashed" w:sz="12" w:space="1" w:color="00FF00"/>')
+    expect(out).toContain('<w:bottom w:val="dashed" w:sz="12" w:space="1" w:color="FF0000"/>')
+    expect(out).toContain('<w:shd w:val="pct10" w:color="auto" w:fill="EEEEEE"/>')
+  })
+
+  it("Word's Shadow and 3-D settings are read from the sides, kept untouched, and written when set", async () => {
+    const side = (name: string, fx: string) =>
+      `<w:${name} w:val="single" w:sz="8" w:space="1" w:color="auto"${fx}/>`
+    const box = (fx: string) =>
+      `<w:pPr><w:pBdr>${['top', 'left', 'bottom', 'right'].map((n) => side(n, fx)).join('')}</w:pBdr></w:pPr>`
+    const raw = box(' w:shadow="1"')
+    const bytes = await buildDocx({ bodyXml: `<w:p>${raw}<w:r><w:t>x</w:t></w:r></w:p>` })
+    const format = (await parseDocx(bytes)).blocks[0].format as ParaFormat
+    expect(format.borderLines?.t).toEqual({ szPt: 1, spacePt: 1, shadow: true })
+    expect(mergePPrFormat(raw, format)).toBe(raw)
+
+    const framed = Object.fromEntries(
+      (['t', 'b', 'l', 'r'] as const).map((ch) => [ch, { szPt: 1, spacePt: 1, frame: true }]),
+    ) as ParaFormat['borderLines']
+    expect(mergePPrFormat(raw, { ...format, borderLines: framed })).toBe(box(' w:frame="1"'))
+    const off = box(' w:shadow="0"')
+    const plain = (
+      await parseDocx(await buildDocx({ bodyXml: `<w:p>${off}<w:r><w:t>x</w:t></w:r></w:p>` }))
+    ).blocks[0].format as ParaFormat
+    expect(plain.borderLines?.t).toEqual({ szPt: 1, spacePt: 1 })
+  })
+
+  it('a line style and a shading pattern are read, kept untouched, and rebuilt when they change', async () => {
+    const raw =
+      '<w:pPr><w:pBdr><w:top w:val="double" w:sz="6" w:space="1" w:color="auto"/>' +
+      '<w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr>' +
+      '<w:shd w:val="pct25" w:color="C00000" w:fill="FFF2CC"/></w:pPr>'
+    const doc = await parseDocx(
+      await buildDocx({ bodyXml: `<w:p>${raw}<w:r><w:t>x</w:t></w:r></w:p>` }),
+    )
+    const format = doc.blocks[0].format!
+    expect(format.borderLines).toEqual({
+      t: { szPt: 0.75, spacePt: 1, val: 'double' },
+      b: { szPt: 0.75, spacePt: 1 },
+    })
+    expect(format.shadingPattern).toEqual({ val: 'pct25', color: 'C00000' })
+    expect(format.shadingDisplay).toBe('EFB699')
+    expect(mergePPrFormat(raw, format)).toBe(raw)
+
+    const dotted = mergePPrFormat(raw, {
+      ...format,
+      borderLines: { ...format.borderLines, t: { szPt: 0.75, spacePt: 1, val: 'dotted' } },
+    })
+    expect(dotted).toContain('<w:top w:val="dotted" w:sz="6" w:space="1" w:color="auto"/>')
+    expect(dotted).toContain('<w:shd w:val="pct25" w:color="C00000" w:fill="FFF2CC"/>')
+
+    const { shadingPattern: _pattern, ...plain } = format
+    expect(mergePPrFormat(raw, plain)).toContain(
+      '<w:shd w:val="clear" w:color="auto" w:fill="FFF2CC"/>',
+    )
+    const solid = mergePPrFormat(raw, { ...format, shadingPattern: { val: 'solid' } })
+    expect(solid).toContain('<w:shd w:val="solid" w:color="auto" w:fill="FFF2CC"/>')
+    const { shadingFill: _fill, ...tint } = format
+    expect(mergePPrFormat(raw, tint)).toContain(
+      '<w:shd w:val="pct25" w:color="C00000" w:fill="auto"/>',
+    )
   })
 
   it('rebuilding pBdr from a bare model writes declared color/sz and a 0 space', () => {
@@ -197,5 +256,41 @@ describe('pattern shading display blend', () => {
     const format = doc.blocks[0].format!
     expect(format.shadingFill).toBe('D9D9D9')
     expect(format.shadingDisplay).toBeUndefined()
+  })
+})
+
+describe('character-unit first-line indents (#1892)', () => {
+  // Word's output for a two-character first line in a 10.5pt Normal style
+  const CHARS_RAW = '<w:pPr><w:ind w:firstLineChars="200" w:firstLine="420"/></w:pPr>'
+  const PARSED: ParaFormat = { indentFirstLine: 420, charIndents: { firstLine: 200 } }
+
+  it('the writer emits the character unit next to its twips twin', () => {
+    const out = mergePPrFormat('<w:pPr/>', {
+      indentFirstLine: 420,
+      charIndents: { firstLine: 200 },
+    })
+    expect(out).toContain('w:firstLineChars="200"')
+    expect(out).toContain('w:firstLine="420"')
+  })
+
+  it('an untouched parse → merge round trip keeps the raw bytes', () => {
+    expect(mergePPrFormat(CHARS_RAW, PARSED)).toBe(CHARS_RAW)
+  })
+
+  it('editing within the character unit re-writes it instead of cancelling', () => {
+    // 200 → 240 chars: the unit still lays out, so no w:firstLineChars="0"
+    const out = mergePPrFormat(CHARS_RAW, {
+      indentFirstLine: 480,
+      charIndents: { firstLine: 240 },
+    })
+    expect(out).toContain('w:firstLineChars="240"')
+    expect(out).not.toContain('w:firstLineChars="0"')
+    expect(out).toContain('w:firstLine="480"')
+  })
+
+  it('dropping the character unit cancels it so Word keeps the absolute indent', () => {
+    const out = mergePPrFormat(CHARS_RAW, { indentFirstLine: 720 }, PARSED)
+    expect(out).toContain('w:firstLineChars="0"')
+    expect(out).toContain('w:firstLine="720"')
   })
 })
