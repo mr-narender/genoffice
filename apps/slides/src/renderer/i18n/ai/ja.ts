@@ -18,6 +18,7 @@ export const ja = {
   aiQcStopped: 'レイアウトチェックを停止しました',
   aiQcCapped: '残り {count} ページは未チェック(1回の上限)',
   aiGskLoginBtn: 'Genspark にサインイン',
+  aiGskLoginOk: 'Genspark にサインインしました',
   aiPanelTitle: 'Genspark',
   aiOpenAssistant: 'AI アシスタントを開く',
   aiFactCheckBtn: 'AI ファクトチェック',
@@ -109,6 +110,8 @@ export const ja = {
   aiErrUnknown: '不明なエラー',
   aiErrStreamTimeout:
     'AIリクエストがタイムアウトしました：ネットワークからの応答がないため中断しました。接続を確認して再試行してください',
+  aiErrRegion:
+    'このモデルの提供元は現在の地域ではサービスを提供していません。別のモデルを選ぶか、ネットワークを切り替えてください',
   aiErrOverloaded: 'AI サービスが混み合っています。しばらくしてからもう一度お試しください',
   aiErrNetwork:
     'ネットワークに問題があり、AI サービスに接続できません。接続を確認して再試行してください',
@@ -222,5 +225,4 @@ export const ja = {
   aiSumSaveTemplate: 'スタイル テンプレート「{name}」を保存',
   aiSumTemplatesEmpty: 'スタイル テンプレート一覧（空）',
   aiSumListTemplates: '{count} 個のスタイル テンプレートを一覧表示',
-  aiPageCloudToLocal: 'クラウド生成不可効 — ローカルで生成',
 } satisfies Record<keyof typeof zh, string>

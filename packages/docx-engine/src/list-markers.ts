@@ -13,8 +13,9 @@ const BULLET_GLYPHS: Record<string, string> = {
 
 const DEFAULT_BULLETS = ['•', '◦', '▪', '•', '◦', '▪', '•', '◦', '▪']
 
-function toLetters(value: number): string {
+function toLetters(rawValue: number): string {
   // Word: 1..26 -> A..Z, 27 -> AA (repeated same letter, not positional notation)
+  const value = Math.max(1, rawValue)
   const n = ((value - 1) % 26) + 1
   const repeat = Math.floor((value - 1) / 26) + 1
   return String.fromCharCode(64 + n).repeat(repeat)
@@ -329,14 +330,62 @@ export interface ListMarkerInfo {
   font?: string
   /** the item's own counter value (numbered levels only) */
   value?: number
+  /** the numbers of `text` without the words before and after them ("Chapter 2." -> "2") */
+  number?: string
 }
 
-/** text-font substitutes draw solid round bullets smaller than the Word symbol glyph
- *  (glyph-box ratios: Symbol bullet 0.29em vs Arial 0.25em; Wingdings circle 0.58em vs Arial 0.43em) */
-const SUBSTITUTE_BULLET_SCALE: Record<string, number> = { '•': 1.25, '●': 1.35 }
+/** Word symbol bullets with no glyph on this platform: Liberation Sans' U+25CF through a
+ *  size-adjusted alias (fonts.css) carrying the Word face's ink size and line metrics */
+const SUBSTITUTE_BULLETS: Record<string, BulletSubstitute> = {
+  '\u2022': { glyph: '\u25cf', face: 'Symbol Bullet GO' },
+  '\u25cf': { glyph: '\u25cf', face: 'Wingdings Bullet GO' },
+}
 
-export function bulletMarkerScale(glyph: string): number {
-  return SUBSTITUTE_BULLET_SCALE[glyph] ?? 1
+export interface BulletSubstitute {
+  glyph: string
+  face: string
+}
+
+export function substituteBullet(glyph: string): BulletSubstitute | null {
+  return SUBSTITUTE_BULLETS[glyph] ?? null
+}
+
+export const SEGOE_UI_SYMBOL_RE = /^segoe ui symbol$/
+
+/** Bullet glyphs none of Word's common Latin text faces carry (DFonts cmaps: Calibri,
+ *  Arial, Times New Roman, Cambria, Aptos, Verdana, Tahoma): Word draws them in Segoe UI Symbol */
+const SEGOE_FALLBACK_GLYPHS = new Set([
+  '\u25b8',
+  '\u25b9',
+  '\u25c6',
+  '\u25c7',
+  '\u27a2',
+  '\u27a4',
+  '\u2714',
+  '\u2726',
+  '\u2756',
+  '\u2605',
+  '\u2606',
+  '\u2794',
+])
+
+/** glyphs only some of those faces lack -> the faces known to lack them */
+const PARTIAL_FALLBACK: Array<[RegExp, string]> = [
+  [/calibri|arial|times|cambria|verdana|tahoma/, '\u2713\u2610\u2611'],
+  [/calibri|cambria|aptos|verdana/, '\u2023\u25a0\u25ba\u25b2\u25bc\u2043'],
+  [/cambria/, '\u25aa\u25ab\u25a1\u25cf\u25e6'],
+]
+
+/** the face Word substitutes when a text-font marker glyph is missing from its face */
+export function markerFallbackFace(glyph: string, face: string): string | null {
+  const cps = [...glyph]
+  if (cps.length !== 1) return null
+  const f = face.trim().toLowerCase()
+  if (SEGOE_UI_SYMBOL_RE.test(f) || isSymbolFont(face)) return null
+  if (SEGOE_FALLBACK_GLYPHS.has(cps[0])) return 'Segoe UI Symbol'
+  return PARTIAL_FALLBACK.some(([re, set]) => re.test(f) && set.includes(cps[0]))
+    ? 'Segoe UI Symbol'
+    : null
 }
 
 function bulletInfo(text: string, level: NumberingLevel): ListMarkerInfo {
@@ -408,18 +457,20 @@ export function computeListMarkerInfos(
     }
     c.length = lvl + 1
 
-    const marker = level.lvlText.replace(/%(\d)/g, (_, d: string) => {
-      const refLvl = Number(d) - 1
-      const refDef = def.levels[refLvl]
-      const value = c[refLvl] ?? refDef?.start ?? 1
-      const fmt = refDef?.numFmt ?? 'decimal'
-      if (level.isLgl && !ARABIC_FORMATS.has(fmt)) return String(value)
-      return formatNumber(value, fmt, refDef?.customFormat)
-    })
-    // numFmt "none": an explicit empty marker (Word shows nothing) so renderer
-    // counter fallbacks don't kick in on the null
-    if (!marker && level.numFmt !== 'none') return null
-    return { text: marker, value: c[lvl] }
+    const fill = (template: string): string =>
+      template.replace(/%(\d)/g, (_, d: string) => {
+        const refLvl = Number(d) - 1
+        const refDef = def.levels[refLvl]
+        const value = c[refLvl] ?? refDef?.start ?? 1
+        const fmt = refDef?.numFmt ?? 'decimal'
+        if (level.isLgl && !ARABIC_FORMATS.has(fmt)) return String(value)
+        return formatNumber(value, fmt, refDef?.customFormat)
+      })
+    const marker = fill(level.lvlText)
+    const numbers = /%\d(?:[\s\S]*%\d)?/.exec(level.lvlText)?.[0]
+    // numFmt "none" or an empty lvlText: an explicit empty marker (Word shows
+    // nothing) so renderer counter fallbacks don't kick in on the null
+    return { text: marker, value: c[lvl], ...(numbers ? { number: fill(numbers) } : {}) }
   })
 }
 
@@ -435,14 +486,110 @@ export function computeListMarkers(
   return computeListMarkerInfos(items, defs).map((m) => m?.text ?? null)
 }
 
+/** a list item as a cross-reference to its number reads it */
+export interface ListNumberSite {
+  /** the number the page shows; empty for a bullet */
+  text: string
+  ilvl: number
+  /** index of the item it sits under in the same list; -1 at the top */
+  parent: number
+  /** the shallowest level whose number the text already carries */
+  from: number
+  /** the numbers of `text` without the words before and after them */
+  number?: string
+}
+
+export function computeListNumberSites(
+  items: ListItemRef[],
+  defs: Map<string, NumberingDef>,
+): (ListNumberSite | null)[] {
+  const infos = computeListMarkerInfos(items, defs)
+  const open = new Map<string, number[]>()
+  return items.map((item, i) => {
+    const def = item.numId !== null ? defs.get(item.numId) : undefined
+    const ilvl = Math.max(0, item.ilvl)
+    const level = def?.levels[ilvl]
+    if (!def || !level) return null
+    const path = open.get(def.abstractNumId) ?? []
+    open.set(def.abstractNumId, path)
+    path.length = ilvl
+    let parent = -1
+    for (let l = ilvl - 1; l >= 0 && parent < 0; l--) parent = path[l] ?? -1
+    path[ilvl] = i
+    const numbered = level.numFmt !== 'bullet'
+    const shown = [...level.lvlText.matchAll(/%(\d)/g)].map((m) => Number(m[1]) - 1)
+    return {
+      text: numbered ? (infos[i]?.text ?? '') : '',
+      ilvl,
+      parent,
+      from: numbered && shown.length > 0 ? Math.min(ilvl, ...shown) : ilvl,
+      ...(numbered && infos[i]?.number ? { number: infos[i]!.number } : {}),
+    }
+  })
+}
+
+/** REF \r, \n and \w: the number relative to the paragraph of the field, alone, or with every level above it */
+export type ParagraphNumberContext = 'relative' | 'none' | 'full'
+
+const withoutFinalPeriod = (text: string): string => text.trim().replace(/\.$/, '')
+
+/**
+ * The number of item `target` as Word's REF field shows it: one final period dropped,
+ * the levels above put in front where the number does not carry them itself.
+ * `separator` (REF \d) goes between the levels in place of their own punctuation.
+ */
+export function paragraphNumberText(
+  sites: ReadonlyArray<ListNumberSite | null>,
+  target: number,
+  context: ParagraphNumberContext,
+  options: { from?: number; separator?: string; bare?: boolean } = {},
+): string | null {
+  const site = sites[target]
+  if (!site || !site.text.trim()) return null
+  if (context === 'none') return withoutFinalPeriod(site.text)
+  const pathOf = (index: number): number[] => {
+    const path: number[] = []
+    for (let at = index; at >= 0 && sites[at]; at = sites[at]!.parent) path.unshift(at)
+    return path
+  }
+  let floor = 0
+  if (context === 'relative' && options.from !== undefined && sites[options.from]) {
+    const mine = pathOf(target)
+    const theirs = pathOf(options.from)
+    let shared = 0
+    while (shared < mine.length && mine[shared] === theirs[shared]) shared++
+    floor = shared < mine.length ? sites[mine[shared]]!.ilvl : site.ilvl
+  }
+  const pieces: string[] = []
+  const bare: Array<string | undefined> = []
+  for (let at = target; ;) {
+    const here = sites[at]!
+    if (here.text.trim()) {
+      pieces.unshift(here.text.trim())
+      bare.unshift(here.number)
+    }
+    let up = here.parent
+    while (up >= 0 && sites[up] && sites[up]!.ilvl >= here.from) up = sites[up]!.parent
+    if (here.from <= 0 || up < 0 || !sites[up] || sites[up]!.ilvl < floor) break
+    at = up
+  }
+  // STYLEREF \t: what stands between the numbers of two levels is not known to be kept
+  if (options.bare) return bare.length === 1 ? (bare[0] ?? null) : null
+  return options.separator !== undefined
+    ? pieces.map(withoutFinalPeriod).join(options.separator)
+    : withoutFinalPeriod(pieces.join(''))
+}
+
 /**
  * Word's default tab after a numbering marker: when the marker fits the hanging
- * area the text starts at the text indent; otherwise it jumps to the next tab
- * stop past the marker end — the paragraph's custom stops first, the default
- * grid only beyond the last custom stop (a custom stop clears the default stops
- * left of it). All positions are twips relative to the text column edge.
- * Returns the marker-box width (marker start -> text start), or null when the
- * hanging area already fits.
+ * area the text starts at the text indent, unless a custom stop sits between
+ * the marker end and that indent (the text indent is only an implicit stop;
+ * explicit stops before it still catch the tab). Otherwise it jumps to the
+ * next tab stop past the marker end — the paragraph's custom stops first, the
+ * default grid only beyond the last custom stop (a custom stop clears the
+ * default stops left of it). All positions are twips relative to the text
+ * column edge. Returns the marker-box width (marker start -> text start), or
+ * null when the text starts at the hanging indent.
  */
 export function markerTabAdvance(
   markerStart: number,
@@ -452,7 +599,10 @@ export function markerTabAdvance(
   customStops: number[] = [],
 ): number | null {
   const end = markerStart + markerWidth
-  if (markerStart < textIndent && end <= textIndent) return null
+  if (markerStart < textIndent && end <= textIndent) {
+    const inside = customStops.filter((s) => s > end && s < textIndent).sort((a, b) => a - b)[0]
+    return inside === undefined ? null : inside - markerStart
+  }
   const custom = customStops.filter((s) => s > end).sort((a, b) => a - b)[0]
   if (custom !== undefined) return custom - markerStart
   // no default grid (w:defaultTabStop 0): the text follows the marker directly

@@ -5,6 +5,7 @@ export const pt = {
   aiEmptyBuildTitle: 'Deixe a IA montar esta pasta de trabalho para você',
   aiEmptyBuildBody: 'Descreva a tabela, os dados ou o gráfico que precisa — a IA cria na hora.',
   aiGskLoginBtn: 'Entrar no Genspark',
+  aiGskLoginOk: 'Conectado ao Genspark',
   aiUndelivered: 'Não enviado',
   aiRetry: 'Tentar novamente',
   aiOpenAssistant: 'Abrir assistente de IA',
@@ -62,6 +63,8 @@ export const pt = {
   aiUnknownError: 'Erro desconhecido',
   aiTimeoutError:
     'A solicitação de IA expirou: sem resposta da rede, a execução foi interrompida. Verifique sua conexão e tente novamente',
+  aiRegionError:
+    'O fornecedor deste modelo não atende à sua região atual — escolha outro modelo ou mude de rede',
   aiOverloadedError:
     'O serviço de IA está sobrecarregado no momento — tente novamente em instantes',
   aiNetworkError:

@@ -18,6 +18,7 @@ export const pl = {
   aiQcStopped: 'Sprawdzanie układu zatrzymane',
   aiQcCapped: 'Pozostałe {count} stron(y) nie sprawdzono (limit na uruchomienie)',
   aiGskLoginBtn: 'Zaloguj się do Genspark',
+  aiGskLoginOk: 'Zalogowano do Genspark',
   aiPanelTitle: 'Genspark',
   aiOpenAssistant: 'Otwórz asystenta AI',
   aiFactCheckBtn: 'Weryfikacja AI',
@@ -110,6 +111,8 @@ export const pl = {
   aiErrUnknown: 'Nieznany błąd',
   aiErrStreamTimeout:
     'Przekroczono limit czasu żądania AI: brak odpowiedzi sieci, przerwano. Sprawdź połączenie i spróbuj ponownie',
+  aiErrRegion:
+    'Dostawca tego modelu nie obsługuje Twojego obecnego regionu — wybierz inny model lub zmień sieć',
   aiErrOverloaded: 'Usługa AI jest obecnie przeciążona — spróbuj ponownie za chwilę',
   aiErrNetwork:
     'Problem z siecią: nie można połączyć się z usługą AI. Sprawdź połączenie i spróbuj ponownie',
@@ -223,5 +226,4 @@ export const pl = {
   aiSumSaveTemplate: 'Zapisano szablon stylu „{name}”',
   aiSumTemplatesEmpty: 'Szablony stylu (pusto)',
   aiSumListTemplates: 'Wyświetlono szablony stylu: {count}',
-  aiPageCloudToLocal: 'Chmura niedostępna — wygenerowano lokalnie',
 } satisfies Record<keyof typeof zh, string>

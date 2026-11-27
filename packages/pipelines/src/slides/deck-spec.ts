@@ -17,8 +17,13 @@ import {
   type PageSpec,
   type ParseSpecOptions,
 } from './page-spec'
+import { parseLenientJson } from './lenient-json'
 
 export const MAX_DECK_PAGES = 60
+/** Raw LLM deck-spec budget; larger payloads are rejected before JSON.parse. */
+export const MAX_DECK_SPEC_RAW_CHARS = 2_000_000
+/** CLI spec files may inline data: URL images, so the file budget is far wider. */
+export const MAX_LOCAL_DECK_SPEC_RAW_CHARS = 64_000_000
 
 export interface DeckSpec {
   pages: PageSpec[]
@@ -40,12 +45,13 @@ export function parseDeckSpec(
   raw: string,
   opts: ParseSpecOptions = {},
 ): { ok: true; spec: DeckSpec; issues: DeckPageIssue[] } | { ok: false; error: string } {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch (e) {
-    return { ok: false, error: `invalid JSON: ${e instanceof Error ? e.message : String(e)}` }
+  const limit = opts.localImages ? MAX_LOCAL_DECK_SPEC_RAW_CHARS : MAX_DECK_SPEC_RAW_CHARS
+  if (typeof raw !== 'string' || raw.length > limit) {
+    return { ok: false, error: `deck spec too large (limit ${limit} chars)` }
   }
+  const result = parseLenientJson(raw)
+  if (!result.ok) return { ok: false, error: `invalid JSON: ${result.error}` }
+  const parsed = result.value
   const rawPages = Array.isArray(parsed)
     ? parsed
     : parsed && typeof parsed === 'object' && Array.isArray((parsed as { pages?: unknown }).pages)

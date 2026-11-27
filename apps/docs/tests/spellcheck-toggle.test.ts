@@ -1,7 +1,5 @@
-// Review → Spelling toggles the native check-as-you-type spellchecker (r168):
-// the ribbon button flips the persisted pref, and the editorProps route (App's
-// setOptions call) must actually move the spellcheck attribute on the editable
-// DOM — a direct DOM write would be reverted by ProseMirror's attribute deco.
+// Review → Spelling shows or hides the red lines under misspelled words: the
+// ribbon button flips the persisted pref.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
@@ -36,34 +34,11 @@ describe('spellcheck preference', () => {
   })
 })
 
-describe('editorProps route', () => {
-  it('moves the spellcheck attribute on the editable DOM via setOptions', () => {
-    const editor = new Editor({
-      element: document.createElement('div'),
-      extensions: editorExtensions,
-      editorProps: { attributes: { class: 'doc-page', spellcheck: 'true' } },
-      content: { type: 'doc', content: [{ type: 'docParagraph' }] },
-    })
-    expect(editor.view.dom.getAttribute('spellcheck')).toBe('true')
-    editor.setOptions({
-      editorProps: {
-        ...editor.options.editorProps,
-        attributes: {
-          ...(editor.options.editorProps.attributes as Record<string, string>),
-          spellcheck: 'false',
-        },
-      },
-    })
-    expect(editor.view.dom.getAttribute('spellcheck')).toBe('false')
-    editor.destroy()
-  })
-})
-
 describe('Review → Spelling toggle', () => {
   let editor: Editor
   let root: Root
   let container: HTMLElement
-  const onSpellcheck = vi.fn()
+  const onCommand = vi.fn()
 
   function renderRibbon(spellcheck: boolean) {
     act(() =>
@@ -71,16 +46,16 @@ describe('Review → Spelling toggle', () => {
         createElement(Ribbon, {
           ...ribbonProps(editor, computeFormatState(editor)),
           spellcheck,
-          onSpellcheck,
+          onCommand,
         }),
       ),
     )
   }
 
   const spellingButton = () =>
-    [...container.querySelectorAll<HTMLButtonElement>('.rb-big')].find(
-      // the icon's SVG text glyph ("abc") is part of textContent, so match the label span
-      (b) => b.querySelector('span:last-child')?.textContent === t('ribbonSpellcheckBtn'),
+    [...container.querySelectorAll<HTMLButtonElement>('.rb-small')].find(
+      // the icon's SVG text glyph ("abc") is part of textContent, so match its tail
+      (b) => b.textContent?.endsWith(t('ribbonSpellcheckBtn')),
     )
 
   beforeEach(() => {
@@ -94,10 +69,10 @@ describe('Review → Spelling toggle', () => {
     act(() => root.unmount())
     container.remove()
     editor.destroy()
-    onSpellcheck.mockClear()
+    onCommand.mockClear()
   })
 
-  it('shows an active toggle that reports the flipped state on click', () => {
+  it('shows an active toggle that runs the spelling command on click', () => {
     renderRibbon(true)
     const reviewTab = [...container.querySelectorAll<HTMLButtonElement>('.ribbon-tab')].find(
       (b) => b.textContent === t('ribbonTabReview'),
@@ -106,7 +81,7 @@ describe('Review → Spelling toggle', () => {
     const btn = spellingButton()!
     expect(btn.className).toContain('active')
     act(() => btn.click())
-    expect(onSpellcheck).toHaveBeenCalledWith(false)
+    expect(onCommand).toHaveBeenCalledWith('toggle-spellcheck')
   })
 
   it('renders inactive when spellcheck is off and re-enables on click', () => {
@@ -118,6 +93,6 @@ describe('Review → Spelling toggle', () => {
     const btn = spellingButton()!
     expect(btn.className).not.toContain('active')
     act(() => btn.click())
-    expect(onSpellcheck).toHaveBeenCalledWith(true)
+    expect(onCommand).toHaveBeenCalledWith('toggle-spellcheck')
   })
 })

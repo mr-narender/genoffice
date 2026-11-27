@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react'
 import { IconEnter, IconSend, IconStop } from './icons'
 import { useAiPanelPrefs } from './ai-panel-prefs-store'
+import { useImeEnterGuard } from './ime-enter'
 
 // Keep in sync with the CSS `max-height` on `.ai-input-box textarea` (7 lines à 24px)
 const MAX_TEXTAREA_HEIGHT = 168
@@ -10,6 +11,7 @@ const MAX_TEXTAREA_HEIGHT = 168
  * (Enter sends, Shift+Enter newline, Esc stops) plus a footer with optional
  * app-specific controls, a shortcut hint, and the send/stop button.
  * Renders the `.ai-input-box` class family; each app themes it in its own CSS.
+ * While busy, Enter queues the draft instead (see useChatRunQueue).
  */
 export function AiComposer({
   value,
@@ -22,6 +24,7 @@ export function AiComposer({
   stopLabel,
   ariaLabel,
   header,
+  queueStrip,
   footerStart,
   iconOnly = false,
   sendIconEnabled,
@@ -30,6 +33,8 @@ export function AiComposer({
   textareaRef,
   onChange,
   onSend,
+  onQueue,
+  queuePlaceholder,
   onStop,
   onPasteFiles,
   onPasteText,
@@ -45,6 +50,8 @@ export function AiComposer({
   readonly ariaLabel?: string | undefined
   /** content inside the box above the textarea (attachment chips, …) — Genspark composer style */
   readonly header?: React.ReactNode
+  /** queued-messages strip, rendered above the header while replies run */
+  readonly queueStrip?: React.ReactNode
   /** extra controls at the left of the footer (attach button, toggles, …) */
   readonly footerStart?: React.ReactNode
   /** compact variant: no hint text, icon-only enter/stop button (Genspark composer style) */
@@ -58,6 +65,10 @@ export function AiComposer({
   readonly textareaRef?: React.RefObject<HTMLTextAreaElement | null> | undefined
   readonly onChange: (next: string) => void
   readonly onSend: () => void
+  /** while busy, Enter queues the draft instead of sending (MiniMax-style queue) */
+  readonly onQueue?: (() => void) | undefined
+  /** placeholder shown while busy and queueing is available, naming the Enter/Esc swap */
+  readonly queuePlaceholder?: string | undefined
   readonly onStop: () => void
   /** clipboard files pasted into the textarea (screenshots, copied files); text paste stays native */
   readonly onPasteFiles?: ((files: File[]) => void) | undefined
@@ -67,6 +78,7 @@ export function AiComposer({
   const innerRef = useRef<HTMLTextAreaElement | null>(null)
   const ref = textareaRef ?? innerRef
   const canSend = value.trim().length > 0 && !busy
+  const ime = useImeEnterGuard()
   const { spellcheck } = useAiPanelPrefs()
 
   // auto-grow up to ~6 lines; empty clears the inline height outright so the
@@ -84,20 +96,25 @@ export function AiComposer({
 
   return (
     <div className="ai-input-box">
+      {queueStrip}
       {header}
       <textarea
         ref={ref}
         value={value}
-        placeholder={placeholder}
+        placeholder={busy && onQueue && queuePlaceholder ? queuePlaceholder : placeholder}
         aria-label={ariaLabel}
         rows={1}
         dir="auto"
         spellCheck={spellcheck}
         onChange={(e) => onChange(e.target.value)}
+        onCompositionStart={ime.handleCompositionStart}
+        onCompositionEnd={ime.handleCompositionEnd}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+          if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault()
+            if (ime.isImeConfirm(e.nativeEvent)) return
             if (canSend) onSend()
+            else if (busy && onQueue) onQueue()
           } else if (e.key === 'Escape' && busy) {
             e.preventDefault()
             onStop()

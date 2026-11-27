@@ -151,9 +151,10 @@ describe('pastePayload', () => {
     editor.destroy()
   })
 
-  it('Paste Special choices: picture needs a bitmap, text needs text', () => {
+  it('Paste Special choices: picture needs something to show, text needs text', () => {
     const { editor, pasteText } = makeEditor()
-    expect(pastePayload(editor, { html: '', text: 'plain', image: null }, 'picture')).toBe(false)
+    // copied text is drawn as a picture now (paste-as-picture.test.ts); an empty clipboard is not
+    expect(pastePayload(editor, { html: '', text: '  ', image: null }, 'picture')).toBe(false)
     expect(pastePayload(editor, { html: '', text: '', image: null }, 'text')).toBe(false)
     const image = new Blob(['x'], { type: 'image/png' })
     expect(pastePayload(editor, { html: '', text: 'alt', image }, 'text')).toBe(true)
@@ -187,5 +188,16 @@ describe('readClipboardPayload', () => {
     expect(await pasteFromClipboard(editor, 'text')).toBe(true)
     expect(pasteText).toHaveBeenCalledWith('fallback', expect.anything())
     editor.destroy()
+  })
+
+  it('names the clipboard source only when the HTML declares one', async () => {
+    const { clipboardSource } = await import('../src/renderer/components/PasteSpecialDialog')
+    expect(
+      clipboardSource(
+        '<html><head><meta name=Generator content="Microsoft Word 15"></head></html>',
+      ),
+    ).toBe('Microsoft Word 15')
+    expect(clipboardSource("<meta content='Sheets' name='generator'>")).toBe('Sheets')
+    expect(clipboardSource('<p>plain</p>')).toBe('')
   })
 })

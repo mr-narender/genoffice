@@ -5,6 +5,7 @@ export const vi = {
   aiEmptyBuildTitle: 'Để AI xây dựng sổ làm việc này cho bạn',
   aiEmptyBuildBody: 'Mô tả bảng, dữ liệu hoặc biểu đồ bạn cần — AI sẽ tạo trực tiếp tại chỗ.',
   aiGskLoginBtn: 'Đăng nhập vào Genspark',
+  aiGskLoginOk: 'Đã đăng nhập Genspark',
   aiUndelivered: 'Chưa gửi',
   aiRetry: 'Thử lại',
   aiOpenAssistant: 'Mở trợ lý AI',
@@ -62,6 +63,8 @@ export const vi = {
   aiUnknownError: 'Lỗi không xác định',
   aiTimeoutError:
     'Yêu cầu AI đã hết thời gian: mạng không phản hồi nên quá trình đã dừng lại. Hãy kiểm tra kết nối và thử lại',
+  aiRegionError:
+    'Nhà cung cấp của mô hình này không phục vụ khu vực hiện tại của bạn — hãy chọn mô hình khác hoặc đổi mạng',
   aiOverloadedError: 'Dịch vụ AI hiện đang bận — vui lòng thử lại sau giây lát',
   aiNetworkError: 'Sự cố mạng: không thể kết nối với dịch vụ AI. Hãy kiểm tra kết nối và thử lại',
   aiCreditsExhausted:

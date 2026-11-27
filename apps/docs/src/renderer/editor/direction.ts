@@ -1,8 +1,9 @@
 import type { Editor } from '@tiptap/core'
 import type { Lang } from '@genoffice/i18n'
 import { Extension } from '@tiptap/core'
-import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { NodeSelection, Plugin, PluginKey } from '@tiptap/pm/state'
 import { Mapping } from '@tiptap/pm/transform'
+import type { ParaFormat, Run } from '@genoffice/docx-engine'
 
 /** paragraph-like blocks that carry the bidi attribute */
 const DIR_BLOCKS = new Set(['docParagraph', 'docHeading', 'docListItem'])
@@ -24,6 +25,14 @@ export function firstStrongDir(text: string): 'ltr' | 'rtl' | null {
     return RTL_CHAR.test(ch) ? 'rtl' : 'ltr'
   }
   return null
+}
+
+/** render-only RTL for a paragraph without w:bidi: first strong character, else any w:rtl run */
+export function inferredBidi(format: ParaFormat | undefined, runs: Run[] | undefined): boolean {
+  if (format?.bidi || !runs?.length) return false
+  const strong = firstStrongDir(runs.map((r) => r.text).join(''))
+  if (strong) return strong === 'rtl'
+  return runs.some((r) => r.rtl)
 }
 
 /** effective direction: explicit w:bidi or the render-only inferred flag */
@@ -62,7 +71,7 @@ export function activeBidi(editor: Editor): boolean {
  * side clears the attr, aligning to the end side sets it explicitly.
  */
 export function alignAttrFor(
-  align: 'left' | 'center' | 'right' | 'justify',
+  align: 'left' | 'center' | 'right' | 'justify' | 'distribute',
   bidi: boolean,
 ): string | null {
   if (align === 'left') return bidi ? 'left' : null
@@ -80,7 +89,7 @@ function dirFlipAttrs(attrs: Record<string, unknown>, bidi: boolean): Record<str
   if (align === 'left') align = 'right'
   else if (align === 'right') align = 'left'
   // an explicit direction choice supersedes the render-only inference
-  return { ...attrs, bidi, align, bidiInferred: false }
+  return { ...attrs, bidi, align, bidiInherited: false, bidiInferred: false }
 }
 
 /**
@@ -91,32 +100,77 @@ function dirFlipAttrs(attrs: Record<string, unknown>, bidi: boolean): Record<str
  */
 export function setSelectionAlign(
   editor: Editor,
-  align: 'left' | 'center' | 'right' | 'justify',
+  align: 'left' | 'center' | 'right' | 'justify' | 'distribute',
 ): boolean {
   return editor
     .chain()
     .focus()
     .command(({ state, tr, dispatch }) => {
-      const { from, to } = state.selection
       let changed = false
-      state.doc.nodesBetween(from, to, (node, pos) => {
-        if (DIR_BLOCKS.has(node.type.name)) {
-          const value = alignAttrFor(align, effectiveBidi(node.attrs))
-          tr.setNodeMarkup(pos, undefined, { ...node.attrs, align: value })
-          changed = true
-        } else if (node.type.name === 'docProtected') {
-          // alignment also applies to selected images (w:jc on the image paragraph)
-          tr.setNodeMarkup(pos, undefined, {
-            ...node.attrs,
-            imageAlign: alignAttrFor(align, false),
-          })
-          changed = true
-        }
-      })
+      // every range: a table cell selection (a row picked from the margin, a
+      // column, a block of cells) is one range per cell, and Word aligns them all
+      const visit = (from: number, to: number) =>
+        state.doc.nodesBetween(from, to, (node, pos) => {
+          if (DIR_BLOCKS.has(node.type.name)) {
+            const value = alignAttrFor(align, effectiveBidi(node.attrs))
+            tr.setNodeMarkup(pos, undefined, { ...node.attrs, align: value })
+            changed = true
+          } else if (node.type.name === 'docProtected') {
+            // alignment also applies to selected images (w:jc on the image paragraph)
+            tr.setNodeMarkup(pos, undefined, {
+              ...node.attrs,
+              imageAlign: alignAttrFor(align, false),
+            })
+            changed = true
+          }
+        })
+      for (const range of state.selection.ranges) visit(range.$from.pos, range.$to.pos)
       if (changed && dispatch) dispatch(tr)
       return changed
     })
     .run()
+}
+
+/**
+ * The Home alignment buttons and ⌘L / ⌘E / ⌘R. Word: with the whole table
+ * selected (its move handle), Left / Center / Right move the table itself, not
+ * the text in its cells. Kept to these entry points: the Paragraph dialog
+ * applies its alignment to the paragraphs through setSelectionAlign, and must
+ * leave the table where it is.
+ */
+export function alignSelectionOrTable(
+  editor: Editor,
+  align: 'left' | 'center' | 'right' | 'justify' | 'distribute',
+): boolean {
+  const { selection } = editor.state
+  if (
+    selection instanceof NodeSelection &&
+    selection.node.type.name === 'docTable' &&
+    (align === 'left' || align === 'center' || align === 'right')
+  ) {
+    return alignSelectedTable(editor, selection, align)
+  }
+  return setSelectionAlign(editor, align)
+}
+
+function alignSelectedTable(
+  editor: Editor,
+  selection: NodeSelection,
+  align: 'left' | 'center' | 'right',
+): boolean {
+  const table = selection.node
+  // a floating table is placed by its w:tblpPr, which the alignment does not move
+  if (table.attrs.tblFloat === 'left' || table.attrs.tblFloat === 'right') return false
+  const tr = editor.state.tr.setNodeMarkup(selection.from, undefined, {
+    ...table.attrs,
+    // 'left' is written as no w:jc; the indent only applies to a left-aligned table
+    tblAlign: align,
+  })
+  // keep the whole table selected, as Word does, so a second press works too
+  tr.setSelection(NodeSelection.create(tr.doc, selection.from))
+  editor.view.dispatch(tr)
+  editor.commands.focus()
+  return true
 }
 
 /** Set the writing direction of every paragraph-like block in the selection. */

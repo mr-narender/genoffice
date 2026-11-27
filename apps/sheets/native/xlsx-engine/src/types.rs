@@ -67,6 +67,20 @@ pub struct SheetMetadata {
     /// background recovery saves whose string-based patch path would require
     /// several copies of a very large entry in the Electron main process.
     pub source_xml_bytes: u64,
+    /// Cells with a value, formula or style — the full-load budget the host
+    /// gates on (row_count x column_count is only the bounding box). Absent
+    /// once the workbook's STORED_CELL_COUNT_BUDGET is spent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_cell_count: Option<usize>,
+    /// Stored cells with a value or formula — what sorting and filtering
+    /// need resident; style-only blanks are the remainder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_cell_count: Option<usize>,
+    /// Rows and columns spanned by the value cells (1-based extents).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_row_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_column_count: Option<usize>,
     pub column_widths: Vec<ColumnWidth>,
     pub default_row_height: Option<f64>,
     /// sheetFormatPr/@customHeight: the default row height is user-fixed, so
@@ -79,6 +93,9 @@ pub struct SheetMetadata {
     pub base_column_width: Option<f64>,
     pub freeze: Option<FreezePane>,
     pub hidden: bool,
+    /// state="veryHidden": hidden too, but Excel only unhides it via VBA.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub very_hidden: bool,
     pub tab_color: Option<String>,
     pub show_grid_lines: bool,
     /// sheetView/@showFormulas: the sheet opens in formula view (#188).
@@ -90,6 +107,17 @@ pub struct SheetMetadata {
     /// Saved normal-view zoom percent (10-400); omitted at the 100% default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zoom_scale: Option<u16>,
+    /// sheetFormatPr/@outlineLevelRow|Col: the outline gutter sizes itself
+    /// from these before any row streams in.
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    pub outline_level_row: u8,
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    pub outline_level_col: u8,
+    /// sheetPr/outlinePr summaryBelow / summaryRight; omitted at the default (true).
+    #[serde(skip_serializing_if = "Clone::clone")]
+    pub outline_summary_below: bool,
+    #[serde(skip_serializing_if = "Clone::clone")]
+    pub outline_summary_right: bool,
     pub tables: Vec<TableInfo>,
     pub comments: Vec<CommentInfo>,
     /// PivotTable output areas — protected from edits by the renderer.
@@ -113,6 +141,15 @@ pub struct SheetMetadata {
     /// In-cell rich-value pictures ("place picture in cell").
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cell_images: Vec<CellImageInfo>,
+    /// Protection is known before cell indexing starts.
+    pub protection: SheetProtectionMetadata,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetProtectionMetadata {
+    pub sheet_protection: Option<SheetProtectionInfo>,
+    pub protected_ranges: Vec<ProtectedRangeInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -309,6 +346,10 @@ pub struct TableInfo {
     pub header_bottom_border_style: Option<String>,
 }
 
+pub(crate) fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 pub(crate) fn is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -324,6 +365,48 @@ pub struct CommentInfo {
     pub column: usize,
     pub author: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadInfo>,
+    /// The picture the note's shape is showing, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<CommentImageInfo>,
+}
+
+/// A note's picture, fetched through the `read_media` command rather than
+/// carried inline: the bytes of a photograph do not belong in the metadata a
+/// workbook hands back for every sheet it has.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentImageInfo {
+    /// Media lookup key for the read_media command.
+    pub id: String,
+    #[serde(skip_serializing)]
+    pub media_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReplyInfo {
+    pub id: String,
+    pub person_id: String,
+    pub author: String,
+    pub d_t: String,
+    pub text: String,
+}
+
+/// A threaded (modern) comment's identity, replies and resolved flag; the
+/// root text is the comment's `text` when `replies` is empty, otherwise the
+/// `text` is the display body and the root text lives here.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadInfo {
+    pub id: String,
+    pub person_id: String,
+    pub author: String,
+    pub d_t: String,
+    pub done: bool,
+    pub text: String,
+    pub replies: Vec<ThreadReplyInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -361,7 +444,11 @@ pub struct CellRange {
 }
 
 impl CellRange {
-    pub(crate) fn validate(&self, sheet: &SheetMetadata) -> Result<(), SidecarError> {
+    pub(crate) fn validate(
+        &self,
+        sheet: &SheetMetadata,
+        sparse_rows: Option<&[usize]>,
+    ) -> Result<(), SidecarError> {
         if self.start_row > self.end_row || self.start_column > self.end_column {
             return Err(SidecarError::InvalidRequest(
                 "Range boundaries are reversed.".into(),
@@ -372,7 +459,18 @@ impl CellRange {
                 "Range is outside the worksheet.".into(),
             ));
         }
-        let row_count = self.end_row - self.start_row + 1;
+        if sparse_rows.is_some_and(|rows| {
+            rows.is_empty()
+                || rows.len() > 512
+                || rows[0] < self.start_row
+                || rows[rows.len() - 1] > self.end_row
+                || rows.windows(2).any(|pair| pair[0] >= pair[1])
+        }) {
+            return Err(SidecarError::InvalidRequest(
+                "Invalid sparse row selection.".into(),
+            ));
+        }
+        let row_count = sparse_rows.map_or(self.end_row - self.start_row + 1, <[usize]>::len);
         let column_count = self.end_column - self.start_column + 1;
         if row_count.saturating_mul(column_count) > MAX_RANGE_CELLS {
             return Err(SidecarError::InvalidRequest(format!(
@@ -383,7 +481,7 @@ impl CellRange {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CellValue {
     String(String),
@@ -433,7 +531,16 @@ pub struct SharedString {
     pub(crate) runs: Option<Vec<RichRun>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RangeReadMode {
+    #[default]
+    Wait,
+    Viewport,
+    Status,
+}
+
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RangeResult {
     pub cells: Vec<CellRecord>,
@@ -496,12 +603,50 @@ pub struct CustomFilterItem {
     pub operator: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetProtectionInfo {
     pub protected: bool,
     /// password= (legacy) or algorithmName/hashValue (modern) present.
     pub has_password: bool,
+    pub allow: SheetProtectionAllow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<SheetPasswordHash>,
+}
+
+/// What stays available while the sheet is protected (Excel's dialog list).
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetProtectionAllow {
+    pub select_locked_cells: bool,
+    pub select_unlocked_cells: bool,
+    pub format_cells: bool,
+    pub format_columns: bool,
+    pub format_rows: bool,
+    pub insert_columns: bool,
+    pub insert_rows: bool,
+    pub insert_hyperlinks: bool,
+    pub delete_columns: bool,
+    pub delete_rows: bool,
+    pub sort: bool,
+    pub auto_filter: bool,
+    pub pivot_tables: bool,
+    pub objects: bool,
+    pub scenarios: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all_fields = "camelCase", untagged)]
+pub enum SheetPasswordHash {
+    Legacy {
+        legacy: String,
+    },
+    Hashed {
+        algorithm_name: String,
+        hash_value: String,
+        salt_value: String,
+        spin_count: u32,
+    },
 }
 
 /// Inches, from `<pageMargins>`.
@@ -594,14 +739,54 @@ pub struct ProtectedRangeInfo {
     pub has_password: bool,
 }
 
+/// Outline attributes of every <row> that carries them, collected while
+/// indexing so the gutter does not depend on which rows have streamed in.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowOutlineEntry {
+    pub row: usize,
+    pub level: u8,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowOutlineResult {
+    pub rows: Vec<RowOutlineEntry>,
+    pub indexing_complete: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormulaCellsResult {
+    /// Masters and ordinary formula cells only; shared-formula followers are
+    /// described by `shared_groups`.
     pub cells: Vec<CellRecord>,
+    pub shared_groups: Vec<SharedFormulaGroup>,
     pub indexing_complete: bool,
     /// True when the sheet has more formula cells than the response cap —
     /// the caller must treat the list as unusable for closure analysis.
     pub truncated: bool,
+}
+
+/// One `<f t="shared">` group: the master cell plus the follower cells that
+/// inherit its formula shifted by their offset. `range` is set when the
+/// followers fill the declared `ref` span exactly; otherwise `cells` lists
+/// every follower (0-based `[row, column]`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFormulaGroup {
+    pub si: u32,
+    pub row: usize,
+    pub column: usize,
+    pub formula: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<MergedRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<[usize; 2]>>,
 }
 
 #[derive(Clone, Debug, Serialize)]

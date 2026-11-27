@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   RibbonCollapseButton,
   RibbonExpandButton,
@@ -64,6 +64,8 @@ interface Props {
   dirty: boolean
   onSave: () => void
   onSaveAs: () => void
+  /** Ask the model for a name, then open Save As with it prefilled */
+  onNameWithAi: () => void
   onFind: () => void
   canUndo: boolean
   canRedo: boolean
@@ -78,6 +80,10 @@ interface Props {
   canInsert: boolean
   /** images come from a picked file by default; `url` places a remote image instead; tables take the picker's rows × cols */
   onInsert: (kind: InsertKind, opts?: InsertOptions) => void
+  /** replace a still-blank page with the document skeleton, in the UI language */
+  onInsertSkeleton: () => void
+  /** false once the page has content: a skeleton would only duplicate the document */
+  canInsertSkeleton: boolean
   /** page-wide AI actions: send this instruction to the assistant right away */
   onAiPreset: (text: string) => void
   canvasMode: CanvasMode
@@ -137,28 +143,14 @@ export function Ribbon(p: Props) {
   const themeRef = useRef<HTMLDivElement>(null)
   useDismissablePopover(themeOpen, () => setThemeOpen(false), {
     inside: () => [themeRef.current],
+    escape: true,
   })
-  useEffect(() => {
-    if (!themeOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setThemeOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [themeOpen])
   const [presentOpen, setPresentOpen] = useState(false)
   const presentRef = useRef<HTMLDivElement>(null)
   useDismissablePopover(presentOpen, () => setPresentOpen(false), {
     inside: () => [presentRef.current],
+    escape: true,
   })
-  useEffect(() => {
-    if (!presentOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPresentOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [presentOpen])
 
   const [insertPop, setInsertPop] = useState<InsertPopover | null>(null)
   const [imageUrl, setImageUrl] = useState('')
@@ -176,15 +168,8 @@ export function Ribbon(p: Props) {
     insertPop === pop ? closeInsert() : setInsertPop(pop)
   useDismissablePopover(insertPop !== null, closeInsert, {
     inside: () => [imageRef.current, tableRef.current, moreRef.current],
+    escape: true,
   })
-  useEffect(() => {
-    if (insertPop === null) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeInsert()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [insertPop])
   const submitImageUrl = () => {
     const url = imageUrl.trim()
     if (!url) return
@@ -223,6 +208,17 @@ export function Ribbon(p: Props) {
           onClick={p.onSaveAs}
         >
           {t('saveAs')}
+        </button>
+        <button
+          type="button"
+          className="qa-btn qa-name-with-ai"
+          data-tip={t('aiNameFile')}
+          aria-label={t('aiNameFile')}
+          disabled={off}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={p.onNameWithAi}
+        >
+          {t('aiNameFile')}
         </button>
         <button
           type="button"
@@ -506,6 +502,19 @@ export function Ribbon(p: Props) {
                       {t(INSERT_LABEL[kind])}
                     </button>
                   ))}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={!p.canInsertSkeleton}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      closeInsert()
+                      p.onInsertSkeleton()
+                    }}
+                  >
+                    <IconCode size={16} />
+                    {t('insertSkeleton')}
+                  </button>
                 </div>
               )}
             </div>

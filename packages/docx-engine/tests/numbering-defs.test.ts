@@ -4,6 +4,8 @@ import {
   computeListMarkerInfos,
   computeListMarkers,
   customEnumItems,
+  customLevelFromNumberingLevel,
+  customLevelXml,
   formatNumber,
   markerTabAdvance,
   mergeLevelXml,
@@ -11,6 +13,7 @@ import {
   saveDocx,
   type SaveBlock,
 } from '../src/index'
+import { unlinkListStyleXml } from '../src/patch'
 import { buildDocx, TINY_PNG_BASE64 } from './helpers/build-docx'
 
 const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
@@ -51,6 +54,38 @@ describe('numbering definitions (word/numbering.xml)', () => {
     // follow the abstractNum
     expect(num2.levels[1]).toEqual({ numFmt: 'upperRoman', lvlText: '%2:', start: 5 })
     expect(num2.levels[0]).toEqual({ numFmt: 'decimal', lvlText: '%1.', start: 1 })
+  })
+
+  it('reads level w:ind as logical start/end with an absent left = 0, and the level w:bidi', async () => {
+    // Word probe 2026-10-20: a bidi level `right=360 hanging=360` hangs the marker
+    // 18pt outside the start (right) margin and indents the end (left) side by 18pt
+    const numbering =
+      XML_DECL +
+      '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+      '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/>' +
+      '<w:numFmt w:val="bullet"/><w:lvlText w:val="-"/><w:lvlJc w:val="right"/>' +
+      '<w:pPr><w:bidi/><w:ind w:right="360" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>' +
+      '<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/>' +
+      '<w:numFmt w:val="bullet"/><w:lvlText w:val="-"/>' +
+      '<w:pPr><w:ind w:start="720" w:end="120" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>' +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>' +
+      '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>' +
+      '</w:numbering>'
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml:
+          '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>' +
+          '<w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>',
+        numberingXml: numbering,
+      }),
+    )
+    const rtl = doc.numbering.get('1')?.levels[0]
+    expect(rtl).toMatchObject({ indentLeft: 0, indentRight: 360, hanging: 360, bidi: true })
+    expect(doc.numbering.get('2')?.levels[0]).toMatchObject({ indentLeft: 720, indentRight: 120 })
+    expect(doc.numbering.get('2')?.levels[0]?.bidi).toBeUndefined()
+    // the level's w:bidi makes the paragraph bidi: w:jc left is the start edge (visual right)
+    const item = doc.blocks.find((b) => b.type === 'listItem')
+    expect(item && 'format' in item ? item.format?.align : undefined).toBe('right')
   })
 
   it('keeps the bullet/ordered classification for list blocks', async () => {
@@ -156,6 +191,28 @@ describe('missing w:start default', () => {
       doc.numbering,
     )
     expect(markers).toEqual(['0.', '1.'])
+  })
+
+  it('letter formats clamp a missing or zero w:start to the first letter instead of an empty marker', async () => {
+    const letters = NO_START_NUMBERING.replace('w:val="decimal"', 'w:val="lowerLetter"')
+    const li = (text: string) =>
+      '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>' +
+      `<w:r><w:t>${text}</w:t></w:r></w:p>`
+    const doc = await parseDocx(
+      await buildDocx({ bodyXml: li('a') + li('b'), numberingXml: letters }),
+    )
+    const markers = computeListMarkers(
+      [
+        { numId: '1', ilvl: 0 },
+        { numId: '1', ilvl: 0 },
+      ],
+      doc.numbering,
+    )
+    // the counter still starts at 0 (as for decimal); only the glyph is floored, like toRoman
+    expect(markers[0]).toBe('a.')
+    expect(markers.every((m) => m !== '.')).toBe(true)
+    expect(formatNumber(0, 'lowerLetter')).toBe('a')
+    expect(formatNumber(-3, 'upperLetter')).toBe('A')
   })
 })
 
@@ -292,6 +349,275 @@ describe('w:numStyleLink indirection', () => {
   })
 })
 
+describe('named list styles', () => {
+  const LIST_STYLES =
+    '<w:style w:type="numbering" w:default="1" w:styleId="NoList"><w:name w:val="No List"/></w:style>' +
+    '<w:style w:type="numbering" w:styleId="Clauses" w:customStyle="1"><w:name w:val="Clauses"/>' +
+    '<w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style>'
+  const STYLED_NUMBERING =
+    XML_DECL +
+    '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    '<w:abstractNum w:abstractNumId="0"><w:numStyleLink w:val="Clauses"/></w:abstractNum>' +
+    '<w:abstractNum w:abstractNumId="1"><w:styleLink w:val="Clauses"/>' +
+    '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl>' +
+    '</w:abstractNum>' +
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>' +
+    '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>' +
+    '</w:numbering>'
+  const P = (text: string) => `<w:p><w:r><w:t>${text}</w:t></w:r></w:p>`
+  const originals = (doc: Awaited<ReturnType<typeof parseDocx>>): SaveBlock[] =>
+    doc.blocks
+      .filter((b) => !b.hidden && b.docxIndex !== null)
+      .map((b) => ({ kind: 'original', docxIndex: b.docxIndex! }))
+  const LEVELS = [
+    { numFmt: 'decimal', lvlText: '%1)', indentLeft: 360, hanging: 360 },
+    { numFmt: 'lowerLetter', lvlText: '%2)', indentLeft: 720, hanging: 360 },
+  ]
+
+  it('lists the styles of type numbering with the levels of their abstractNum', async () => {
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: P('x'),
+        extraStylesXml: LIST_STYLES,
+        numberingXml: STYLED_NUMBERING,
+      }),
+    )
+    expect(doc.listStyles?.map((s) => s.styleId)).toEqual(['NoList', 'Clauses'])
+    const [none, clauses] = doc.listStyles!
+    expect(none).toMatchObject({ name: 'No List', isDefault: true, levels: {} })
+    expect(none.numId).toBeUndefined()
+    expect(clauses).toMatchObject({ name: 'Clauses', numId: '2', custom: true })
+    expect(clauses.levels[0]).toMatchObject({ numFmt: 'upperRoman', lvlText: '%1.' })
+    expect(doc.numbering.get('1')!.listStyleId).toBe('Clauses')
+    expect(doc.numbering.get('2')!.listStyleId).toBe('Clauses')
+    expect(doc.styles.has('Clauses')).toBe(false)
+  })
+
+  it('styleNums: a new w:num over an abstractNum that only links to the existing style', async () => {
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: P('x'),
+        extraStylesXml: LIST_STYLES,
+        numberingXml: STYLED_NUMBERING,
+      }),
+    )
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: {
+        styleNums: [
+          {
+            numId: '7',
+            styleId: 'Clauses',
+            define: { name: 'Clauses', numId: '8', levels: LEVELS },
+          },
+        ],
+      },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const numXml = await zip.file('word/numbering.xml')!.async('string')
+    expect(numXml).toContain(
+      '<w:abstractNum w:abstractNumId="2"><w:multiLevelType w:val="multilevel"/><w:numStyleLink w:val="Clauses"/></w:abstractNum>',
+    )
+    expect(numXml).toContain('<w:num w:numId="7"><w:abstractNumId w:val="2"/></w:num>')
+    // the style is already there: nothing is defined a second time
+    expect(numXml).not.toContain('w:numId="8"')
+    expect(numXml.match(/<w:styleLink /g)).toHaveLength(1)
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml.match(/w:styleId="Clauses"/g)).toHaveLength(1)
+    const reparsed = await parseDocx(saved)
+    expect(reparsed.numbering.get('7')).toMatchObject({ listStyleId: 'Clauses' })
+    expect(reparsed.numbering.get('7')!.levels[0]).toMatchObject({ numFmt: 'upperRoman' })
+  })
+
+  it('a list style name and level text holding `$&` are written as typed', async () => {
+    const name = "Cost $& Tax $' $$"
+    const levels = [{ ...LEVELS[0], lvlText: '$&%1$$' }, ...LEVELS.slice(1)]
+    const doc = await parseDocx(await buildDocx({ bodyXml: P('x') }))
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: { styleDefs: [{ styleId: 'Costs', name, numId: '5', levels }] },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml.match(/<\/w:styles>/g)).toHaveLength(1)
+    expect(
+      (await zip.file('word/numbering.xml')!.async('string')).match(/<\/w:numbering>/g),
+    ).toHaveLength(1)
+    const style = (await parseDocx(saved)).listStyles!.find((s) => s.styleId === 'Costs')!
+    expect(style.name).toBe(name)
+    expect(style.levels[0].lvlText).toBe('$&%1$$')
+  })
+
+  it('a deleted list style leaves `$$` level text whole in the lists that copied it', () => {
+    const xml =
+      '<w:numbering><w:abstractNum w:abstractNumId="1"><w:styleLink w:val="S"/>' +
+      '<w:lvl w:ilvl="0"><w:lvlText w:val="$$%1 $&amp;"/></w:lvl></w:abstractNum>' +
+      '<w:abstractNum w:abstractNumId="2"><w:numStyleLink w:val="S"/></w:abstractNum></w:numbering>'
+    expect(unlinkListStyleXml(xml, 'S')).toContain(
+      '<w:abstractNum w:abstractNumId="2"><w:lvl w:ilvl="0"><w:lvlText w:val="$$%1 $&amp;"/></w:lvl></w:abstractNum>',
+    )
+  })
+
+  it('styleDefs: a user-made list style is written though no list follows it, once', async () => {
+    const doc = await parseDocx(await buildDocx({ bodyXml: P('x') }))
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: {
+        styleDefs: [{ styleId: 'MyList', name: 'My List', numId: '5', levels: LEVELS }],
+        styleNums: [
+          {
+            numId: '6',
+            styleId: 'MyList',
+            define: { name: 'My List', numId: '7', levels: LEVELS, custom: true },
+          },
+        ],
+      },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const numXml = await zip.file('word/numbering.xml')!.async('string')
+    expect(numXml.match(/<w:styleLink w:val="MyList"\/>/g)).toHaveLength(1)
+    expect(numXml).not.toContain('w:numId="7"')
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml).toContain(
+      '<w:style w:type="numbering" w:customStyle="1" w:styleId="MyList"><w:name w:val="My List"/>',
+    )
+    const reparsed = await parseDocx(saved)
+    const style = reparsed.listStyles!.find((s) => s.styleId === 'MyList')!
+    expect(style).toMatchObject({ name: 'My List', numId: '5', custom: true })
+    expect(style.levels[1]).toMatchObject({ numFmt: 'lowerLetter', lvlText: '%2)' })
+    expect(reparsed.numbering.get('6')!.listStyleId).toBe('MyList')
+  })
+
+  it('removedStyles: the style goes, and the lists that followed it keep its levels as their own', async () => {
+    const item =
+      '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>'
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: item,
+        extraStylesXml: LIST_STYLES,
+        numberingXml: STYLED_NUMBERING,
+      }),
+    )
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: { removedStyles: ['Clauses'] },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const numXml = await zip.file('word/numbering.xml')!.async('string')
+    expect(numXml).not.toContain('tyleLink')
+    expect(numXml.match(/<w:lvl w:ilvl="0">/g)).toHaveLength(2)
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml).not.toContain('Clauses')
+    expect(stylesXml).toContain('w:styleId="NoList"')
+    const reparsed = await parseDocx(saved)
+    expect(reparsed.listStyles!.map((s) => s.styleId)).toEqual(['NoList'])
+    expect(reparsed.numbering.get('1')!.listStyleId).toBeUndefined()
+    expect(reparsed.numbering.get('1')!.levels[0]).toMatchObject({ numFmt: 'upperRoman' })
+    expect(computeListMarkers([{ numId: '1', ilvl: 0 }], reparsed.numbering)).toEqual(['I.'])
+  })
+
+  it('styleNums with define: writes the style, its abstractNum and the linking list into a document with neither', async () => {
+    const doc = await parseDocx(await buildDocx({ bodyXml: P('x') }))
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: {
+        styleNums: [
+          {
+            numId: '10',
+            styleId: '1ai',
+            define: { name: 'Outline List 1', numId: '11', levels: LEVELS },
+          },
+        ],
+      },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const numXml = await zip.file('word/numbering.xml')!.async('string')
+    const defining =
+      /<w:abstractNum w:abstractNumId="(\d+)"><w:multiLevelType w:val="multilevel"\/><w:styleLink w:val="1ai"\/><w:lvl /.exec(
+        numXml,
+      )
+    const linking =
+      /<w:abstractNum w:abstractNumId="(\d+)"><w:multiLevelType w:val="multilevel"\/><w:numStyleLink w:val="1ai"\/><\/w:abstractNum>/.exec(
+        numXml,
+      )
+    expect(defining).not.toBeNull()
+    expect(linking).not.toBeNull()
+    expect(numXml).toContain(
+      `<w:num w:numId="11"><w:abstractNumId w:val="${defining![1]}"/></w:num>`,
+    )
+    expect(numXml).toContain(
+      `<w:num w:numId="10"><w:abstractNumId w:val="${linking![1]}"/></w:num>`,
+    )
+    expect(numXml.lastIndexOf('<w:abstractNum ')).toBeLessThan(numXml.indexOf('<w:num '))
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml).toContain(
+      '<w:style w:type="numbering" w:styleId="1ai"><w:name w:val="Outline List 1"/>',
+    )
+    expect(stylesXml).toContain('<w:pPr><w:numPr><w:numId w:val="11"/></w:numPr></w:pPr></w:style>')
+
+    const reparsed = await parseDocx(saved)
+    const style = reparsed.listStyles!.find((s) => s.styleId === '1ai')!
+    expect(style).toMatchObject({ name: 'Outline List 1', numId: '11' })
+    expect(style.custom).toBeUndefined()
+    expect(style.levels[1]).toMatchObject({ numFmt: 'lowerLetter', lvlText: '%2)' })
+    expect(reparsed.numbering.get('10')!.listStyleId).toBe('1ai')
+    expect(
+      computeListMarkers(
+        [
+          { numId: '10', ilvl: 0 },
+          { numId: '10', ilvl: 1 },
+          { numId: '10', ilvl: 0 },
+        ],
+        reparsed.numbering,
+      ),
+    ).toEqual(['1)', 'a)', '2)'])
+  })
+
+  it('a package without a styles part gets one, with its relationship and content type', async () => {
+    const zip = await JSZip.loadAsync(await buildDocx({ bodyXml: P('x') }))
+    zip.remove('word/styles.xml')
+    for (const [name, pattern] of [
+      ['word/_rels/document.xml.rels', /<Relationship [^>]*Target="styles\.xml"[^>]*\/>/],
+      ['[Content_Types].xml', /<Override [^>]*PartName="\/word\/styles\.xml"[^>]*\/>/],
+    ] as const)
+      zip.file(name, (await zip.file(name)!.async('string')).replace(pattern, ''))
+    const doc = await parseDocx(await zip.generateAsync({ type: 'uint8array' }))
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: {
+        styleNums: [
+          {
+            numId: '10',
+            styleId: '1ai',
+            define: { name: 'Outline List 1', numId: '11', levels: LEVELS },
+          },
+        ],
+      },
+    })
+    const out = await JSZip.loadAsync(saved)
+    expect(await out.file('word/_rels/document.xml.rels')!.async('string')).toMatch(
+      /Type="[^"]*\/styles" Target="styles\.xml"|Target="styles\.xml"[^>]*Type="[^"]*\/styles"/,
+    )
+    expect(await out.file('[Content_Types].xml')!.async('string')).toContain(
+      'PartName="/word/styles.xml"',
+    )
+    expect((await parseDocx(saved)).listStyles?.map((s) => s.styleId)).toEqual(['1ai'])
+  })
+
+  it('two lists of one undefined style define it once', async () => {
+    const doc = await parseDocx(await buildDocx({ bodyXml: P('x') }))
+    const define = { name: 'Mine', numId: '11', levels: LEVELS }
+    const saved = await saveDocx(doc, originals(doc), {
+      numbering: {
+        styleNums: [
+          { numId: '10', styleId: 'Mine', define },
+          { numId: '12', styleId: 'Mine', define },
+        ],
+      },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const numXml = await zip.file('word/numbering.xml')!.async('string')
+    expect(numXml.match(/<w:styleLink /g)).toHaveLength(1)
+    expect(numXml.match(/<w:numStyleLink /g)).toHaveLength(2)
+    const stylesXml = await zip.file('word/styles.xml')!.async('string')
+    expect(stylesXml.match(/w:styleId="Mine"/g)).toHaveLength(1)
+  })
+})
+
 describe('numFmt "none" with empty lvlText', () => {
   const NONE_NUMBERING =
     XML_DECL +
@@ -310,6 +636,35 @@ describe('numFmt "none" with empty lvlText', () => {
       }),
     )
     expect(doc.numbering.get('1')!.levels[0].numFmt).toBe('none')
+    const markers = computeListMarkers(
+      [
+        { numId: '1', ilvl: 0 },
+        { numId: '1', ilvl: 0 },
+      ],
+      doc.numbering,
+    )
+    expect(markers).toEqual(['', ''])
+  })
+})
+
+describe('empty lvlText', () => {
+  const EMPTY_TEXT_NUMBERING =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    '<w:abstractNum w:abstractNumId="0">' +
+    '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:suff w:val="nothing"/><w:lvlText w:val=""/>' +
+    '<w:pPr><w:ind w:left="432" w:hanging="432"/></w:pPr></w:lvl>' +
+    '</w:abstractNum>' +
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>' +
+    '</w:numbering>'
+
+  it('a decimal level whose lvlText is empty shows nothing, not the counter fallback', async () => {
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: '<w:p><w:r><w:t>x</w:t></w:r></w:p>',
+        numberingXml: EMPTY_TEXT_NUMBERING,
+      }),
+    )
     const markers = computeListMarkers(
       [
         { numId: '1', ilvl: 0 },
@@ -378,6 +733,76 @@ describe('w14 custom numFmt (mc:AlternateContent)', () => {
     expect(formatNumber(5, 'custom', 'α, β, γ, ...')).toBe('β')
     expect(formatNumber(3, 'custom')).toBe('3')
   })
+
+  // genoffice#2121: the dialog shape dropped the enumeration, so a reused or
+  // re-saved custom level came back as plain digits ("Za 1:")
+  it('customLevelFromNumberingLevel carries the enumeration', async () => {
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: '<w:p><w:r><w:t>x</w:t></w:r></w:p>',
+        numberingXml: alternate('custom', 'α, β, γ, ...'),
+      }),
+    )
+    const custom = customLevelFromNumberingLevel(doc.numbering.get('1')!.levels[0])
+    expect(custom.numFmt).toBe('custom')
+    expect(custom.customFormat).toBe('α, β, γ, ...')
+  })
+
+  it('a new custom level is written as mc:AlternateContent and parses back', async () => {
+    const lvl = customLevelXml(
+      { numFmt: 'custom', customFormat: 'Za prvé, Za druhé, ...', lvlText: '%1:', indentLeft: 720 },
+      0,
+    )
+    expect(lvl).not.toMatch(/<w:numFmt w:val="custom"\/>/)
+    expect(lvl).toMatch(/<w:start[^>]*\/><mc:AlternateContent[^>]*><mc:Choice Requires="w14">/)
+    expect(lvl).toContain('<mc:Fallback><w:numFmt w:val="decimal"/></mc:Fallback>')
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: '<w:p><w:r><w:t>x</w:t></w:r></w:p>',
+        numberingXml:
+          XML_DECL +
+          '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+          `<w:abstractNum w:abstractNumId="0">${lvl}</w:abstractNum>` +
+          '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>',
+      }),
+    )
+    expect(doc.numbering.get('1')!.levels[0].customFormat).toBe('Za prvé, Za druhé, ...')
+    expect(
+      computeListMarkers(
+        [
+          { numId: '1', ilvl: 0 },
+          { numId: '1', ilvl: 0 },
+        ],
+        doc.numbering,
+      ),
+    ).toEqual(['Za prvé:', 'Za druhé:'])
+  })
+
+  it('mergeLevelXml replaces the custom numFmt in place instead of adding a bare one beside it', () => {
+    const existing =
+      '<w:lvl w:ilvl="0"><w:start w:val="1"/>' +
+      '<mc:AlternateContent><mc:Choice Requires="w14"><w:numFmt w:val="custom" w:format="α, β, γ, ..."/></mc:Choice>' +
+      '<mc:Fallback><w:numFmt w:val="decimal"/></mc:Fallback></mc:AlternateContent>' +
+      '<w:lvlText w:val="%1."/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
+    const kept = mergeLevelXml(
+      existing,
+      { numFmt: 'custom', customFormat: 'α, β, γ, ...', lvlText: '%1.', indentLeft: 1440 },
+      0,
+    )
+    expect(kept.match(/<w:numFmt\b/g)).toHaveLength(2)
+    expect(kept.match(/<mc:AlternateContent\b/g)).toHaveLength(1)
+    expect(kept).toMatch(/<w:start[^>]*\/><mc:AlternateContent/)
+    expect(kept).toContain('w:format="α, β, γ, ..."')
+    expect(kept).toContain('<w:ind w:left="1440"')
+
+    const plain = mergeLevelXml(
+      existing,
+      { numFmt: 'upperRoman', lvlText: '%1.', indentLeft: 720 },
+      0,
+    )
+    expect(plain).not.toContain('AlternateContent')
+    expect(plain).toContain('<w:start w:val="1"/><w:numFmt w:val="upperRoman"/>')
+  })
 })
 
 describe('numbering level positive w:firstLine', () => {
@@ -410,6 +835,16 @@ describe('markerTabAdvance (default tab after the marker)', () => {
   it('returns null when the marker fits the hanging area', () => {
     expect(markerTabAdvance(0, 300, 360)).toBeNull()
     expect(markerTabAdvance(0, 360, 360)).toBeNull()
+  })
+
+  it('a custom stop between the marker end and the hanging indent catches the tab', () => {
+    // numbered heading: level left=720 hanging=720, paragraph stops 450/1350/3060,
+    // one-digit marker ~160 twips -> Word starts the text at 450, not at 720
+    expect(markerTabAdvance(0, 160, 720, 720, [450, 1350, 3060, 720])).toBe(450)
+    // stops at or past the indent change nothing
+    expect(markerTabAdvance(0, 160, 720, 720, [720, 1350])).toBeNull()
+    // a stop under the marker itself is skipped
+    expect(markerTabAdvance(0, 500, 720, 720, [450])).toBeNull()
   })
 
   it('jumps to the next default-tab-grid stop when the marker overflows', () => {

@@ -11,6 +11,7 @@ import { editorExtensions } from '../src/renderer/editor/extensions'
 import { renderFieldSpec } from '../src/renderer/editor/protected-render'
 import {
   charScaleXDecls,
+  charScaleXFits,
   glowDecl,
   textAlignDecl,
   textEffectDecls,
@@ -101,11 +102,31 @@ describe('editor run rendering', () => {
     expect(spaced.style.transform).toBe('')
   })
 
+  it('letter-spaces a scaled East Asian run long enough to wrap', async () => {
+    const short = '\u65e5\u672c\u8a9e'
+    const long = '\u65e5\u672c\u8a9e\u306e\u6587'.repeat(4)
+    const spans = await renderSpans(
+      `<w:p><w:r><w:rPr><w:w w:val="85"/></w:rPr><w:t>${short}</w:t></w:r>` +
+        `<w:r><w:rPr><w:b/><w:w w:val="85"/></w:rPr><w:t>${long}</w:t></w:r></w:p>`,
+    )
+    const box = spans.find((s) => s.textContent === short)!
+    expect(box.style.transform).toBe('scaleX(0.85)')
+    const flow = spans.find((s) => s.textContent === long)!
+    expect(flow.style.transform).toBe('')
+    expect(flow.style.display).toBe('')
+    expect(flow.style.letterSpacing).toMatch(/^-0\.\d+em$/)
+    expect(charScaleXFits('unbreakablelatinword')).toBe(true)
+    expect(charScaleXFits('two words')).toBe(false)
+  })
+
   it('lowers a run by its w:position', async () => {
     const spans = await renderSpans(
       '<w:p><w:r><w:rPr><w:position w:val="-8"/></w:rPr><w:t>low</w:t></w:r></w:p>',
     )
-    expect(spans.find((s) => s.textContent === 'low')!.style.verticalAlign).toBe('-4pt')
+    const low = spans.find((s) => s.textContent === 'low')!
+    expect(low.style.position).toBe('relative')
+    expect(low.style.top).toBe('4pt')
+    expect(low.style.verticalAlign).toBe('')
   })
 })
 
@@ -135,5 +156,21 @@ describe('Hyperlink style rendering', () => {
       }) as never,
     ).dom as HTMLElement
     expect(dom.querySelector('.doc-toc-title')?.getAttribute('data-style')).toBe('Hyperlink')
+  })
+
+  it('sizes a TOC line by the union of the title and page faces (Word probe 2026-11-07)', () => {
+    const render = (pageFontFamily?: string) =>
+      DOMSerializer.renderSpec(
+        document,
+        renderFieldSpec({
+          kind: 'tocLine',
+          left: 'Article 1',
+          right: '5',
+          fontFamily: 'Century Gothic',
+          ...(pageFontFamily ? { pageFontFamily } : {}),
+        }) as never,
+      ).dom as HTMLElement
+    expect(render('Calibri').style.getPropertyValue('--doc-line-factor')).toBe('1.2745')
+    expect(render().style.getPropertyValue('--doc-line-factor')).toBe('1.2261')
   })
 })

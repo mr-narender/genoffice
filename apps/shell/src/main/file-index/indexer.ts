@@ -2,6 +2,7 @@ import { Worker } from 'node:worker_threads'
 import type { Extracted } from './extract'
 import type { WorkerRequest, WorkerResponse } from './extract-worker'
 import { isSupportedTreeFile } from '../folder-tree'
+import { isUnderExcludedFolder } from '@genoffice/electron-utils'
 import { statOrNull, type ScannedFile } from './scan'
 import type { FileIndexStore } from './store'
 
@@ -18,6 +19,9 @@ export interface IndexerSources {
   roots: () => readonly string[]
   /** files outside the roots that should still be searchable (recents, starred) */
   extraPaths: () => readonly string[]
+  /** folders the user excluded from search: roots inside them are skipped and
+   *  the walk prunes them from the trees it does enter (genoffice#2844) */
+  excludedFolders?: () => readonly string[]
 }
 
 const RESCAN_DEBOUNCE_MS = 1500
@@ -27,6 +31,21 @@ const RESCAN_DEBOUNCE_MS = 1500
  * so one bad file cannot stall indexing (and search with it) for good
  */
 const WORKER_REQUEST_TIMEOUT_MS = 120_000
+/**
+ * heap cap for the extraction worker: without resourceLimits a parse that
+ * exhausts V8's heap is a process-wide fatal OOM and takes the whole app down
+ * with it; with one, only the worker dies and the file is recorded as an error.
+ * 256 MB fits the heaviest extraction measured (a 40 MB, 7.6 M-cell xlsx) and
+ * keeps V8 collecting instead of letting a scan's garbage pile up to a gigabyte
+ */
+const WORKER_HEAP_LIMIT_MB = 256
+/**
+ * The worker is a thread of the main process, so its heap shows up as the
+ * app's memory. Once a scan and its extractions are done nothing is lost by
+ * retiring it: the next refresh spawns a fresh one in milliseconds, while an
+ * idle worker would have held the scan's heap until V8 got around to shrinking it
+ */
+const WORKER_IDLE_MS = 5_000
 
 /**
  * Keeps the store in step with the disk: a scan diffs mtime/size against the
@@ -38,12 +57,15 @@ export class FileIndexer {
   private worker: Worker | null = null
   private nextId = 1
   private readonly waiting = new Map<number, (r: WorkerResponse) => void>()
+  /** request ids posted to each worker: a retired worker's exit fails only its own */
+  private readonly postedTo = new WeakMap<Worker, Set<number>>()
   private readonly queue: ScannedFile[] = []
   private readonly queued = new Set<string>()
   private draining = false
   private scanning = false
   private scanRequested = false
   private rescanTimer: NodeJS.Timeout | null = null
+  private idleTimer: NodeJS.Timeout | null = null
   private lastScanAt = 0
   private stopped = false
 
@@ -52,7 +74,14 @@ export class FileIndexer {
     private readonly workerPath: string,
     private readonly sources: IndexerSources,
     private readonly requestTimeoutMs = WORKER_REQUEST_TIMEOUT_MS,
+    private readonly workerHeapLimitMb = WORKER_HEAP_LIMIT_MB,
+    private readonly workerIdleMs = WORKER_IDLE_MS,
   ) {}
+
+  /** whether an extraction worker is currently alive (test seam) */
+  workerIsRunning(): boolean {
+    return this.worker !== null
+  }
 
   progress(): IndexProgress {
     return { indexed: this.store.count(), pending: this.queue.length, scanning: this.scanning }
@@ -83,15 +112,22 @@ export class FileIndexer {
     try {
       const seen = new Map<string, ScannedFile>()
       let walked = true
+      let complete = true
+      const excluded = this.sources.excludedFolders?.() ?? []
       for (const root of this.sources.roots()) {
-        const res = await this.ask({ id: 0, type: 'scan', root })
+        // a root that sits inside an excluded folder is not a tree to walk
+        if (excluded.length > 0 && isUnderExcludedFolder(root, excluded)) continue
+        const res = await this.ask({ id: 0, type: 'scan', root, excludedFolders: excluded })
         // a crashed worker answers with an extract error; dropping the index on that would empty search
-        if (res.type === 'scan') for (const f of res.files) seen.set(f.path, f)
-        else walked = false
+        if (res.type === 'scan') {
+          for (const f of res.files) seen.set(f.path, f)
+          if (res.truncated) complete = false
+        } else walked = false
       }
-      if (walked) this.diff(seen)
+      if (walked) this.diff(seen, complete)
     } finally {
       this.scanning = false
+      this.scheduleIdleRecycle()
     }
     // a refresh that arrived mid-scan runs now, whether or not the walk succeeded
     if (this.scanRequested) {
@@ -101,21 +137,28 @@ export class FileIndexer {
   }
 
   /** bring the store in step with what the walk saw; extra paths are stat-ed here */
-  private diff(seen: Map<string, ScannedFile>): void {
-    for (const p of this.sources.extraPaths()) {
+  // a budget-capped walk cannot tell a vanished file from one it never reached,
+  // so entries are only removed when every root was walked to the end
+  private diff(seen: Map<string, ScannedFile>, complete: boolean): void {
+    const excluded = this.sources.excludedFolders?.() ?? []
+    for (const p of this.sources
+      .extraPaths()
+      .filter((p) => excluded.length === 0 || !isUnderExcludedFolder(p, excluded))) {
       if (seen.has(p) || !isSupportedTreeFile(p)) continue
       const st = statOrNull(p)
       if (st) seen.set(p, st)
     }
     const known = this.store.listAll()
-    const gone: string[] = []
-    for (const path of known.keys()) if (!seen.has(path)) gone.push(path)
-    this.store.remove(gone)
+    if (complete) {
+      const gone: string[] = []
+      for (const path of known.keys()) if (!seen.has(path)) gone.push(path)
+      this.store.remove(gone)
+    }
     for (const f of seen.values()) {
+      // an unchanged file that already failed is not retried: a parse that
+      // kills the worker would otherwise be re-run on every scan
       const k = known.get(f.path)
-      if (k && k.status !== 'error' && k.mtimeMs === f.mtimeMs && k.sizeBytes === f.sizeBytes) {
-        continue
-      }
+      if (k && k.mtimeMs === f.mtimeMs && k.sizeBytes === f.sizeBytes) continue
       this.enqueue(f)
     }
     this.lastScanAt = Date.now()
@@ -147,7 +190,18 @@ export class FileIndexer {
       }
     } finally {
       this.draining = false
+      this.scheduleIdleRecycle()
     }
+  }
+
+  private scheduleIdleRecycle(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer)
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null
+      if (this.scanning || this.draining || this.queue.length > 0 || this.waiting.size > 0) return
+      this.recycleWorker()
+    }, this.workerIdleMs)
+    this.idleTimer.unref?.()
   }
 
   private apply(f: ScannedFile, r: Extracted): void {
@@ -180,7 +234,9 @@ export class FileIndexer {
         resolve(r)
       })
       try {
-        this.ensureWorker().postMessage({ ...req, id })
+        const w = this.ensureWorker()
+        this.postedTo.get(w)?.add(id)
+        w.postMessage({ ...req, id })
       } catch (e) {
         // a failed post must not reject into the void-ed callers: answer as an
         // extraction error, exactly like the drop handler does for a crash
@@ -204,8 +260,14 @@ export class FileIndexer {
   }
 
   private ensureWorker(): Worker {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = null
+    }
     if (this.worker) return this.worker
-    const w = new Worker(this.workerPath)
+    const w = new Worker(this.workerPath, {
+      resourceLimits: { maxOldGenerationSizeMb: this.workerHeapLimitMb },
+    })
     w.on('message', (msg: WorkerResponse) => {
       const cb = this.waiting.get(msg.id)
       if (!cb) return
@@ -213,13 +275,21 @@ export class FileIndexer {
       cb(msg)
     })
     const drop = () => {
-      // a crashed worker fails its in-flight request as an extraction error so the queue moves on
+      // a crashed worker fails its in-flight request as an extraction error so
+      // the queue moves on; the exit of a worker retired for idleness or a
+      // timeout arrives after its successor may already have requests in
+      // flight, so only this worker's own requests are failed
       if (this.worker === w) this.worker = null
-      for (const [id, cb] of this.waiting) {
+      const posted = this.postedTo.get(w) ?? new Set<number>()
+      for (const id of posted) {
+        const cb = this.waiting.get(id)
+        if (!cb) continue
+        this.waiting.delete(id)
         cb({ id, type: 'extract', result: { kind: 'error', error: 'worker exited' } })
       }
-      this.waiting.clear()
+      posted.clear()
     }
+    this.postedTo.set(w, new Set())
     w.on('error', drop)
     w.on('exit', drop)
     this.worker = w
@@ -229,6 +299,7 @@ export class FileIndexer {
   stop(): void {
     this.stopped = true
     if (this.rescanTimer) clearTimeout(this.rescanTimer)
+    if (this.idleTimer) clearTimeout(this.idleTimer)
     this.queue.length = 0
     this.queued.clear()
     void this.worker?.terminate()

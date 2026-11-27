@@ -1,13 +1,25 @@
 /**
  * Word's Edit ▸ Go To: resolve a target (page, section, line, bookmark, comment,
- * note, table, heading) to a document position. Document-structure targets are
+ * note, field, table, graphic, equation, object, heading) to a document position. Document-structure targets are
  * read from the ProseMirror doc; page / section / line targets need the last
  * pagination pass (`PageLayout`), which App feeds through a ref.
  */
-import type { Node as PmNode } from '@tiptap/pm/model'
+import type { Mark, Node as PmNode } from '@tiptap/pm/model'
+import { NodeSelection, TextSelection } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
 import { BlockIndex } from '../pagination-index'
-import type { BlockBox, PageSlice } from '../pagination-types'
+import type { FlowCarry, PageCut } from '../pagination-cuts'
+import type { PreparedFlow } from '../pagination-pass'
+import type {
+  BlockBox,
+  FloatBox,
+  FloatVShiftPatch,
+  PageNoteItem,
+  PageSlice,
+  RowSplitPatch,
+  SectionGeom,
+  SectionHfHeights,
+} from '../pagination-types'
 
 export type GoToTarget =
   | 'page'
@@ -17,7 +29,11 @@ export type GoToTarget =
   | 'comment'
   | 'footnote'
   | 'endnote'
+  | 'field'
   | 'table'
+  | 'graphic'
+  | 'equation'
+  | 'object'
   | 'heading'
 
 export const GOTO_TARGETS: readonly GoToTarget[] = [
@@ -28,7 +44,11 @@ export const GOTO_TARGETS: readonly GoToTarget[] = [
   'comment',
   'footnote',
   'endnote',
+  'field',
   'table',
+  'graphic',
+  'equation',
+  'object',
   'heading',
 ]
 
@@ -38,17 +58,68 @@ export interface GoToItem {
 }
 
 export interface PageLayout {
+  /** pass counter of this layout (a preview printing it reports the generation it saw) */
+  passGen: number
   blocks: BlockBox[]
   slices: PageSlice[]
   sections: Array<{ firstBlockIndex: number }>
+  /** the pass's PageCut list (one per slice), geometry and row splits: what the preview sheets print */
+  cuts: PageCut[]
+  geoms: SectionGeom[]
+  hfHeights: SectionHfHeights[]
+  rowSplits: RowSplitPatch[]
+  /** float-carry spacers of split floating tables (flow displacement, flowOffsetAt) */
+  carries: FlowCarry[]
+  /** the measured floating boxes the cuts index (`PageCut.boxes`) */
+  floats: FloatBox[]
+  /** anchor paragraphs whose side-wrapped drawings the slicer pulled up (sliceFlow applied them to the pass's floats) */
+  floatPullUps: FloatVShiftPatch[]
+  /** the prepared flow the pass sliced (sections, endnotes, spill, geometry) */
+  flow?: PreparedFlow
+  /** each page's footnote entries, placed once by the pass (the preview prints them as is) */
+  pageNotes: PageNoteItem[][]
 }
+
+const FIELD_MARKS = new Set(['instrField', 'refField'])
+
+/** Word's Graphic: pictures, charts and diagrams; an embedded OLE object is an Object instead */
+const isGraphic = (node: PmNode): boolean =>
+  !node.attrs.oleProgId &&
+  !node.attrs.decorative &&
+  (node.attrs.blockType === 'image' ||
+    !!node.attrs.chartDisplay ||
+    !!node.attrs.genChart ||
+    !!node.attrs.diagramDisplay)
 
 /** structural targets in document order (bookmarks carry their name as label) */
 export function listGoToItems(doc: PmNode, target: GoToTarget): GoToItem[] {
   const items: GoToItem[] = []
   const seenComments = new Set<string>()
+  let lastField: Mark | null = null
   doc.descendants((node, pos) => {
+    const sealed = node.type.name === 'docProtected'
     switch (target) {
+      case 'field': {
+        const mark = node.marks.find((m) => FIELD_MARKS.has(m.type.name)) ?? null
+        // one field can span several text nodes (formatting changes inside its result)
+        if (mark && !(lastField && mark.eq(lastField)))
+          items.push({ pos, label: node.text?.slice(0, 60) ?? '' })
+        lastField = node.isInline ? mark : null
+        if (node.type.name === 'docEqLayout' || (sealed && node.attrs.fieldDisplay))
+          items.push({ pos, label: String(node.attrs.previewText ?? '').slice(0, 60) })
+        return !sealed
+      }
+      case 'graphic':
+        if (node.type.name === 'docInlineImage' || (sealed && isGraphic(node)))
+          items.push({ pos, label: String(node.attrs.imageAlt ?? node.attrs.label ?? '') })
+        return !sealed
+      case 'equation':
+        if (node.type.name === 'docInlineMath' || (sealed && node.attrs.formulaDisplay))
+          items.push({ pos, label: String(node.attrs.text ?? node.attrs.previewText ?? '') })
+        return !sealed
+      case 'object':
+        if (sealed && node.attrs.oleProgId) items.push({ pos, label: String(node.attrs.oleProgId) })
+        return !sealed
       case 'heading':
         if (node.type.name === 'docHeading')
           items.push({ pos, label: node.textContent.slice(0, 60) })
@@ -227,4 +298,77 @@ export function resolveGoToIndex(
   if (rel) return clamp(current + (rel[1] === '+' ? 1 : -1) * Number(rel[2]))
   if (/^\d+$/.test(s)) return clamp(Number(s) - 1)
   return null
+}
+
+function lastAtOrBefore(positions: Array<number | null>, caret: number): number {
+  let idx = -1
+  positions.forEach((p, i) => {
+    if (p !== null && p <= caret) idx = i
+  })
+  return idx
+}
+
+/**
+ * Where Go To lands from the caret: the next or previous target, or the one
+ * `input` names (a number, a +/- offset, a bookmark). Null when there is none
+ * or the target needs a layout that is not there.
+ */
+export function goToPosition(
+  view: EditorView,
+  layout: PageLayout | null,
+  target: GoToTarget,
+  dir: 1 | -1,
+  input = '',
+): number | null {
+  const caret = view.state.selection.from
+  let positions: Array<number | null>
+  let current: number
+  if (target === 'page' || target === 'section') {
+    if (!layout) return null
+    positions = target === 'page' ? pagePositions(view, layout) : sectionPositions(view, layout)
+    current =
+      target === 'page'
+        ? pageOfBlock(layout, Math.max(blockIndexAtPos(view, layout, caret), 0)) - 1
+        : Math.max(0, lastAtOrBefore(positions, caret))
+  } else if (target === 'line') {
+    if (!layout) return null
+    const total = lineCounts(layout).reduce((a, b) => a + b, 0)
+    const line = resolveGoToIndex(input, lineIndexAtPos(view, layout, caret), total, dir)
+    return line === null ? null : linePosition(view, layout, line + 1)
+  } else {
+    const items = listGoToItems(view.state.doc, target)
+    positions = items.map((i) => i.pos)
+    current = lastAtOrBefore(positions, caret)
+    if (target === 'bookmark' && input) {
+      const named = items.find((i) => i.label === input)
+      return named ? named.pos : null
+    }
+  }
+  const idx = resolveGoToIndex(input, current, positions.length, dir)
+  return idx === null ? null : (positions[idx] ?? null)
+}
+
+/** place the caret at `pos` (nearest valid text position) and bring it on screen; a picture or other sealed object is selected whole */
+export function jumpTo(view: EditorView, pos: number): void {
+  const { state } = view
+  const clamped = Math.max(0, Math.min(pos, state.doc.content.size))
+  const $pos = state.doc.resolve(clamped)
+  const at = $pos.nodeAfter
+  const whole = at && at.isAtom && !at.isText && NodeSelection.isSelectable(at)
+  const sel = whole ? NodeSelection.create(state.doc, clamped) : TextSelection.near($pos, 1)
+  view.dispatch(state.tr.setSelection(sel).scrollIntoView())
+  const dom = whole ? view.nodeDOM(clamped) : view.domAtPos(sel.from).node
+  const el = dom instanceof HTMLElement ? dom : dom?.parentElement
+  el?.scrollIntoView({ block: 'center' })
+}
+
+/** what Word's Browse Next / Previous steps through: pages until a Find or a Go To says otherwise */
+export type BrowseObject = GoToTarget | 'find'
+
+let browseObject: BrowseObject = 'page'
+
+export const currentBrowseObject = (): BrowseObject => browseObject
+
+export function setBrowseObject(next: BrowseObject): void {
+  browseObject = next
 }

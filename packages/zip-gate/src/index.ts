@@ -6,7 +6,7 @@
  * central directory's declared sizes is advisory at best: 600 MB of payload
  * declaring 300 bytes passes it, and the first genuine inflate then pays for
  * the whole payload in one allocation (measured in #759: 794 MB and 3.12 GB of
- * RSS from sub-megabyte inputs; #1102-era re-measurement agreed).
+ * RSS from sub-megabyte inputs; a later re-measurement agreed).
  *
  * `assertZipInflatesWithinLimits` inflates each part through a stream that is
  * cancelled one byte past what the part claims: an honest part completes at its
@@ -147,10 +147,20 @@ function scanParts(bytes: Uint8Array): ScannedPart[] {
   if (end < 0) throw new Error('zip: end of central directory not found')
   let eocd = -1
   for (let i = end; i >= Math.max(0, end - 0xffff); i--) {
-    if (at(i, 4) === EOCD_SIG) {
-      eocd = i
-      break
-    }
+    if (at(i, 4) !== EOCD_SIG) continue
+    // The archive comment can contain the same signature. Only a record whose
+    // comment reaches the end of the file and whose central directory fits
+    // before it is the real EOCD; taking the last bare signature lets a comment
+    // smuggle in an empty directory that skips every part.
+    if (i + 22 + at(i + 20, 2) !== bytes.byteLength) continue
+    const count = at(i + 10, 2)
+    const cdSize = at(i + 12, 4)
+    const cdOffset = at(i + 16, 4)
+    if (cdOffset + cdSize > i) continue
+    if (count > 0 && (cdSize < 46 || at(cdOffset, 4) !== CENTRAL_SIG)) continue
+    if (count === 0 && (cdOffset !== i || cdSize !== 0)) continue
+    eocd = i
+    break
   }
   if (eocd < 0) throw new Error('zip: end of central directory not found')
   if (eocd >= 20 && at(eocd - 20, 4) === ZIP64_LOCATOR_SIG) {
@@ -261,6 +271,55 @@ function underDeclared(part: ScannedPart, cause?: unknown): Error {
       'but inflates past that',
   )
   return cause === undefined ? error : Object.assign(error, { cause })
+}
+
+/**
+ * Inflates one deflate-raw stream while refusing to materialise more than
+ * `maxBytes` of output: the stream is cancelled at the first chunk past the
+ * cap and null comes back, so a forged size header costs at most `maxBytes`
+ * of memory no matter how far the payload really inflates. Corrupt input and
+ * unsupported streams also return null — on-demand serving callers map that
+ * to a 404 rather than an exception.
+ *
+ * Companion to `assertZipInflatesWithinLimits` for paths that inflate one
+ * already-located part on demand (the docs lazy-media server reads media
+ * straight out of the source archive, outside any bulk open): the gate above
+ * proves an archive honest in bulk, this one holds for a single part whose
+ * declared sizes were never gate-checked.
+ */
+export async function inflateRawWithinCap(
+  raw: Uint8Array,
+  maxBytes: number,
+): Promise<Uint8Array | null> {
+  // `seen > maxBytes` is false when the cap is NaN, which used to let the whole
+  // stream through; treat any invalid cap as a failed gate.
+  if (!Number.isFinite(maxBytes) || maxBytes < 0) return null
+  let seen = 0
+  const chunks: Uint8Array[] = []
+  try {
+    const reader = streamBytes(raw).pipeThrough(decompressionStream('deflate-raw')).getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      seen += value.byteLength
+      if (seen > maxBytes) {
+        await reader.cancel()
+        return null
+      }
+      chunks.push(value)
+    }
+  } catch {
+    // DecompressionStream rejects with an empty-message TypeError on bad data;
+    // a serving caller only needs the boolean answer.
+    return null
+  }
+  const out = new Uint8Array(seen)
+  let at = 0
+  for (const chunk of chunks) {
+    out.set(chunk, at)
+    at += chunk.byteLength
+  }
+  return out
 }
 
 /** UTF-8 with the high bytes preserved, matching what JSZip does with names. */

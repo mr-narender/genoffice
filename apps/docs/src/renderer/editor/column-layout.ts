@@ -1,3 +1,4 @@
+import { charCellSpacingCss } from '../char-grid'
 import { Extension } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
@@ -6,6 +7,7 @@ import { splitFloatStyle } from '../pagination-lines'
 import type { ColumnSplitShape, VerticalBlockSpec } from '../pagination-types'
 import { TopLevelPositions } from './top-level-pos'
 import type { LayoutBatch } from './pagination-gaps'
+import { columnDecoration, mapColumnDecorations } from './column-layout-recovery'
 
 const key = new PluginKey<DecorationSet>('columnLayout')
 
@@ -34,10 +36,10 @@ export const ColumnLayoutExtension = Extension.create({
         key,
         state: {
           init: () => DecorationSet.empty,
-          apply(tr, set) {
+          apply(tr, set, oldState) {
             const next = tr.getMeta(key) as DecorationSet | undefined
             if (next) return next
-            return set.map(tr.mapping, tr.doc)
+            return mapColumnDecorations(set, tr, oldState.doc)
           },
         },
         props: {
@@ -68,9 +70,16 @@ export interface ColumnBlockSpec {
   /** owning section's character-grid letter-spacing delta (pt) in docs whose
    *  sections disagree on docGrid charSpace (doc-charspace-block) */
   charSpacePt?: number
+  charSpaceSbPt?: number
+  /** owning section's snapToChars cell pitch (pt) in docs whose sections disagree on it */
+  charCellPt?: number
+  /** owning section's w:adjustRightInd share (pt) in docs whose sections disagree on it */
+  rightIndentPt?: number
   /** translate; dy < 0 pulls content up over vacated column space */
   dx: number
   dy: number
+  /** the w:mirrorIndents share of dx (--mirror-ind-dx, read by the export sheets) */
+  mirrorDx?: number
   /** left edge of the block's page on the shared paper (--page-cx); not undone by page-relative anchors */
   pageDx?: number
   /** vertical-text section block (doc-vert-block): writing-mode box, see verticalTextSpecs */
@@ -78,6 +87,8 @@ export interface ColumnBlockSpec {
   /** paragraph straddling two columns of different widths: a leading float
    *  (doc-col-split-float) rewraps the head or the tail at the narrower width */
   split?: ColumnSplitShape
+  /** first block of a page-opening section (doc-sect-page-start: clear floats) */
+  sectionPageStart?: true
 }
 
 const SPLIT_CLASS = 'doc-col-split-float'
@@ -102,7 +113,12 @@ const PATCH_PROPS = [
   '--doc-margin-top',
   '--doc-grid-pitch',
   '--doc-char-space',
+  '--doc-char-space-sb',
+  '--doc-char-snap',
+  '--doc-rind-sect',
   '--vert-mb',
+  '--vert-tbl-h',
+  '--vert-inset',
 ]
 
 const PATCH_CLASSES = [
@@ -115,6 +131,9 @@ const PATCH_CLASSES = [
   'doc-vert-tbRl',
   'doc-vert-tbRlV',
   'doc-vert-btLr',
+  'doc-vert-table',
+  'doc-vert-inset',
+  'doc-sect-page-start',
 ]
 
 /** pitch/charSpace-only specs get an inert marker class: .doc-col-block's
@@ -123,11 +142,14 @@ const PATCH_CLASSES = [
  *  CSS as doc-nosnap): reusing doc-nosnap would trip sectionGridPitchSpecs'
  *  own-opt-out skip on the next pass and let patch cleanup strip a node's own
  *  snapToGrid=0 class. */
-function specClass(spec: ColumnBlockSpec): string {
+function specClass(spec: ColumnBlockSpec, leading = true): string {
   const varsOnly =
     (spec.gridPitchPt !== undefined ||
       spec.charSpacePt !== undefined ||
-      spec.marginTopPx !== undefined) &&
+      spec.charCellPt !== undefined ||
+      spec.rightIndentPt !== undefined ||
+      spec.marginTopPx !== undefined ||
+      spec.sectionPageStart) &&
     spec.widthPx === undefined &&
     spec.contentWPx === undefined &&
     spec.dx === 0 &&
@@ -136,9 +158,12 @@ function specClass(spec: ColumnBlockSpec): string {
   let cls = varsOnly ? 'doc-grid-block' : 'doc-col-block'
   if (spec.gridPitchPt === 0) cls += ' doc-grid-nosnap'
   if (spec.charSpacePt !== undefined) cls += ' doc-charspace-block'
-  if (spec.vertical) {
+  if (leading && spec.sectionPageStart) cls += ' doc-sect-page-start'
+  if (spec.vertical?.table) cls += ' doc-vert-table'
+  else if (spec.vertical) {
     cls += ` doc-vert-block doc-vert-${spec.vertical.mode}`
-    if (spec.vertical.firstOnPage) cls += ' doc-vert-first'
+    if (leading && spec.vertical.firstOnPage) cls += ' doc-vert-first'
+    if (spec.vertical.insetPx) cls += ' doc-vert-inset'
   }
   return cls
 }
@@ -174,15 +199,30 @@ export function setColumnLayout(
         ? `--doc-grid-pitch:${spec.gridPitchPt > 0 ? `${round2(spec.gridPitchPt)}pt` : '0.0001px'};`
         : '') +
       (spec.charSpacePt !== undefined ? `--doc-char-space:${round4(spec.charSpacePt)}pt;` : '') +
+      (spec.charSpaceSbPt !== undefined
+        ? `--doc-char-space-sb:${round4(spec.charSpaceSbPt)}pt;`
+        : '') +
+      (spec.charCellPt !== undefined
+        ? `--doc-char-snap:${charCellSpacingCss(spec.charCellPt)};`
+        : '') +
+      (spec.rightIndentPt !== undefined ? `--doc-rind-sect:${round2(spec.rightIndentPt)}pt;` : '') +
       (spec.pageDx ? `--page-cx:${round2(spec.pageDx)}px;` : '') +
+      (spec.mirrorDx ? `--mirror-ind-dx:${round2(spec.mirrorDx)}px;` : '') +
       (spec.vertical ? `--vert-mb:${round2(spec.vertical.marginBottomPx)}px;` : '') +
+      (spec.vertical?.table ? `--vert-tbl-h:${round2(spec.vertical.table.heightPx)}px;` : '') +
+      (spec.vertical?.insetPx ? `--vert-inset:${round2(spec.vertical.insetPx)}px;` : '') +
       `--col-dx:${round2(spec.dx)}px;--col-dy:${round2(spec.dy)}px`
     const cls = specClass(spec)
     styleOf.set(spec.el, { style, cls })
     const range = positions.of(spec.el)
     if (!range) continue
     const { from, to } = range
-    decos.push(Decoration.node(from, to, { class: cls, style }, { key: `col-${cls}-${style}` }))
+    // Vertical placements and split-column floats depend on measured block
+    // extents. Leave them on the existing mapping/pagination path instead of
+    // copying stale coordinates or a float shape onto newly split paragraphs.
+    const continuation =
+      spec.vertical || spec.split ? undefined : { class: specClass(spec, false), style }
+    decos.push(columnDecoration(from, to, { class: cls, style }, continuation))
     const split = splitOf.get(spec.el)
     if (split)
       decos.push(

@@ -43,10 +43,13 @@ interface Session {
 }
 
 const MAX_JSON_BYTES = 32 * 1024 * 1024
+/** clients that never DELETE their session otherwise grow the map without bound */
+const MAX_SESSIONS = 100
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 
 export async function startHttp(opts: HttpServeOptions): Promise<HttpHandle> {
-  const host = opts.host ?? '127.0.0.1'
+  // '' would bypass the loopback default and bind every interface
+  const host = opts.host?.trim() || '127.0.0.1'
   const files = new FileStore(
     join(tmpdir(), `genoffice-mcp-http-${process.pid}-${randomBytes(4).toString('hex')}`),
   )
@@ -106,6 +109,19 @@ export async function startHttp(opts: HttpServeOptions): Promise<HttpHandle> {
       if (sessions.delete(id)) {
         disposeContext(ctx)
         log(`[mcp] session ${id} closed`)
+      }
+    }
+    // Map preserves insertion order, so the first key is the oldest session
+    while (sessions.size >= MAX_SESSIONS) {
+      const oldest = sessions.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      const evicted = sessions.get(oldest)
+      sessions.delete(oldest)
+      if (evicted) {
+        // deleted first so transport.onclose does not dispose twice
+        void evicted.transport.close().catch(() => {})
+        disposeContext(evicted.ctx)
+        log(`[mcp] session ${oldest} evicted (cap ${MAX_SESSIONS})`)
       }
     }
     sessions.set(id, session)
@@ -231,7 +247,7 @@ export async function startHttp(opts: HttpServeOptions): Promise<HttpHandle> {
     }
     // no token and a loopback bind: refuse Host headers a rebound DNS name would carry
     if (!opts.token && LOOPBACK_HOSTS.has(host)) {
-      const hostname = new URL(`http://${header(req.headers.host) ?? ''}`).hostname
+      const hostname = hostnameOf(header(req.headers.host) ?? '')
       if (!LOOPBACK_HOSTS.has(hostname)) {
         json(res, 403, { error: 'host not allowed' })
         return
@@ -296,6 +312,18 @@ export async function startHttp(opts: HttpServeOptions): Promise<HttpHandle> {
     },
   }
 
+  if (!opts.token && !LOOPBACK_HOSTS.has(host)) {
+    // Refuse before anything binds: this server exposes document read/write
+    // tools with no authentication, and refusing after listen would leave the
+    // socket accepting connections for its lifetime and the scratch directory
+    // behind on disk. Someone who genuinely wants LAN access sets --token —
+    // which is exactly the check this refusal exists to force.
+    files.dispose()
+    throw new Error(
+      'refusing to serve the MCP HTTP API on a non-loopback address without --token: ' +
+        'the tools read and write files with no authentication; bind 127.0.0.1 or pass --token',
+    )
+  }
   await new Promise<void>((resolve, reject) => {
     httpServer.once('error', reject)
     httpServer.listen(opts.port, host, () => {
@@ -307,11 +335,6 @@ export async function startHttp(opts: HttpServeOptions): Promise<HttpHandle> {
       resolve()
     })
   })
-  if (!opts.token && !LOOPBACK_HOSTS.has(host)) {
-    log(
-      '[mcp] warning: reachable from other machines without --token; anyone on the network can use the tools',
-    )
-  }
   log(`[mcp] listening on ${handle.url}/mcp (uploads: PUT ${handle.url}/files/<name>)`)
   return handle
 }
@@ -332,6 +355,15 @@ export async function serveHttp(opts: HttpServeOptions): Promise<void> {
 
 function header(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
+}
+
+/** '' for an absent or malformed Host so it reads as not allowed instead of a 500 */
+function hostnameOf(hostHeader: string): string {
+  try {
+    return new URL(`http://${hostHeader}`).hostname
+  } catch {
+    return ''
+  }
 }
 
 function isInitialize(body: unknown): boolean {

@@ -5,7 +5,7 @@ import {
   FORMULA_REFERENCE_PATTERN,
   qualifierMatches,
 } from '@genoffice/xlsx-gateway/gateway/xlsx-structure'
-import JSZip from 'jszip'
+import { loadUserZip } from './gated-zip'
 import { excerpt, PLACEHOLDER, textWidthPx, type IssueDraft } from '../check'
 import { displayText } from './xlsx'
 
@@ -61,7 +61,7 @@ export interface WorkbookCheck {
 }
 
 export async function checkWorkbook(bytes: Uint8Array): Promise<WorkbookCheck> {
-  const zip = await JSZip.loadAsync(bytes)
+  const zip = await loadUserZip(bytes)
   const text = async (path: string) => (await zip.file(path)?.async('string')) ?? ''
   const workbook = await text('xl/workbook.xml')
   const rels = parseRelationships(await text('xl/_rels/workbook.xml.rels'))
@@ -123,12 +123,12 @@ function parseStyles(xml: string): Styles {
   }
   const fontSizes: number[] = []
   const fonts = /<fonts\b[^>]*>([\s\S]*?)<\/fonts>/.exec(xml)?.[1] ?? ''
-  for (const m of fonts.matchAll(/<font\b[^>]*(?:\/>|>([\s\S]*?)<\/font>)/g)) {
+  for (const m of fonts.matchAll(/<font\b[^>]*?(?:\/>|>([\s\S]*?)<\/font>)/g)) {
     fontSizes.push(Number(/<sz\b[^>]*\bval="([\d.]+)"/.exec(m[1] ?? '')?.[1] ?? 11))
   }
   const xfs: Xf[] = []
   const cellXfs = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(xml)?.[1] ?? ''
-  for (const m of cellXfs.matchAll(/<xf\b([^>]*)(?:\/>|>([\s\S]*?)<\/xf>)/g)) {
+  for (const m of cellXfs.matchAll(/<xf\b([^>]*?)(?:\/>|>([\s\S]*?)<\/xf>)/g)) {
     xfs.push({
       numFmtId: Number(/\bnumFmtId="(\d+)"/.exec(m[1]!)?.[1] ?? 0),
       fontId: Number(/\bfontId="(\d+)"/.exec(m[1]!)?.[1] ?? 0),

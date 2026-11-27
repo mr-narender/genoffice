@@ -1,4 +1,4 @@
-import { BooleanNumber, type IStyleData, WrapStrategy } from '@univerjs/core'
+import { BaselineOffset, BooleanNumber, type IStyleData, WrapStrategy } from '@univerjs/core'
 
 import { isAccountingPattern } from './numfmt-dialog'
 
@@ -24,7 +24,9 @@ export interface SelectionFormat {
   readonly bold: boolean
   readonly italic: boolean
   readonly underline: boolean
+  readonly doubleUnderline: boolean
   readonly strike: boolean
+  readonly vertAlign: 'superscript' | 'subscript' | null
   readonly wrap: boolean
   /// Neutral (wire) alignment names, or null when unset.
   readonly horizontalAlignment: string | null
@@ -88,7 +90,14 @@ export function toSelectionFormat(
     bold: style.bl === BooleanNumber.TRUE,
     italic: style.it === BooleanNumber.TRUE,
     underline: style.ul?.s === BooleanNumber.TRUE,
+    doubleUnderline: style.ul?.s === BooleanNumber.TRUE && style.ul.t === 10,
     strike: style.st?.s === BooleanNumber.TRUE,
+    vertAlign:
+      style.va === BaselineOffset.SUPERSCRIPT
+        ? 'superscript'
+        : style.va === BaselineOffset.SUBSCRIPT
+          ? 'subscript'
+          : null,
     wrap: style.tb === WrapStrategy.WRAP,
     horizontalAlignment: (style.ht != null && HORIZONTAL_NAMES[style.ht]) || null,
     verticalAlignment: (style.vt != null && VERTICAL_NAMES[style.vt]) || null,
@@ -112,7 +121,9 @@ export function selectionFormatEquals(
     a.bold === b.bold &&
     a.italic === b.italic &&
     a.underline === b.underline &&
+    a.doubleUnderline === b.doubleUnderline &&
     a.strike === b.strike &&
+    a.vertAlign === b.vertAlign &&
     a.wrap === b.wrap &&
     a.horizontalAlignment === b.horizontalAlignment &&
     a.verticalAlignment === b.verticalAlignment &&

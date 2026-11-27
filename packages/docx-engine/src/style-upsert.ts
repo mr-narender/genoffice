@@ -1,5 +1,6 @@
 import { PPR_CHILD_ORDER, RPR_CHILD_ORDER, splitXmlChildren } from './generate'
 import { escapeXmlAttr } from './xml-utils'
+import type { TabStop } from './types'
 
 /** Run properties of a style definition; a present key sets, null clears, absent keeps. */
 export interface StyleRunProps {
@@ -27,6 +28,8 @@ export interface StyleParaProps {
   spaceAfterTwips?: number | null
   /** line spacing as a multiple (auto) */
   lineSpacing?: number | null
+  /** exact / at-least line height in twips; wins over lineSpacing */
+  lineFixed?: { rule: 'exact' | 'atLeast'; twips: number }
   indentLeftTwips?: number | null
   indentRightTwips?: number | null
   /** positive = first-line indent, negative = hanging indent */
@@ -34,10 +37,17 @@ export interface StyleParaProps {
   keepNext?: boolean
   keepLines?: boolean
   pageBreakBefore?: boolean
+  widowControl?: boolean
+  suppressLineNumbers?: boolean
+  contextualSpacing?: boolean
+  suppressAutoHyphens?: boolean
+  adjustRightInd?: boolean
   /** 1-9 (w:outlineLvl val + 1) */
   outlineLevel?: number | null
   /** list level linked to the style (w:numPr); null removes it */
   numPr?: { numId: string; ilvl: number } | null
+  /** w:tabs of the style; [] or null removes the element */
+  tabStops?: TabStop[] | null
 }
 
 /**
@@ -101,9 +111,90 @@ export interface StyleUpsert {
   next?: string | null
   /** w:qFormat (quick style gallery); new styles default to true */
   quickFormat?: boolean
+  /** one of Word's built-in styles (by name): created without w:customStyle */
+  builtIn?: boolean
+  /** takes the style (and its linked character twin) out of styles.xml */
+  remove?: true
+  /** the file's own definition is ignored: the style is built from scratch */
+  replace?: true
+  /** a whole w:style element to start from instead of the file's own (copied from another file) */
+  sourceXml?: string
   rPr?: StyleRunProps
   pPr?: StyleParaProps
 }
+
+/** half-point sizes of the built-in headings, as the blank template defines them */
+const BUILT_IN_HEADING_SIZES: Readonly<Record<number, number>> = {
+  1: 32,
+  2: 28,
+  3: 26,
+  4: 24,
+  5: 22,
+  6: 22,
+}
+
+/**
+ * Word's built-in "heading N" for a document that defines none: the same
+ * definition the blank template ships (bold, keep-with-next, outline level,
+ * quick-style), based on the document's default paragraph style so its fonts
+ * show through. The id is HeadingN — parse-styles reads that id as the level
+ * even without the name, so the saved heading survives reopen.
+ */
+export function builtInHeadingStyleUpsert(
+  level: number,
+  defaultParagraphStyleId: string | undefined,
+): StyleUpsert {
+  const lvl = Math.min(Math.max(Math.round(level) || 1, 1), 9)
+  return {
+    styleId: `Heading${lvl}`,
+    type: 'paragraph',
+    name: `heading ${lvl}`,
+    ...(defaultParagraphStyleId
+      ? { basedOn: defaultParagraphStyleId, next: defaultParagraphStyleId }
+      : {}),
+    quickFormat: true,
+    builtIn: true,
+    pPr: {
+      keepNext: true,
+      spaceBeforeTwips: lvl <= 2 ? 240 : 160,
+      spaceAfterTwips: 120,
+      outlineLevel: lvl,
+    },
+    rPr: { bold: true, sizeHalfPoints: BUILT_IN_HEADING_SIZES[lvl] ?? 22 },
+  }
+}
+
+/**
+ * Word's built-in "header" / "footer" for a document that defines none, as Word
+ * for Mac 16 writes it the first time a header is used (probe 2026-11-20): based
+ * on the default paragraph style, a center stop at 4680 and a right stop at 9360
+ * twips whatever the page width, no space after and single line spacing. Not a
+ * quick style.
+ */
+export function builtInHfStyleUpsert(
+  kind: 'header' | 'footer',
+  defaultParagraphStyleId: string | undefined,
+): StyleUpsert {
+  return {
+    styleId: kind === 'header' ? 'Header' : 'Footer',
+    type: 'paragraph',
+    name: kind,
+    ...(defaultParagraphStyleId ? { basedOn: defaultParagraphStyleId } : {}),
+    quickFormat: false,
+    builtIn: true,
+    pPr: {
+      tabStops: [...BUILT_IN_HF_TAB_STOPS],
+      spaceAfterTwips: 0,
+      lineSpacing: 1,
+    },
+  }
+}
+
+/** the stops Word's built-in Header and Footer styles carry */
+export const BUILT_IN_HF_TAB_STOPS: readonly TabStop[] = [
+  { pos: 4680, val: 'center' },
+  { pos: 9360, val: 'right' },
+]
 
 const STYLE_CHILD_ORDER = [
   'w:name',
@@ -290,6 +381,10 @@ function patchPara(children: Children, pp: StyleParaProps): void {
     spacing['w:line'] = pp.lineSpacing === null ? null : num(pp.lineSpacing * 240)
     spacing['w:lineRule'] = pp.lineSpacing === null ? null : 'auto'
   }
+  if (pp.lineFixed) {
+    spacing['w:line'] = num(pp.lineFixed.twips)
+    spacing['w:lineRule'] = pp.lineFixed.rule
+  }
   if (Object.keys(spacing).length > 0) children.attrs('w:spacing', spacing)
   const ind: Record<string, string | null> = {}
   if (pp.indentLeftTwips !== undefined) {
@@ -309,12 +404,30 @@ function patchPara(children: Children, pp: StyleParaProps): void {
   children.flag('w:keepNext', pp.keepNext)
   children.flag('w:keepLines', pp.keepLines)
   children.flag('w:pageBreakBefore', pp.pageBreakBefore)
+  children.flag('w:widowControl', pp.widowControl)
+  children.flag('w:suppressLineNumbers', pp.suppressLineNumbers)
+  children.flag('w:contextualSpacing', pp.contextualSpacing)
+  children.flag('w:suppressAutoHyphens', pp.suppressAutoHyphens)
+  children.flag('w:adjustRightInd', pp.adjustRightInd)
   if (pp.outlineLevel !== undefined) {
     children.set(
       'w:outlineLvl',
       pp.outlineLevel === null ? null : `<w:outlineLvl w:val="${num(pp.outlineLevel - 1)}"/>`,
     )
   }
+  if (pp.tabStops !== undefined) {
+    const stops = pp.tabStops ?? []
+    children.set(
+      'w:tabs',
+      stops.length === 0 ? null : `<w:tabs>${stops.map(tabXml).join('')}</w:tabs>`,
+    )
+  }
+}
+
+function tabXml(ts: TabStop): string {
+  let xml = `<w:tab w:val="${escapeXmlAttr(ts.val)}" w:pos="${num(ts.pos)}"`
+  if (ts.leader && ts.leader !== 'none') xml += ` w:leader="${escapeXmlAttr(ts.leader)}"`
+  return xml + '/>'
 }
 
 /** The w:style element after applying `up` to `existing` (null = create). */
@@ -324,7 +437,7 @@ export function mergeStyleXml(existing: string | null, up: StyleUpsert): string 
     ? new Map([
         ['w:type', up.type ?? 'paragraph'],
         ['w:styleId', escapeXmlAttr(up.styleId)],
-        ['w:customStyle', '1'],
+        ...(up.builtIn ? [] : [['w:customStyle', '1'] as const]),
       ])
     : parseTag(existing).attrs
   const children = new Children(
@@ -359,16 +472,94 @@ export function mergeStyleXml(existing: string | null, up: StyleUpsert): string 
   return tag('w:style', attrs, children.toXml())
 }
 
-export function upsertStyleXml(xml: string, up: StyleUpsert): string {
-  const escapedId = up.styleId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const existing = new RegExp(
+const styleElementRe = (styleId: string): RegExp => {
+  const escapedId = styleId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(
     `<w:style\\b[^>]*\\bw:styleId=(["'])${escapedId}\\1[^>]*(?:\\/>|>[\\s\\S]*?<\\/w:style>)`,
   )
+}
+
+const styleRefOf = (styleXml: string, child: string): string | undefined =>
+  new RegExp(`<${child}\\b[^>]*\\bw:val=(["'])([^"']*)\\1`).exec(styleXml)?.[2]
+
+/** styles.xml without the style: its children move to its parent, w:next / w:link to it go */
+function removeStyleXml(xml: string, styleId: string, seen: Set<string> = new Set()): string {
+  const match = styleElementRe(styleId).exec(xml)
+  if (!match || seen.has(styleId)) return xml
+  seen.add(styleId)
+  const parent = styleRefOf(match[0], 'w:basedOn')
+  const linked = styleRefOf(match[0], 'w:link')
+  const id = escapeXmlAttr(styleId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  let out = xml.replace(match[0], '')
+  out = out.replace(new RegExp(`<w:basedOn\\s+w:val=(["'])${id}\\1\\s*/>`, 'g'), () =>
+    parent ? `<w:basedOn w:val="${parent}"/>` : '',
+  )
+  out = out.replace(new RegExp(`<w:(?:next|link)\\s+w:val=(["'])${id}\\1\\s*/>`, 'g'), '')
+  // the character half of a linked pair has no life of its own
+  const twin = linked ? styleElementRe(linked).exec(out)?.[0] : undefined
+  if (linked && twin && /\bw:type=(["'])character\1/.test(twin))
+    out = removeStyleXml(out, linked, seen)
+  return out
+}
+
+/** the ids a removal takes out of styles.xml: the style and its linked character twin */
+export function styleRemovalIds(xml: string, styleId: string): string[] {
+  const own = styleElementRe(styleId).exec(xml)?.[0]
+  if (!own) return []
+  const linked = styleRefOf(own, 'w:link')
+  const twin = linked ? styleElementRe(linked).exec(xml)?.[0] : undefined
+  return linked && twin && /\bw:type=(["'])character\1/.test(twin) ? [styleId, linked] : [styleId]
+}
+
+/** a story part without references to the removed styles: the text falls back to the default style */
+export function dropStyleRefsXml(xml: string, styleIds: readonly string[]): string {
+  if (styleIds.length === 0) return xml
+  const ids = styleIds.map((id) => escapeXmlAttr(id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  return xml.replace(
+    new RegExp(`<w:(?:pStyle|rStyle|tblStyle)\\s+w:val=(["'])(?:${ids.join('|')})\\1\\s*/>`, 'g'),
+    '',
+  )
+}
+
+export function upsertStyleXml(xml: string, up: StyleUpsert): string {
+  if (up.remove) return removeStyleXml(xml, up.styleId)
+  const existing = styleElementRe(up.styleId)
   const match = existing.exec(xml)
-  const styleXml = mergeStyleXml(match?.[0] ?? null, up)
+  const base =
+    up.sourceXml !== undefined
+      ? up.sourceXml.replace(
+          /(<w:style\b[^>]*\bw:styleId=)(["'])[^"']*\2/,
+          (_, head: string) => `${head}"${escapeXmlAttr(up.styleId)}"`,
+        )
+      : up.replace
+        ? null
+        : (match?.[0] ?? null)
+  const styleXml = mergeStyleXml(base, up)
   return match
     ? xml.replace(existing, () => styleXml)
-    : xml.replace('</w:styles>', `${styleXml}</w:styles>`)
+    : xml.replace('</w:styles>', () => `${styleXml}</w:styles>`)
+}
+
+/** a w:style with the run and paragraph properties of `rPr` / `pPr` (inner XML) it does not state itself */
+export function withDefaultPropsXml(styleXml: string, rPr: string, pPr: string): string {
+  const children = new Children(splitXmlChildren(innerOf(styleXml)), STYLE_CHILD_ORDER)
+  const fold = (name: 'w:rPr' | 'w:pPr', defaults: string, order: readonly string[]) => {
+    const own = new Children(
+      splitXmlChildren(innerOf(children.get(name)?.xml ?? `<${name}/>`)),
+      order,
+    )
+    for (const child of splitXmlChildren(defaults))
+      if (!own.get(child.name)) own.set(child.name, child.xml)
+    if (own.size) children.set(name, `<${name}>${own.toXml()}</${name}>`)
+  }
+  fold('w:pPr', pPr, PPR_CHILD_ORDER)
+  fold('w:rPr', rPr, RPR_CHILD_ORDER)
+  return tag('w:style', parseTag(styleXml).attrs, children.toXml())
+}
+
+export function hasStyleXml(xml: string, styleId: string): boolean {
+  const escapedId = styleId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`<w:style\\b[^>]*\\bw:styleId=(["'])${escapedId}\\1`).test(xml)
 }
 
 /** Patch only the requested default font slots, preserving all other defaults. */

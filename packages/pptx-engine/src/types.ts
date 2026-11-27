@@ -185,6 +185,23 @@ export interface TextRun {
   strikeStyle?: string
   /** Original rPr carried an explicit u="none" — an override of inherited underline the rebuild path must re-emit */
   underlineExplicitNone?: boolean
+  /**
+   * Withheld from the model: `label` is the only part a model ever sees, in
+   * place of this run's words. The words themselves stay in the document and in
+   * the file — a run is a mark over real text, never a replacement for it.
+   *
+   * It is stored on the model rather than left to ride along in the XML because
+   * two save paths discard anything they do not model: the structural rebuild
+   * (`rebuildTxBody`, taken when the run count changes) regenerates `<a:rPr>`
+   * from scratch, and the patch path rewrites `u`/`b`/`i`/`sz` from the model.
+   * Verified against this engine, not assumed: an `<a:extLst>` left in the
+   * original `<a:rPr>` survives an in-place text patch but is lost on rebuild.
+   *
+   * `underline` is the visible half and is NOT free: the patch path writes
+   * `u="none"` for a run whose model does not carry it, so applying a
+   * redaction must also set `underline` or the mark becomes invisible.
+   */
+  redact?: string
   /** Original rPr carried strike="noStrike" (see underlineExplicitNone) */
   strikeExplicitNone?: boolean
   /** Explicit cap attribute verbatim (incl. "none"); `cap` below holds the resolved display value, which may be inherited */
@@ -215,6 +232,26 @@ export interface TextRun {
    * GB2312 → Microsoft YaHei). Name classification is only the last resort.
    */
   fontScriptHint?: 'ja' | 'ko' | 'sc' | 'tc'
+  /**
+   * The run's East Asian language: its own altLang/lang, else the nearest inherited level
+   * default that carries a lang. 'none' = tagged with a non-East-Asian language (en-US);
+   * absent = no tag on the run or anywhere in its inheritance chain. PowerPoint for Mac with
+   * a Korean UI applied no East Asian rules to such text (a deck with no lang anywhere broke
+   * Hangul mid-word, like en-US), so layout applies none unless the host passes
+   * `defaultEaLang`. PowerPoint picks East Asian line-breaking rules by this tag, not by the
+   * characters (PowerPoint for Mac probes):
+   * - kinsoku and hanging punctuation use the language's own character sets, and en-US
+   *   text has none ("。" may start a line);
+   * - space-delimited Hangul words stay whole only in Korean-tagged text (an en-US run
+   *   breaks inside the last word that does not fit);
+   * - latinLnBrk="1" splits Latin words mid-word except in Korean-tagged text, where it
+   *   splits Hangul words instead.
+   */
+  eaLang?: 'ja' | 'ko' | 'sc' | 'tc' | 'none'
+  /** The run's own rPr lang / altLang, written back when the run is regenerated so an edit
+   *  does not strip the language its line breaking depends on. */
+  lang?: string
+  altLang?: string
   /**
    * Original <a:latin>/<a:ea> typeface text (incl. +mj-lt/+mn-ea theme refs).
    * Present = the user has not changed the font: patches keep the original bytes
@@ -303,7 +340,7 @@ export interface Paragraph {
   alignSrc?: string
   /** Paragraph base direction (a:pPr rtl): true = RTL base, false = explicit LTR base, absent = inferred from the first strong character */
   rtl?: boolean
-  /** <a:pPr hangingPunct="0"> switches off East Asian hanging punctuation (a trailing closing mark may overhang the margin); absent = PowerPoint's default, on */
+  /** Effective East Asian hanging-punctuation switch (own pPr, else lstStyle/master level); absent = PowerPoint default, on */
   hangingPunct?: boolean
   /** <a:pPr latinLnBrk="1"> ("allow Latin text to wrap in the middle of a word"): Hangul words then break per syllable like CJK; absent = word wrap */
   latinLnBrk?: boolean
@@ -377,6 +414,9 @@ export interface Paragraph {
     indent?: boolean
     tabLst?: boolean
     defTabSz?: boolean
+    hangingPunct?: boolean
+    latinLnBrk?: boolean
+    eaLnBrk?: boolean
   }
 }
 
@@ -455,6 +495,15 @@ interface ElementBase {
   transform: Transform
   /** Editor dirty flag: when true, save must regenerate OOXML; otherwise originalXml passes through */
   dirty?: boolean
+  /**
+   * Text-moved flag: a traced paragraph/run landed at a different index than its
+   * source (reorder, split or insert), so the in-place run patch would inherit the
+   * attributes of the old run now sitting at that position. Set by setText and
+   * consumed by patchTextElementXml, which rebuilds the txBody instead; it stays
+   * set until the element is reparsed/materialized (a rebuild cannot clear it while
+   * the moved text still occupies a foreign position).
+   */
+  textMoved?: boolean
   /** Geometry dirty flag: when true, save patches <a:xfrm> in place (orthogonal to text patches) */
   dirtyTransform?: boolean
   /** Fill dirty flag: when true, save patches the spPr fill node in place */
@@ -476,6 +525,21 @@ interface ElementBase {
    * state can be restored on reopen.
    */
   descr?: string
+  /**
+   * Withheld from the model, at element granularity. Only a picture can carry
+   * one: images, video and audio have no words to redact, so the point is that
+   * the model is not handed a reference it could fetch.
+   *
+   * Shape-level rather than run-level, because a picture is atomic — there is
+   * no run inside it to mark. `media.target` is the reason this is not merely
+   * cosmetic: for video and audio it can be an **external URL** (`r:link` of
+   * `videoFile`/`audioFile`), so emitting it hands the model a link it can
+   * replay, signed or not.
+   *
+   * The label is what the model sees. The `target`, the duration and the
+   * dimensions must not be.
+   */
+  redact?: string
   /**
    * <p:cNvPr id>: matching key between group children and slices of the group's
    * originalXml (for in-group editing). parseGroup iterates children grouped by
@@ -542,7 +606,7 @@ export interface TextElement extends ElementBase {
   /** spPr carried neither a:prstGeom nor a:custGeom (non-placeholder): PowerPoint draws only the text */
   noGeometry?: true
   fill?: Fill
-  /** <p:sp useBgFill="1">: painted with the slide's effective background fill (fill is only a fallback) */
+  /** <p:sp useBgFill="1"> without an spPr fill of its own: painted with the slide's effective background fill */
   useBgFill?: boolean
   /** <a:effectLst><a:fillOverlay>: second fill composited over the base (PowerPoint blends
    *  with the record's blend mode; the renderer approximates every mode as multiply) */
@@ -576,6 +640,11 @@ export interface PictureElement extends ElementBase {
    * frame; target is the media file's zip path or an external URL (external).
    */
   media?: { kind: 'video' | 'audio'; target?: string; external?: boolean }
+  /**
+   * A 3D model (mc:AlternateContent: am3d:model3d in the Choice, this picture in the Fallback):
+   * the .glb zip path and am3d:rot in 60,000ths of a degree.
+   */
+  model3d?: { target?: string; rot: { ax: number; ay: number; az: number } }
   /** Picture outline geometry <a:prstGeom> (ellipse avatars/rounded-corner frames etc. from picture styles; rect omitted) */
   presetGeometry?: string
   adjust?: Record<string, number>
@@ -679,6 +748,8 @@ export interface ChartElement extends ElementBase {
   type: 'chart'
   /** Parsed chart data model (see chart.ts) */
   chart: import('./chart').ChartModel
+  /** c:userShapes text/shape overlays, already in slide coordinates; render-only (never saved back) */
+  userShapes?: TextElement[]
 }
 
 export type SlideElement =

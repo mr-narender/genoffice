@@ -6,6 +6,7 @@ export const fr = {
   aiEmptyBuildBody:
     "Décrivez le tableau, les données ou le graphique voulu — l'IA les crée directement.",
   aiGskLoginBtn: 'Se connecter à Genspark',
+  aiGskLoginOk: 'Connecté à Genspark',
   aiUndelivered: 'Non envoyé',
   aiRetry: 'Réessayer',
   aiOpenAssistant: "Ouvrir l'assistant IA",
@@ -63,6 +64,8 @@ export const fr = {
   aiUnknownError: 'Erreur inconnue',
   aiTimeoutError:
     "Délai de la requête IA dépassé : aucune réponse du réseau, l'exécution a été interrompue. Vérifiez votre connexion et réessayez",
+  aiRegionError:
+    'Le fournisseur de ce modèle ne dessert pas votre région actuelle — choisissez un autre modèle ou changez de réseau',
   aiOverloadedError: "Le service d'IA est actuellement surchargé — réessayez dans un instant",
   aiNetworkError:
     'Problème réseau : impossible de joindre le service IA. Vérifiez votre connexion et réessayez',

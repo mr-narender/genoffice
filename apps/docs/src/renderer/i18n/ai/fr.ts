@@ -9,6 +9,7 @@ export const fr = {
   aiStarterContinue: 'Continuer la rédaction là où le document s’arrête',
   aiStarterFillTemplate: 'Trouver et remplir les espaces réservés du document',
   aiGskLoginBtn: 'Se connecter à Genspark',
+  aiGskLoginOk: 'Connecté à Genspark',
   aiPanelTitle: 'Genspark',
   aiOpenAssistant: "Ouvrir l'assistant IA",
   aiSummarizeBtn: 'Résumé IA',
@@ -102,6 +103,11 @@ export const fr = {
     "Suivi des modifications activé : les modifications de contenu de l'IA sont marquées comme révisions (insertions soulignées, suppressions barrées) ; acceptez ou refusez dans Révision",
   aiTrackOffTitle:
     "Suivi des modifications désactivé : les modifications de l'IA s'appliquent immédiatement (vous pouvez toujours restaurer via les instantanés de version)",
+  aiRevisionBarTitle: 'Révisions',
+  aiRevisionCount: '{count} modifications en attente',
+  aiRevisionRejectAll: 'Tout refuser',
+  aiRevisionAcceptAll: 'Tout accepter',
+  aiRevisionPara: 'Paragraphe {n}',
   aiTurnLimit:
     "(Limite de tours d'appels d'outils atteinte pour cette requête ; la réponse ci-dessus reflète les étapes déjà effectuées et peut être incomplète.)",
   aiStopped: '(Arrêté)',
@@ -113,6 +119,8 @@ export const fr = {
   aiUnknownError: 'Erreur inconnue',
   aiTimeoutError:
     "Délai de la requête IA dépassé : aucune réponse du réseau, l'exécution a été interrompue. Vérifiez votre connexion et réessayez",
+  aiRegionError:
+    'Le fournisseur de ce modèle ne dessert pas votre région actuelle — choisissez un autre modèle ou changez de réseau',
   aiOverloadedError: "Le service d'IA est actuellement surchargé — réessayez dans un instant",
   aiNetworkError:
     'Problème réseau : impossible de joindre le service IA. Vérifiez votre connexion et réessayez',
@@ -122,6 +130,9 @@ export const fr = {
   aiSumImageAttachment: 'Pièce jointe image {name}',
   aiSumRead: 'Lire {name}',
   aiSumReadAttachmentName: 'Lire la pièce jointe {name}',
+  aiSumSkillsList: 'Compétences installées listées',
+  aiSumSkillRead: 'Lecture de la compétence {name}',
+  aiSumRunCli: 'A exécuté {args}',
   aiSumWebSearch: 'Recherche web',
   aiSumWebSearchDone: 'Recherche « {query} » ({count} résultats)',
   aiSumImageSearch: "Recherche d'images",
@@ -146,6 +157,8 @@ export const fr = {
     "{blocks} blocs sont arrivés avant l'arrêt de la rédaction. Conserver cette partie ou l'abandonner ?",
   aiPartialAdopt: 'Conserver',
   aiPartialDiscard: 'Abandonner',
+  aiSumProtectedBlocked:
+    'Non appliqué : le document est protégé en dehors de ses zones modifiables',
   aiSumInsertedBlocks: '{count} bloc(s) inséré(s)',
   aiSumCreateDocument: 'Créer un nouveau document',
   aiSumCreatedDocument: '{name} créé',
@@ -185,4 +198,22 @@ export const fr = {
   aiCmdImages: '{count} image(s) mise(s) à jour',
   aiCmdToc: 'Table des matières insérée ({count} entrées)',
   aiCmdSkipped: ' ({count} bloc(s) protégé(s) ignoré(s))',
+  aiStarterMindMap: 'Générer une carte mentale de ce document',
+  aiMindMapBtn: 'Carte mentale IA',
+  aiMindMapPrompt:
+    'Génère une carte mentale de ce document en organisant les thèmes principaux et les concepts clés selon sa structure de sections',
+  aiSumMindMap: 'Générer la carte mentale',
+  aiMindMapTitle: 'Carte mentale',
+  aiMindMapNodes: '{count} nœuds',
+  aiMindMapAskPrompt: 'Parle-moi de « {label} » dans ce document',
+  aiMindMapJump: 'Aller au passage cité',
+  aiMindMapExport: 'Exporter en PNG',
+  aiMindMapExportSvg: 'Exporter en SVG',
+  aiMindMapInsert: 'Insérer dans le document',
+  aiMindMapReset: 'Réinitialiser la vue',
+  aiMindMapExpand: 'Déplier la branche',
+  aiMindMapCollapse: 'Replier la branche',
+  aiMindMapToggleLayout: 'Changer la disposition',
+  aiMindMapLayoutTopDown: 'Passer à la disposition de haut en bas',
+  aiMindMapLayoutLeftRight: 'Passer à la disposition de gauche à droite',
 } satisfies Record<keyof typeof zh, string>

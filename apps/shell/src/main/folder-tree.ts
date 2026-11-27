@@ -1,18 +1,23 @@
 import {
   accessSync,
+  chmodSync,
   constants,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   watch,
   type FSWatcher,
 } from 'node:fs'
 import { basename, dirname, extname, join, resolve, sep } from 'node:path'
+import { copyFileExclusiveSync } from '@genoffice/electron-utils/copy-file'
 import type {
   FolderEntry,
   FolderListing,
@@ -23,7 +28,9 @@ import type {
   RenameResult,
 } from '../shared/home-api'
 import { isValidRenameName } from './rename-validation'
+import { PerFolderWatch } from './per-folder-watch'
 import { statPathEntries } from './recent-files'
+import { mkdirDirs } from '@genoffice/electron-utils'
 
 /** files the home tree shows; mirrors the shell's open-dialog filter */
 export const TREE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
@@ -34,11 +41,21 @@ export const TREE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
   'xls',
   'csv',
   'tsv',
+  'ods',
+  'ots',
   'pptx',
   'ppt',
+  'odt',
+  'ott',
+  'hwpx',
+  'hwp',
+  'odp',
+  'otp',
   'pdf',
   'md',
   'markdown',
+  'txt',
+  'json',
   'html',
   'htm',
 ])
@@ -72,6 +89,9 @@ function realOrResolved(path: string): string {
   }
 }
 
+/** Ensure a path has a separator boundary without doubling filesystem roots. */
+const withTrailingSep = (dir: string): string => (dir.endsWith(sep) ? dir : dir + sep)
+
 /**
  * True when `path` is the root or lives under it. Existing paths compare by
  * real path (so a symlink pointing outside is rejected); a not-yet-existing
@@ -88,13 +108,16 @@ export function isInsideRoot(root: string, path: string): boolean {
     probe = parent
   }
   const real = join(realOrResolved(probe), ...missing)
-  return real === realRoot || real.startsWith(realRoot + sep)
+  return real === realRoot || real.startsWith(withTrailingSep(realRoot))
 }
 
 export function describeRoot(root: string): FolderRoot {
   let usable: boolean
   try {
-    mkdirSync(root, { recursive: true })
+    // per-level mkdir, not recursive: a filesystem that refuses the leaf while
+    // its parent exists (Defender Controlled Folder Access on Documents) makes
+    // the recursive form spin the main process forever — see mkdirDirs.
+    mkdirDirs(root)
     accessSync(root, constants.W_OK)
     usable = statSync(root).isDirectory()
   } catch {
@@ -146,9 +169,15 @@ export function listFolder(dir: string, starredPaths: ReadonlySet<string>): Fold
 
 /** the candidates below `dir` at any depth; bookkeeping filters tracked paths instead of walking the disk */
 export function pathsUnder(dir: string, candidates: Iterable<string>): string[] {
-  const prefix = resolve(dir) + sep
+  const base = resolve(dir)
+  const prefix = withTrailingSep(base)
   const out = new Set<string>()
-  for (const path of candidates) if (resolve(path).startsWith(prefix)) out.add(path)
+  for (const path of candidates) {
+    const resolved = resolve(path)
+    if (resolved !== base && resolved.startsWith(prefix)) {
+      out.add(path)
+    }
+  }
   return [...out]
 }
 
@@ -195,8 +224,66 @@ export function moveOnDisk(from: string, to: string): void {
     renameSync(from, to)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err
-    cpSync(from, to, { recursive: true, errorOnExist: true, force: false })
+    copyTreeExclusiveSync(from, to)
     rmSync(from, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Copy `from` (a file or a whole folder) to `to`, which must not exist yet.
+ * Files go through copyFileExclusiveSync, which still works on a mount that
+ * refuses the platform copy and the chmod that cpSync gives each folder.
+ */
+function copyTreeExclusiveSync(from: string, to: string): void {
+  // `real` is where an entry was created, with links resolved. In a shared
+  // folder someone else can swap a folder this move made for a link, and what
+  // lies behind that link must be neither removed nor given a mode.
+  const created: { path: string; real: string; isDir: boolean }[] = []
+  const folderModes: { path: string; real: string; mode: number }[] = []
+  const copy = (source: string, target: string, real: string): void => {
+    const stats = lstatSync(source)
+    if (stats.isDirectory()) {
+      // The owner's alone until the end: nobody else can put a link inside
+      // while the copy runs, and a read-only folder could neither be filled
+      // nor emptied again by a roll-back.
+      mkdirSync(target, { mode: 0o700 })
+      created.push({ path: target, real, isDir: true })
+      folderModes.push({ path: target, real, mode: stats.mode & 0o7777 })
+      for (const name of readdirSync(source))
+        copy(join(source, name), join(target, name), join(real, name))
+    } else if (stats.isFile()) {
+      copyFileExclusiveSync(source, target)
+      created.push({ path: target, real, isDir: false })
+    } else {
+      cpSync(source, target, { errorOnExist: true, force: false })
+      created.push({ path: target, real, isDir: false })
+    }
+  }
+  try {
+    copy(from, to, join(realpathSync(dirname(to)), basename(to)))
+  } catch (err) {
+    // Only the entries recorded above, and a folder only once it is empty:
+    // anything else at the destination was not this move's.
+    for (const { path, real, isDir } of created.reverse()) {
+      try {
+        if (realpathSync(dirname(path)) !== dirname(real)) continue
+        if (isDir) rmdirSync(path)
+        else unlinkSync(path)
+      } catch {
+        // the copy already failed; keep undoing the rest
+      }
+    }
+    throw err
+  }
+  // Deepest folder first: once a folder's mode takes the owner's search bit
+  // away, nothing below it can be reached. The copy is complete by now, so a
+  // mount that refuses chmod costs only the mode.
+  for (const { path, real, mode } of folderModes.reverse()) {
+    try {
+      if (realpathSync(path) === real) chmodSync(path, mode)
+    } catch {
+      // the folder keeps the mode it was created with
+    }
   }
 }
 
@@ -215,7 +302,7 @@ export interface MoveOptions {
 export function isSelfOrDescendant(path: string, dir: string): boolean {
   const a = resolve(path)
   const b = resolve(dir)
-  return a === b || b.startsWith(a + sep)
+  return a === b || b.startsWith(withTrailingSep(a))
 }
 
 /**
@@ -315,11 +402,18 @@ function isSameEntry(a: string, b: string): boolean {
 
 /** `oldPrefix/…/file` → `newPrefix/…/file` for a file that lived under a renamed/moved folder */
 export function rebasePath(path: string, oldDir: string, newDir: string): string {
-  const rel = resolve(path).slice(resolve(oldDir).length)
-  return join(newDir, rel)
+  const abs = resolve(path)
+  const base = resolve(oldDir)
+  // a bare prefix slice would also match a sibling like `/w/src2/f` under `/w/src`
+  if (abs !== base && !abs.startsWith(withTrailingSep(base))) return path
+  return join(newDir, abs.slice(base.length))
 }
 
 const WATCH_DEBOUNCE_MS = 250
+
+/** macOS and Windows watch a whole tree through one handle; elsewhere Node walks the tree inside `fs.watch` */
+const hasRecursiveWatch = (): boolean =>
+  process.platform === 'darwin' || process.platform === 'win32'
 
 /**
  * Watches the root recursively and reports the folders whose direct
@@ -327,7 +421,7 @@ const WATCH_DEBOUNCE_MS = 250
  * show up in the tree the same way as our own edits.
  */
 export class FolderWatcher {
-  private watcher: FSWatcher | null = null
+  private watcher: FSWatcher | PerFolderWatch | null = null
   private pending = new Set<string>()
   private timer: NodeJS.Timeout | null = null
 
@@ -341,9 +435,11 @@ export class FolderWatcher {
     private readonly onChange: (dirs: string[]) => void,
   ) {
     try {
-      this.watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
-        this.note(filename)
-      })
+      this.watcher = hasRecursiveWatch()
+        ? watch(root, { recursive: true, persistent: false }, (_event, filename) => {
+            this.note(filename)
+          })
+        : new PerFolderWatch(root, (filename) => this.note(filename))
       this.watcher.on('error', () => this.close())
     } catch {
       this.watcher = null

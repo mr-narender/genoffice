@@ -1,8 +1,9 @@
 import type { Node as PmDocNode } from '@tiptap/pm/model'
 import type { StyleParaProps, StyleRunProps, StyleUpsert } from '@genoffice/docx-engine'
 import type { AgentToolDef } from '../../shared/ipc'
-import { parsePoints } from './lengths'
+import { parseExactLineTwips, parsePoints } from './lengths'
 import type { Op, OpContext, OpDef, OpResult, RunEnv, SelRange, Target, TopBlock } from './ops'
+import { tabSpecsToStops, validateTabs, type TabSpec } from './tab-stops'
 
 /** A style as the AI sees it: the styles.xml entry plus definitions pending in this session. */
 export interface AiStyleInfo {
@@ -88,8 +89,9 @@ export const DEFINE_STYLE_TOOL: AgentToolDef = {
             description: `space after, ${LENGTH_DESC}`,
           },
           lineSpacing: {
-            type: ['number', 'null'],
-            description: 'line spacing as a multiple of single (1, 1.15, 1.5, 2)',
+            type: ['number', 'string', 'null'],
+            description:
+              'a number is a multiple of single spacing (1, 1.15, 1.5, 2); a length string is an exact line height ("30pt")',
           },
           indentLeft: { type: ['number', 'string', 'null'], description: LENGTH_DESC },
           indentRight: { type: ['number', 'string', 'null'], description: LENGTH_DESC },
@@ -104,6 +106,12 @@ export const DEFINE_STYLE_TOOL: AgentToolDef = {
             type: ['integer', 'null'],
             description:
               '1-9: the style becomes a heading of that level in the navigation pane / TOC',
+          },
+          tabs: {
+            type: ['array', 'null'],
+            description:
+              'tab stops of the style (replaces its w:tabs; [] or null removes them): [{ pos: twips or "6.5in", align?: left|center|right|decimal|bar, leader?: none|dot|hyphen|underscore|middleDot, clear?: true }]',
+            items: { type: 'object' },
           },
         },
       },
@@ -222,12 +230,18 @@ function paraProps(input: Record<string, unknown>): Result<StyleParaProps> {
     if (r.value !== undefined) out[target] = r.value
   }
   if (input.lineSpacing !== undefined) {
-    if (
+    const exact = parseExactLineTwips(input.lineSpacing)
+    // pending upserts merge field by field: name both so the other rule never outlives this one
+    out.lineFixed = exact === undefined ? undefined : { rule: 'exact', twips: exact }
+    if (exact !== undefined) out.lineSpacing = undefined
+    else if (
       input.lineSpacing !== null &&
       !(typeof input.lineSpacing === 'number' && input.lineSpacing > 0)
     )
-      return err('paragraph.lineSpacing must be a positive multiple (e.g. 1.5) or null')
-    out.lineSpacing = input.lineSpacing as number | null
+      return err(
+        'paragraph.lineSpacing must be a positive multiple (e.g. 1.5), an exact length (e.g. "30pt") or null',
+      )
+    else out.lineSpacing = input.lineSpacing as number | null
   }
   for (const k of ['keepNext', 'keepLines', 'pageBreakBefore'] as const) {
     const r = boolOf(input[k], `paragraph.${k}`)
@@ -239,6 +253,11 @@ function paraProps(input: Record<string, unknown>): Result<StyleParaProps> {
     if (v !== null && !(Number.isInteger(v) && Number(v) >= 1 && Number(v) <= 9))
       return err('paragraph.outlineLevel must be 1-9 or null')
     out.outlineLevel = v as number | null
+  }
+  if (input.tabs !== undefined) {
+    const error = validateTabs(input.tabs, 'paragraph')
+    if (error) return err(error)
+    out.tabStops = tabSpecsToStops(input.tabs as TabSpec[] | null)
   }
   return { value: out }
 }

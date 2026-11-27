@@ -1,5 +1,6 @@
 import type { Node as PmNode } from '@tiptap/pm/model'
 import type { Command, EditorState, Transaction } from '@tiptap/pm/state'
+import type { EditorView } from '@tiptap/pm/view'
 import { TableMap, isInTable, selectedRect } from '@tiptap/pm/tables'
 
 export const MIN_TABLE_COLUMN_PX = 40
@@ -117,6 +118,7 @@ function writeGridWidths(
   tr: Transaction,
   target: GridTarget,
   widths: number[],
+  keepPctTable = false,
 ): Transaction {
   const { map, table, tableStart } = target
   const seen = new Set<number>()
@@ -136,11 +138,20 @@ function writeGridWidths(
     }
   }
   const total = widths.reduce((sum, width) => sum + width, 0)
+  const colWidthsPct = widths.map((width) => (width / total) * 100)
+  // the shares moved inside a table that stays a share of the page
+  if (keepPctTable && table.attrs.widthPct)
+    return tr.setNodeMarkup(tableStart - 1, undefined, { ...table.attrs, colWidthsPct })
+  // Word turns an AutoFit table into a fixed grid the moment a border is
+  // dragged; leaving 'window' would keep rendering it at the full content width
+  const autoFit =
+    table.attrs.tblAutoFit === 'fixed' ? {} : { tblAutoFit: 'fixed', tblAutoFitEdited: true }
   tr = tr.setNodeMarkup(tableStart - 1, undefined, {
     ...table.attrs,
+    ...autoFit,
     widthPx: total,
     widthPct: null,
-    colWidthsPct: widths.map((width) => (width / total) * 100),
+    colWidthsPct,
   })
   return tr
 }
@@ -170,6 +181,76 @@ function resizeColumns(
 export function setSelectedColumnWidth(desiredPx: number, maxWidthPx: number): Command {
   return (state, dispatch) =>
     resizeColumns(state, dispatch, desiredPx, maxWidthPx, targetFromSelection(state))
+}
+
+/** each column in [left, right) takes `pct` of the grid, the others share the rest; the total stays */
+export function shareColumnWidths(
+  current: number[],
+  left: number,
+  right: number,
+  pct: number,
+  minimum = MIN_TABLE_COLUMN_PX,
+): number[] {
+  const total = current.reduce((sum, width) => sum + width, 0)
+  const picked = right - left
+  const others = current.length - picked
+  if (!(total > 0) || picked <= 0) return current
+  if (others <= 0) return current.map(() => Math.round((total / picked) * 100) / 100)
+  const floor = Math.min(minimum, total / current.length)
+  const each = Math.min(
+    Math.max(floor, (Math.max(0, pct) / 100) * total),
+    (total - floor * others) / picked,
+  )
+  const rest = total - each * picked
+  const restNow = total - current.slice(left, right).reduce((sum, width) => sum + width, 0)
+  return current.map((width, col) => {
+    const next =
+      col >= left && col < right ? each : restNow > 0 ? (width / restNow) * rest : rest / others
+    return Math.round(next * 100) / 100
+  })
+}
+
+/**
+ * Table Properties > Preferred width: a length resizes like the ribbon field, a
+ * percent keeps the table's width; either way the columns' cells remember the unit.
+ */
+export function setSelectedColumnPreferredWidth(
+  width: { px: number } | { pct: number },
+  maxWidthPx: number,
+): Command {
+  return (state, dispatch) => {
+    const target = targetFromSelection(state)
+    if (!target) return false
+    const current = tableGridWidths(state, target, maxWidthPx)
+    if (!current) return false
+    const inPct = 'pct' in width
+    let widths: number[]
+    if (inPct) {
+      widths = shareColumnWidths(current, target.left, target.right, width.pct)
+    } else {
+      const requested = new Map<number, number>()
+      for (let col = target.left; col < target.right; col++) requested.set(col, width.px)
+      widths = fitColumnWidths(current, requested, maxWidthPx)
+    }
+    const resized = widths.some((w, index) => Math.abs(w - current[index]) > 0.01)
+    let tr = resized ? writeGridWidths(state, state.tr, target, widths, inPct) : state.tr
+    const { map, tableStart } = target
+    const seen = new Set<number>()
+    let flagged = false
+    for (let index = 0; index < map.map.length; index++) {
+      const cellPos = map.map[index]
+      if (seen.has(cellPos)) continue
+      seen.add(cellPos)
+      const rect = map.findCell(cellPos)
+      if (rect.left < target.left || rect.right > target.right) continue
+      const cell = tr.doc.nodeAt(tableStart + cellPos)
+      if (!cell || !!cell.attrs.widthPct === inPct) continue
+      tr = tr.setNodeMarkup(tableStart + cellPos, undefined, { ...cell.attrs, widthPct: inPct })
+      flagged = true
+    }
+    if (resized || flagged) dispatch?.(tr)
+    return true
+  }
 }
 
 /** Drag-resize cleanup: proportionally clamp an overflowing grid to the content box. */
@@ -202,4 +283,101 @@ export function distributeSelectedColumns(maxWidthPx: number): Command {
     )
     return true
   }
+}
+
+/** Column grid of the table around a resize handle's cell, as the drag starts from it. */
+export interface TableGridAtCell {
+  /** model px per grid column */
+  widths: number[]
+  /** grid column whose right edge the handle sits on */
+  col: number
+}
+
+/**
+ * Model grid for a border drag. Columns follow the rendered colgroup percentages
+ * when they describe the whole grid (that is what the user sees), scaled to the
+ * table's model width, so the drag starts from exactly the displayed layout.
+ */
+export function tableGridAtCell(
+  state: EditorState,
+  cellPos: number,
+  maxWidthPx: number,
+): TableGridAtCell | null {
+  const target = targetFromCellPos(state, cellPos)
+  if (!target) return null
+  const current = tableGridWidths(state, target, maxWidthPx)
+  if (!current) return null
+  const cell = state.doc.nodeAt(cellPos)
+  if (!cell) return null
+  const col =
+    target.map.colCount(cellPos - target.tableStart) + (Number(cell.attrs.colspan) || 1) - 1
+  const attrs = target.table.attrs
+  const declaredTotal = current.reduce((sum, width) => sum + width, 0)
+  const total =
+    finiteWidth(attrs.widthPx, 0) ||
+    (attrs.widthPct ? (Number(attrs.widthPct) / 100) * maxWidthPx : 0) ||
+    declaredTotal
+  const pct = attrs.colWidthsPct as number[] | null
+  const shares =
+    pct && pct.length === current.length && pct.every((p) => Number.isFinite(p) && p > 0)
+      ? pct
+      : current
+  const shareTotal = shares.reduce((sum, share) => sum + share, 0)
+  if (!(shareTotal > 0) || !(total > 0)) return null
+  return { widths: shares.map((share) => (share / shareTotal) * total), col }
+}
+
+/** Commit a dragged grid: every cell gets its slice, the table its new total and percentages. */
+export function setTableGridAtCell(cellPos: number, widths: number[]): Command {
+  return (state, dispatch) => {
+    const target = targetFromCellPos(state, cellPos)
+    if (!target || widths.length !== target.map.width) return false
+    if (!widths.every((width) => Number.isFinite(width) && width > 0)) return false
+    const rounded = widths.map((width) => Math.max(1, Math.round(width * 100) / 100))
+    dispatch?.(writeGridWidths(state, state.tr, target, rounded))
+    return true
+  }
+}
+
+/**
+ * After AutoFit Contents: keep the columns the browser just sized to their
+ * content as the cells' own widths. Word saves its fitted widths as w:tcW the
+ * same way; without them the save wrote the old equal grid, and the reopened
+ * (or autosaved) table spread back over the whole column, past its margin.
+ */
+export function pinRenderedColumnWidths(view: EditorView): boolean {
+  const target = targetFromSelection(view.state)
+  if (!target) return false
+  const { map, table, tableStart } = target
+  const dom = view.nodeDOM(tableStart - 1)
+  if (!(dom instanceof HTMLElement)) return false
+  const widths: number[] = []
+  for (let col = 0; col < map.width; col++) {
+    let width = 0
+    // a single-column cell gives the column's width; offsetWidth ignores CSS zoom
+    for (let row = 0; row < map.height && !width; row++) {
+      const cellPos = map.map[row * map.width + col]
+      const rect = map.findCell(cellPos)
+      if (rect.right - rect.left !== 1) continue
+      const cell = view.nodeDOM(tableStart + cellPos)
+      if (cell instanceof HTMLElement) width = cell.offsetWidth
+    }
+    if (!(width > 0)) return false
+    widths.push(width)
+  }
+  let tr = view.state.tr
+  const seen = new Set<number>()
+  for (const cellPos of map.map) {
+    if (seen.has(cellPos)) continue
+    seen.add(cellPos)
+    const cell = table.nodeAt(cellPos)
+    if (!cell) continue
+    const rect = map.findCell(cellPos)
+    tr = tr.setNodeMarkup(tableStart + cellPos, undefined, {
+      ...cell.attrs,
+      colwidth: widths.slice(rect.left, rect.right),
+    })
+  }
+  view.dispatch(tr)
+  return true
 }

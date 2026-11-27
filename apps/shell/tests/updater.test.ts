@@ -45,16 +45,25 @@ const updaterState = {
   allowDowngrade: false,
 }
 const checkForUpdates = vi.fn(() => Promise.resolve(null))
-const downloadUpdate = vi.fn<() => Promise<unknown>>(() => Promise.resolve([]))
+const downloadUpdate = vi.fn<(token?: FakeCancellationToken) => Promise<unknown>>(() =>
+  Promise.resolve([]),
+)
+class FakeCancellationToken {
+  cancelled = false
+  cancel(): void {
+    this.cancelled = true
+  }
+}
 const quitAndInstall = vi.fn()
 
 vi.mock('electron-updater', () => ({
+  CancellationToken: FakeCancellationToken,
   autoUpdater: {
     on: (event: string, listener: Listener) => {
       updaterState.listeners.set(event, listener)
     },
     checkForUpdates: () => checkForUpdates(),
-    downloadUpdate: () => downloadUpdate(),
+    downloadUpdate: (token?: FakeCancellationToken) => downloadUpdate(token),
     quitAndInstall: (...args: unknown[]) => quitAndInstall(...(args as [boolean, boolean])),
     set autoDownload(v: boolean) {
       updaterState.autoDownload = v
@@ -100,6 +109,8 @@ vi.mock('../src/main/update-window', () => ({
   pushUpdateState: (patch: Partial<UpdateUiState>) => pushUpdateState(patch),
   closeUpdateWindow: () => closeUpdateWindow(),
   isUpdateWindowOpen: () => false,
+  setUpdateParentWindow: () => {},
+  clearUpdateState: () => closeUpdateWindow(),
 }))
 
 const FIRST_CHECK_DELAY_MS = 15_000
@@ -204,6 +215,24 @@ describe('initAutoUpdater', () => {
     initAutoUpdater(() => null)
     vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
     expect(checkForUpdates).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(RECHECK_INTERVAL_MS)
+    expect(checkForUpdates).toHaveBeenCalledTimes(2)
+  })
+
+  it('skips background checks while automatic checking is off, and resumes when it is back on', async () => {
+    let auto = false
+    const { initAutoUpdater, checkForUpdatesNow } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => auto,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS + RECHECK_INTERVAL_MS)
+    expect(checkForUpdates).not.toHaveBeenCalled()
+    // an explicit Help › Check for Updates… still asks the feed
+    void checkForUpdatesNow()
+    expect(checkForUpdates).toHaveBeenCalledTimes(1)
+    auto = true
     vi.advanceTimersByTime(RECHECK_INTERVAL_MS)
     expect(checkForUpdates).toHaveBeenCalledTimes(2)
   })
@@ -326,6 +355,76 @@ describe('initAutoUpdater', () => {
     expect(checkForUpdates).toHaveBeenCalledTimes(2)
   })
 
+  it('applyUpdateChannel drops a downloaded package of the previous channel', async () => {
+    const { initAutoUpdater, applyUpdateChannel } = await loadUpdater()
+    initAutoUpdater(() => null)
+    const available = updaterState.listeners.get('update-available')!
+    available({ version: '0.2.0' })
+    lastShownActions().onDownload()
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+    expect(updaterState.autoInstallOnAppQuit).toBe(true)
+    lastShownActions().onLater()
+
+    applyUpdateChannel('beta')
+    // the stale package must not install on quit or via a stale window action
+    expect(updaterState.autoInstallOnAppQuit).toBe(false)
+    lastShownActions().onInstall()
+    vi.advanceTimersByTime(0)
+    expect(quitAndInstall).not.toHaveBeenCalled()
+
+    // the new channel's version is offered from scratch, not swallowed
+    available({ version: '0.3.0-beta.1' })
+    expect(showUpdateWindow).toHaveBeenCalledTimes(2)
+    expect(lastShownState().phase).toBe('available')
+    expect(lastShownState().version).toBe('0.3.0-beta.1')
+    lastShownActions().onDownload()
+    expect(downloadUpdate).toHaveBeenCalledTimes(2)
+    // a late completion of the old channel's download is ignored
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+    expect(pushUpdateState).not.toHaveBeenLastCalledWith({ phase: 'downloaded', percent: 100 })
+    updaterState.listeners.get('update-downloaded')!({ version: '0.3.0-beta.1' })
+    expect(pushUpdateState).toHaveBeenLastCalledWith({ phase: 'downloaded', percent: 100 })
+    expect(updaterState.autoInstallOnAppQuit).toBe(true)
+    lastShownActions().onInstall()
+    vi.advanceTimersByTime(0)
+    expect(quitAndInstall).toHaveBeenCalledWith(true, true)
+  })
+
+  it('applyUpdateChannel cancels an in-flight download and shields the new one from its leftovers', async () => {
+    let rejectOld: (err: Error) => void = () => {}
+    downloadUpdate.mockImplementationOnce(() => new Promise((_, reject) => (rejectOld = reject)))
+    downloadUpdate.mockImplementation(() => new Promise(() => {}))
+    const { initAutoUpdater, applyUpdateChannel } = await loadUpdater()
+    initAutoUpdater(() => null)
+    const available = updaterState.listeners.get('update-available')!
+    available({ version: '0.2.0' })
+    lastShownActions().onDownload()
+    updaterState.listeners.get('download-progress')!({ percent: 37 })
+    const oldToken = downloadUpdate.mock.calls[0][0]!
+
+    applyUpdateChannel('beta')
+    expect(closeUpdateWindow).toHaveBeenCalledTimes(1)
+    expect(oldToken.cancelled).toBe(true)
+    // progress still trickling out of the dropped request is ignored
+    updaterState.listeners.get('download-progress')!({ percent: 40 })
+    expect(pushUpdateState).not.toHaveBeenCalledWith({ phase: 'downloading', percent: 40 })
+
+    available({ version: '0.3.0-beta.1' })
+    expect(showUpdateWindow).toHaveBeenCalledTimes(2)
+    expect(lastShownState().phase).toBe('available')
+    expect(lastShownState().percent).toBe(0)
+    lastShownActions().onDownload()
+    expect(downloadUpdate).toHaveBeenCalledTimes(2)
+    expect(downloadUpdate.mock.calls[1][0]).not.toBe(oldToken)
+
+    // the dropped request's late rejection must not fail the new download
+    rejectOld(new Error('cancelled'))
+    await flushAsync()
+    expect(pushUpdateState).not.toHaveBeenCalledWith({ phase: 'error' })
+    updaterState.listeners.get('download-progress')!({ percent: 5 })
+    expect(pushUpdateState).toHaveBeenLastCalledWith({ phase: 'downloading', percent: 5 })
+  })
+
   it('applyUpdateChannel is a no-op before the real updater is active', async () => {
     appState.isPackaged = false
     const { initAutoUpdater, applyUpdateChannel } = await loadUpdater()
@@ -333,6 +432,125 @@ describe('initAutoUpdater', () => {
     applyUpdateChannel('beta')
     expect(updaterState.channel).toBeNull()
     expect(checkForUpdates).not.toHaveBeenCalled()
+  })
+})
+
+describe('quiet background updates (genoffice#2389)', () => {
+  const silent = () => true
+
+  it('is off by default: a background check opens the card and downloads nothing', async () => {
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+    expect(showUpdateWindow).toHaveBeenCalledTimes(1)
+    expect(downloadUpdate).not.toHaveBeenCalled()
+  })
+
+  it('a background check downloads the package instead of opening the card', async () => {
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    expect(checkForUpdates).toHaveBeenCalledTimes(1)
+
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+    expect(downloadUpdate).toHaveBeenCalledTimes(1)
+  })
+
+  it('a quiet download stays quiet and installs the package on quit', async () => {
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+
+    updaterState.listeners.get('download-progress')!({ percent: 50 })
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+    expect(updaterState.autoInstallOnAppQuit).toBe(true)
+  })
+
+  it('a failed quiet download stays quiet too: the next check retries', async () => {
+    downloadUpdate.mockImplementation(() => Promise.reject(new Error('network')))
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+    await flushAsync()
+
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+  })
+
+  it('a manual check after a quiet download shows the package is ready', async () => {
+    const { initAutoUpdater, checkForUpdatesNow } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+
+    void checkForUpdatesNow()
+    await flushAsync()
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+
+    expect(showUpdateWindow).toHaveBeenCalledTimes(1)
+    expect(lastShownState().phase).toBe('downloaded')
+  })
+
+  it('a check the user asked for still reports a failure', async () => {
+    checkForUpdates.mockRejectedValueOnce(new Error('network'))
+    const { initAutoUpdater, checkForUpdatesNow } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    void checkForUpdatesNow()
+    await flushAsync()
+
+    expect(showMessageBox).toHaveBeenCalled()
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+  })
+
+  it('a check the user asked for still opens the card', async () => {
+    const { initAutoUpdater, checkForUpdatesNow } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      silent,
+    )
+    void checkForUpdatesNow()
+    await flushAsync()
+
+    updaterState.listeners.get('update-available')!({ version: '0.2.0' })
+
+    expect(showUpdateWindow).toHaveBeenCalledTimes(1)
+    expect(downloadUpdate).not.toHaveBeenCalled()
   })
 })
 
@@ -739,5 +957,198 @@ describe('checkForUpdatesNow (r148 manual check)', () => {
     expect(showUpdateWindow).toHaveBeenCalledTimes(1)
     expect(lastShownState().version).toBe('9.9.9')
     expect(showMessageBox).not.toHaveBeenCalled()
+  })
+})
+
+describe('linux deb self-update (genoffice#2325)', () => {
+  // electron-builder's FpmTarget bakes `package-type` ("deb") next to
+  // app-update.yml and electron-updater reads that file to pick DebUpdater.
+  // The gate in initAutoUpdater must treat it like the APPIMAGE env var: the
+  // updater starts, the background timer is registered, and a manual check
+  // consults the feed instead of claiming the automatic update "failed".
+  function mockLinuxFiles(packageType: string | null, feedYaml: string): void {
+    readFileSyncMock.mockImplementation(((p: unknown) => {
+      const s = String(p)
+      if (s.endsWith('package-type')) {
+        if (packageType === null) throw new Error('no package-type')
+        return packageType
+      }
+      if (s.endsWith('app-update.yml')) return feedYaml
+      throw new Error('no app-update.yml')
+    }) as never)
+  }
+
+  afterEach(() => {
+    delete process.env.APPIMAGE
+  })
+
+  it('activates the updater and its background timer for a deb install', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    expect(updaterState.listeners.size).toBeGreaterThan(0)
+    expect(updaterState.autoDownload).toBe(false)
+    expect(updaterState.disableDifferentialDownload).toBe(true)
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    expect(checkForUpdates).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(RECHECK_INTERVAL_MS)
+    expect(checkForUpdates).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a deb install on the explicit install button', async () => {
+    // DebUpdater installs through `dpkg -i` behind pkexec; installing that on
+    // quit would open a root password dialog the user did not ask for
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    expect(updaterState.autoInstallOnAppQuit).toBe(false)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0', files: [] })
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+    expect(updaterState.autoInstallOnAppQuit).toBe(false)
+  })
+
+  it('still installs on quit for an AppImage run', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    process.env.APPIMAGE = '/opt/GenOffice.AppImage'
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    expect(updaterState.autoInstallOnAppQuit).toBe(true)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0', files: [] })
+    updaterState.listeners.get('update-downloaded')!({ version: '0.2.0' })
+    expect(updaterState.autoInstallOnAppQuit).toBe(true)
+  })
+
+  it('shows the card instead of downloading quietly for a deb install', async () => {
+    // "install silently" ends in an install on quit, which a deb must not do
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(
+      () => null,
+      'stable',
+      () => true,
+      () => true,
+    )
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    updaterState.listeners.get('update-available')!({ version: '0.2.0', files: [] })
+
+    expect(showUpdateWindow).toHaveBeenCalledTimes(1)
+    expect(downloadUpdate).not.toHaveBeenCalled()
+  })
+
+  it('stays inactive on Linux with neither APPIMAGE nor a package-type', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    mockLinuxFiles(null, 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+    expect(updaterState.listeners.size).toBe(0)
+    expect(checkForUpdates).not.toHaveBeenCalled()
+  })
+
+  it.each(['rpm', 'pacman', 'flatpak'])(
+    'stays inactive for a %s package-type, which the feed does not publish',
+    async (pkg) => {
+      platformSpy?.restore()
+      setPlatform('linux')
+      delete process.env.APPIMAGE
+      mockLinuxFiles(pkg, 'url: https://cdn.example.com/linux\n')
+      const { initAutoUpdater } = await loadUpdater()
+      initAutoUpdater(() => null)
+
+      vi.advanceTimersByTime(FIRST_CHECK_DELAY_MS)
+      expect(updaterState.listeners.size).toBe(0)
+      expect(checkForUpdates).not.toHaveBeenCalled()
+    },
+  )
+
+  it('a manual check on a deb install consults the feed instead of claiming failure', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    const { initAutoUpdater, checkForUpdatesNow } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    checkForUpdates.mockImplementation(() => Promise.resolve({ isUpdateAvailable: false } as never))
+    await checkForUpdatesNow()
+
+    expect(checkForUpdates).toHaveBeenCalledTimes(1)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    // "You're up to date", not the "Automatic update failed…" dialog
+    const opts = showMessageBox.mock.calls.at(-1)![0] as { message: string }
+    expect(opts.message).not.toContain('Automatic update failed')
+    expect(showUpdateWindow).not.toHaveBeenCalled()
+  })
+
+  it('offers the .deb to a deb install that fails twice', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    delete process.env.APPIMAGE
+    Object.defineProperty(process, 'resourcesPath', { value: '/res', configurable: true })
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    downloadUpdate.mockImplementation(() => Promise.reject(new Error('dpkg failed')))
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    updaterState.listeners.get('update-available')!({
+      version: '0.2.0',
+      files: [{ url: 'GenOffice-0.2.0.AppImage' }, { url: 'genoffice_0.2.0_amd64.deb' }],
+    })
+    const actions = lastShownActions()
+    actions.onDownload()
+    await flushAsync()
+    expect(pushUpdateState).toHaveBeenCalledWith({ phase: 'error' })
+    actions.onDownload()
+    await flushAsync()
+    expect(pushUpdateState).toHaveBeenCalledWith({ phase: 'manual' })
+
+    actions.onOpenDownload()
+    expect(openExternal).toHaveBeenCalledWith(
+      'https://cdn.example.com/linux/genoffice_0.2.0_amd64.deb',
+    )
+  })
+
+  it('still offers the AppImage to an AppImage run that fails twice', async () => {
+    platformSpy?.restore()
+    setPlatform('linux')
+    process.env.APPIMAGE = '/opt/GenOffice.AppImage'
+    Object.defineProperty(process, 'resourcesPath', { value: '/res', configurable: true })
+    mockLinuxFiles('deb', 'url: https://cdn.example.com/linux\n')
+    downloadUpdate.mockImplementation(() => Promise.reject(new Error('offline')))
+    const { initAutoUpdater } = await loadUpdater()
+    initAutoUpdater(() => null)
+
+    updaterState.listeners.get('update-available')!({
+      version: '0.2.0',
+      files: [{ url: 'genoffice_0.2.0_amd64.deb' }, { url: 'GenOffice-0.2.0.AppImage' }],
+    })
+    const actions = lastShownActions()
+    actions.onDownload()
+    await flushAsync()
+    actions.onDownload()
+    await flushAsync()
+    expect(pushUpdateState).toHaveBeenCalledWith({ phase: 'manual' })
+
+    actions.onOpenDownload()
+    expect(openExternal).toHaveBeenCalledWith(
+      'https://cdn.example.com/linux/GenOffice-0.2.0.AppImage',
+    )
   })
 })

@@ -2,7 +2,19 @@
 // anchor metadata and page-position resolution, group transforms.
 import { attrsOf, childrenOf, findChild, nameOf, type XNode } from './xml-utils'
 import { EMU_PER_PX } from './parse-xml-text'
-import type { SectionSettings, TextGlow, TextOutline, TextboxDisplay, ThemeColors } from './types'
+import { placedOutsideGroup, type GroupXfrm } from './group-drawings'
+import { DEFAULT_THEME_COLORS } from './theme'
+import type {
+  SectionSettings,
+  TextGlow,
+  TextOutline,
+  TextFill,
+  TextFillStop,
+  TextReflection,
+  TextShadow,
+  TextboxDisplay,
+  ThemeColors,
+} from './types'
 
 /**
  * Display-only extraction of anchored textboxes: DrawingML (wps:wsp, converter
@@ -26,8 +38,24 @@ export const LINE_PRSTS = new Set([
   'curvedConnector4',
 ])
 
+/** a:xfrm flipH / flipV onto a display box */
+export function applyXfrmFlips(
+  box: { flipH?: boolean; flipV?: boolean },
+  xfrmAttrs: Record<string, string>,
+): void {
+  if (xfrmAttrs['flipH'] === '1' || xfrmAttrs['flipH'] === 'true') box.flipH = true
+  if (xfrmAttrs['flipV'] === '1' || xfrmAttrs['flipV'] === 'true') box.flipV = true
+}
+
+/** the box a level or vertical line takes across its stroke */
+export const LINE_BAND_PX = 12
+
 /** wps line shape → display-only line box (synthetic prst carries the arrow ends) */
-export function lineBoxOf(shape: XNode, theme?: ThemeColors | null): TextboxDisplay | null {
+export function lineBoxOf(
+  shape: XNode,
+  theme?: ThemeColors | null,
+  ctm?: GroupCtm | null,
+): TextboxDisplay | null {
   const spPr = findChild(shape, 'wps:spPr')
   if (!spPr) return null
   const prst = attrsOf(findChild(spPr, 'a:prstGeom') ?? {})['prst']
@@ -61,20 +89,29 @@ export function lineBoxOf(shape: XNode, theme?: ThemeColors | null): TextboxDisp
   const ext = findChild(xfrm ?? {}, 'a:ext')
   const cx = ext ? parseInt(attrsOf(ext)['cx'] ?? '', 10) : NaN
   const cy = ext ? parseInt(attrsOf(ext)['cy'] ?? '', 10) : NaN
-  if (Number.isFinite(cx) && cx > 0) box.widthPx = Math.round(cx / EMU_PER_PX)
+  if (Number.isFinite(cx) && cx > 0) box.widthPx = Math.round((cx * (ctm?.sx ?? 1)) / EMU_PER_PX)
   const straight = box.prst === 'line' || box.prst === 'lineArrow' || box.prst === 'lineArrowDouble'
+  const vertical = straight && cx === 0 && Number.isFinite(cy) && cy > 0
   // flips apply at any height: Word's horizontal lines carry cy="0", and a
   // flipH there still reverses which tip holds the arrow
-  if (straight) {
-    if (xfrmAttrs['flipH'] === '1' || xfrmAttrs['flipH'] === 'true') box.flipH = true
-    if (xfrmAttrs['flipV'] === '1' || xfrmAttrs['flipV'] === 'true') box.flipV = true
-  }
+  applyXfrmFlips(box, xfrmAttrs)
+  // a:xfrm rot (60000ths of a degree) and a:ln w (EMU) round-trip on lines the
+  // same way they do on text-bearing shapes, so a rotated/resized connector
+  // keeps its transform across save and reload
+  const rot = parseInt(xfrmAttrs['rot'] ?? '', 10)
+  if (Number.isFinite(rot) && rot !== 0) box.rotDeg = Math.round(rot / 60000)
+  const lnW = parseInt(ln ? (attrsOf(ln)['w'] ?? '') : '', 10)
+  if (Number.isFinite(lnW) && lnW > 0)
+    box.borderWidthPx = Math.round((lnW / EMU_PER_PX) * 100) / 100
   if (Number.isFinite(cy) && cy > 0) {
-    box.heightPx = Math.round(cy / EMU_PER_PX)
+    box.heightPx = Math.round((cy * (ctm?.sy ?? 1)) / EMU_PER_PX)
     box.minHeightPx = box.heightPx
     // a real vertical extent means the connector runs corner to corner
     // (≤12 px stays level: our own inserted lines keep a 12 px grab band)
-    if (straight && (box.heightPx > 12 || box.flipH || box.flipV)) box.lineDiag = true
+    if (vertical) {
+      box.lineVert = true
+      box.widthPx = LINE_BAND_PX
+    } else if (straight && (box.heightPx > 12 || box.flipH || box.flipV)) box.lineDiag = true
   } else {
     // zero-height extent = Word's horizontal line; keep a 12 px grab band
     box.heightPx = 12
@@ -148,12 +185,11 @@ function gradStopRgb(gs: XNode, theme?: ThemeColors | null): number[] | null {
   if (!base && scheme) {
     const slot = SCHEME_CLR_SLOTS[attrsOf(scheme)['val'] ?? '']
     if (!slot) return null
-    base =
-      (theme?.[slot] as string | undefined) ??
-      (slot === 'dk1' ? '000000' : slot === 'lt1' ? 'FFFFFF' : undefined)
+    base = (theme?.[slot] as string | undefined) ?? DEFAULT_THEME_COLORS[slot]
   }
-  if (!base || !/^[0-9A-Fa-f]{6}$/.test(base)) return null
-  let rgb = [0, 2, 4].map((i) => parseInt(base!.slice(i, i + 2), 16))
+  const baseTrimmed = (base ?? '').trim()
+  if (!baseTrimmed || !/^[0-9A-Fa-f]{6}$/.test(baseTrimmed)) return null
+  let rgb = [0, 2, 4].map((i) => parseInt(baseTrimmed.slice(i, i + 2), 16))
   if (scheme) {
     const pct = (name: string): number | null => {
       const v = parseInt(attrsOf(findChild(scheme, name) ?? {})['val'] ?? '', 10)
@@ -189,6 +225,20 @@ export function colorNodeHex(
     .join('')
 }
 
+const COLOR_NODE_NAMES = ['a:srgbClr', 'a:schemeClr', 'a:sysClr', 'a:prstClr']
+
+/** a:alpha of a solid fill's color as 0..1; undefined when opaque or absent */
+export function solidFillAlpha(solidFill: XNode | undefined): number | undefined {
+  if (!solidFill) return undefined
+  for (const name of COLOR_NODE_NAMES) {
+    const color = findChild(solidFill, name)
+    if (!color) continue
+    const raw = parseInt(attrsOf(findChild(color, 'a:alpha') ?? {})['val'] ?? '', 10)
+    return Number.isFinite(raw) && raw >= 0 && raw < 100000 ? raw / 100000 : undefined
+  }
+  return undefined
+}
+
 /** anchored-drawing placement of one top-level w:drawing fragment */
 export interface DrawingAnchorMeta {
   offsetXEmu?: number
@@ -203,6 +253,8 @@ export interface DrawingAnchorMeta {
   pageYEmu?: number
   /** wp:wrapTopAndBottom: body text is excluded from the drawing's vertical band */
   topBottom?: boolean
+  /** layoutInCell="0": a cell-anchored drawing positions against the page/column, not its cell */
+  outsideCell?: boolean
   anchored?: boolean
   /** wp:positionH/V relativeFrom */
   relH?: string
@@ -216,9 +268,11 @@ export interface DrawingAnchorMeta {
   /** wp:extent (drawing size) */
   extentXEmu?: number
   extentYEmu?: number
-  /** wp:anchor distL/distR: text clearance beside a side-wrapped drawing */
+  /** wp:anchor distL/distR/distT/distB: text clearance around a side-wrapped drawing */
   distLEmu?: number
   distREmu?: number
+  distTEmu?: number
+  distBEmu?: number
   /** relativeHeight − Word's 251658240 base: paint order among overlapping anchors */
   z?: number
 }
@@ -278,14 +332,17 @@ export function drawingAnchorMeta(frag: string): DrawingAnchorMeta {
   }
   meta.offsetXEmu = posOf('H')
   meta.offsetYEmu = posOf('V')
-  for (const side of ['L', 'R'] as const) {
-    const v = parseInt(new RegExp(`\\bdist${side}="(\\d+)"`).exec(anchorTag)?.[1] ?? '', 10)
+  for (const side of ['L', 'R', 'T', 'B'] as const) {
+    const v = parseInt(
+      new RegExp(`\\bdist${side}\\s*=\\s*["'](\\d+)["']`).exec(anchorTag)?.[1] ?? '',
+      10,
+    )
     if (Number.isFinite(v)) meta[`dist${side}Emu`] = v
   }
   for (const dir of ['H', 'V'] as const) {
     const m = new RegExp(`<wp:position${dir}\\b([^>]*)>([\\s\\S]*?)</wp:position${dir}>`).exec(frag)
     if (!m) continue
-    const rel = /relativeFrom="(\w+)"/.exec(m[1])?.[1]
+    const rel = /relativeFrom\s*=\s*["'](\w+)["']/.exec(m[1])?.[1]
     const align = /<wp:align>(\w+)<\/wp:align>/.exec(m[2])?.[1]
     const pct = parseInt(
       new RegExp(`<wp14:pctPos${dir}Offset[^>]*>(-?\\d+)<`).exec(m[2])?.[1] ?? '',
@@ -301,23 +358,24 @@ export function drawingAnchorMeta(frag: string): DrawingAnchorMeta {
       if (Number.isFinite(pct)) meta.pctV = pct
     }
   }
-  const extent = /<wp:extent[^>]*cx="(\d+)"[^>]*cy="(\d+)"/.exec(frag)
-  if (extent) {
-    meta.extentXEmu = parseInt(extent[1], 10)
-    meta.extentYEmu = parseInt(extent[2], 10)
-  }
+  const extentTag = /<wp:extent[^>]*\/?>/.exec(frag)?.[0] ?? ''
+  const extentX = parseInt(/\bcx\s*=\s*["'](\d+)["']/.exec(extentTag)?.[1] ?? '', 10)
+  const extentY = parseInt(/\bcy\s*=\s*["'](\d+)["']/.exec(extentTag)?.[1] ?? '', 10)
+  if (Number.isFinite(extentX)) meta.extentXEmu = extentX
+  if (Number.isFinite(extentY)) meta.extentYEmu = extentY
   // the anchor's own wrap element sits before a:graphic; a nested drawing's
   // wrap must not leak up. behindDoc is z-order only: a behind-text picture
   // with wrapTight/wrapSquare/wrapTopAndBottom still excludes the text
   const graphicAt = frag.indexOf('<a:graphic')
   const ownXml = graphicAt === -1 ? frag : frag.slice(0, graphicAt)
-  const behind = /behindDoc="(?:1|true)"/.test(anchorTag)
+  const behind = /behindDoc\s*=\s*["'](?:1|true)["']/.test(anchorTag)
   const ownWrapped = /<wp:wrap(?:Square|Tight|Through|TopAndBottom)\b/.test(ownXml)
   if (frag.includes('<wp:wrapNone') || (behind && !ownWrapped)) meta.noWrap = true
   if (behind) meta.behind = true
-  const relHeight = Number(/relativeHeight="(\d+)"/.exec(anchorTag)?.[1] ?? NaN)
+  const relHeight = Number(/relativeHeight\s*=\s*["'](\d+)["']/.exec(anchorTag)?.[1] ?? NaN)
   if (Number.isFinite(relHeight) && relHeight - 251658240 !== 0) meta.z = relHeight - 251658240
   if (ownXml.includes('<wp:wrapTopAndBottom')) meta.topBottom = true
+  if (/layoutInCell\s*=\s*["'](?:0|false)["']/.test(anchorTag)) meta.outsideCell = true
   return meta
 }
 
@@ -358,10 +416,8 @@ export function resolveAnchorPagePos(
   if (relH !== 'page' && relH !== 'margin') return null
   if (meta.pctH === undefined && meta.alignH === undefined) return null
   const pageW = sect.pageWidth * EMU_PER_TWIP
-  const pageH = sect.pageHeight * EMU_PER_TWIP
   const marL = sect.marginLeft * EMU_PER_TWIP
   const marR = sect.marginRight * EMU_PER_TWIP
-  const marT = sect.marginTop * EMU_PER_TWIP
   const w = meta.extentXEmu ?? 0
   const refW = relH === 'page' ? pageW : pageW - marL - marR
   const relX =
@@ -377,24 +433,37 @@ export function resolveAnchorPagePos(
     xEmu: pageX - marL,
     outsideColumn: pageX + w <= marL || pageX >= pageW - marR,
   }
-  if (
-    (meta.relV === 'page' || meta.relV === 'margin') &&
-    (meta.pctV !== undefined || meta.alignV !== undefined)
-  ) {
-    const marB = sect.marginBottom * EMU_PER_TWIP
-    const h = meta.extentYEmu ?? 0
-    const refH = meta.relV === 'page' ? pageH : pageH - marT - marB
-    const relY =
-      meta.pctV !== undefined
-        ? Math.round((refH * meta.pctV) / 100000)
-        : meta.alignV === 'center'
-          ? Math.round((refH - h) / 2)
-          : meta.alignV === 'bottom' || meta.alignV === 'outside'
-            ? refH - h
-            : 0
-    pos.yEmu = (meta.relV === 'page' ? relY : marT + relY) - marT
-  }
+  const yEmu = resolveAnchorPageYEmu(meta, sect)
+  if (yEmu !== undefined) pos.yEmu = yEmu
   return pos
+}
+
+/**
+ * Page/margin-relative V placement (wp14:pctPosVOffset or wp:align) as an EMU
+ * offset from the body top, independent of how X is anchored. Undefined for
+ * plain posOffset or paragraph/line-relative anchors.
+ */
+export function resolveAnchorPageYEmu(
+  meta: DrawingAnchorMeta,
+  sect: SectionSettings | undefined,
+): number | undefined {
+  if (!sect) return undefined
+  if (meta.relV !== 'page' && meta.relV !== 'margin') return undefined
+  if (meta.pctV === undefined && meta.alignV === undefined) return undefined
+  const pageH = sect.pageHeight * EMU_PER_TWIP
+  const marT = sect.marginTop * EMU_PER_TWIP
+  const marB = sect.marginBottom * EMU_PER_TWIP
+  const h = meta.extentYEmu ?? 0
+  const refH = meta.relV === 'page' ? pageH : pageH - marT - marB
+  const relY =
+    meta.pctV !== undefined
+      ? Math.round((refH * meta.pctV) / 100000)
+      : meta.alignV === 'center'
+        ? Math.round((refH - h) / 2)
+        : meta.alignV === 'bottom' || meta.alignV === 'outside'
+          ? refH - h
+          : 0
+  return (meta.relV === 'page' ? relY : marT + relY) - marT
 }
 
 /**
@@ -442,12 +511,11 @@ function w14ColorRgb(node: XNode, theme?: ThemeColors | null): number[] | null {
   if (isScheme) {
     const slot = SCHEME_CLR_SLOTS[base ?? '']
     if (!slot) return null
-    base =
-      (theme?.[slot] as string | undefined) ??
-      (slot === 'dk1' ? '000000' : slot === 'lt1' ? 'FFFFFF' : undefined)
+    base = (theme?.[slot] as string | undefined) ?? DEFAULT_THEME_COLORS[slot]
   }
-  if (!base || !/^[0-9A-Fa-f]{6}$/.test(base)) return null
-  let rgb = [0, 2, 4].map((i) => parseInt(base!.slice(i, i + 2), 16))
+  const baseTrimmed = (base ?? '').trim()
+  if (!baseTrimmed || !/^[0-9A-Fa-f]{6}$/.test(baseTrimmed)) return null
+  let rgb = [0, 2, 4].map((i) => parseInt(baseTrimmed.slice(i, i + 2), 16))
   const pct = (name: string): number | null => {
     const v = parseInt(attrsOf(findChild(colorNode, name) ?? {})['w14:val'] ?? '', 10)
     return Number.isFinite(v) && v >= 0 ? v / 100000 : null
@@ -516,6 +584,67 @@ export function w14TextFillHex(rPr: XNode, theme?: ThemeColors | null): string |
   return rgbHex([0, 1, 2].map((i) => stops.reduce((sum, rgb) => sum + rgb[i], 0) / stops.length))
 }
 
+/** w14:alpha is how transparent the colour is: the opacity it leaves, when below 1 */
+function w14OpacityOf(node: XNode): number | undefined {
+  const colorNode = findChild(node, 'w14:srgbClr') ?? findChild(node, 'w14:schemeClr')
+  const raw = parseInt(attrsOf(findChild(colorNode ?? {}, 'w14:alpha') ?? {})['w14:val'] ?? '', 10)
+  return raw > 0 && raw <= 100000 ? Math.round((1 - raw / 100000) * 1000) / 1000 : undefined
+}
+
+/** w14:textFill as it is: no fill, a colour with its transparency, or a gradient with its stops */
+export function w14TextFillOf(rPr: XNode, theme?: ThemeColors | null): TextFill | undefined {
+  const tf = findChild(rPr, 'w14:textFill')
+  if (!tf) return undefined
+  if (findChild(tf, 'w14:noFill')) return { kind: 'none' }
+  const solid = findChild(tf, 'w14:solidFill')
+  if (solid) {
+    const rgb = w14ColorRgb(solid, theme)
+    if (!rgb) return undefined
+    const alpha = w14OpacityOf(solid)
+    return { kind: 'solid', color: rgbHex(rgb), ...(alpha !== undefined ? { alpha } : {}) }
+  }
+  const grad = findChild(tf, 'w14:gradFill')
+  const gsLst = findChild(grad ?? {}, 'w14:gsLst')
+  if (!grad || !gsLst) return undefined
+  const stops: TextFillStop[] = []
+  for (const gs of childrenOf(gsLst)) {
+    if (nameOf(gs) !== 'w14:gs') continue
+    const rgb = w14ColorRgb(gs, theme)
+    const pos = parseInt(attrsOf(gs)['w14:pos'] ?? '', 10)
+    if (!rgb || !(pos >= 0)) continue
+    const alpha = w14OpacityOf(gs)
+    stops.push({
+      pos: Math.min(1, pos / 100000),
+      color: rgbHex(rgb),
+      ...(alpha !== undefined ? { alpha } : {}),
+    })
+  }
+  if (stops.length === 0) return undefined
+  stops.sort((a, b) => a.pos - b.pos)
+  const ang = parseInt(attrsOf(findChild(grad, 'w14:lin') ?? {})['w14:ang'] ?? '', 10)
+  const path = attrsOf(findChild(grad, 'w14:path') ?? {})['w14:path']
+  return {
+    kind: 'gradient',
+    stops,
+    angleDeg: Number.isFinite(ang) ? Math.round(ang / 600) / 100 : 0,
+    ...(path === 'circle' || path === 'rect' || path === 'shape' ? { path } : {}),
+  }
+}
+
+/** the fill where it shows something a text colour of `color` would not */
+export function textFillBeyondColor(
+  fill: TextFill | undefined,
+  color: string | undefined,
+): TextFill | undefined {
+  if (!fill) return undefined
+  if (fill.kind === 'solid' && fill.alpha === undefined) {
+    return color !== undefined && fill.color.toUpperCase() !== color.toUpperCase()
+      ? fill
+      : undefined
+  }
+  return fill
+}
+
 /** w14:textOutline stroke (solid fills only; gradient/noFill outlines are not drawn) */
 export function w14TextOutlineOf(rPr: XNode, theme?: ThemeColors | null): TextOutline | undefined {
   const outline = findChild(rPr, 'w14:textOutline')
@@ -559,6 +688,46 @@ export function w14GlowOf(rPr: XNode, theme?: ThemeColors | null): TextGlow | un
   }
 }
 
+/** w14:shadow outer shadow (blur and distance in EMU, direction in 60000ths of a degree) */
+export function w14ShadowOf(rPr: XNode, theme?: ThemeColors | null): TextShadow | undefined {
+  const shadow = findChild(rPr, 'w14:shadow')
+  if (!shadow) return undefined
+  const rgb = w14ColorRgb(shadow, theme)
+  if (!rgb) return undefined
+  const attrs = attrsOf(shadow)
+  const emu = (name: string) => parseInt(attrs[name] ?? '', 10) || 0
+  const colorNode = findChild(shadow, 'w14:srgbClr') ?? findChild(shadow, 'w14:schemeClr')
+  const alphaRaw = parseInt(
+    attrsOf(findChild(colorNode ?? {}, 'w14:alpha') ?? {})['w14:val'] ?? '',
+    10,
+  )
+  const alpha = alphaRaw >= 0 && alphaRaw < 100000 ? alphaRaw / 100000 : undefined
+  return {
+    color: rgbHex(rgb),
+    ...(alpha !== undefined ? { alpha } : {}),
+    blurPt: Math.round((emu('w14:blurRad') / 12700) * 100) / 100,
+    distPt: Math.round((emu('w14:dist') / 12700) * 100) / 100,
+    dirDeg: Math.round(emu('w14:dir') / 60000),
+  }
+}
+
+/** w14:reflection (alphas and positions in 1000ths of a percent, blur and distance in EMU) */
+export function w14ReflectionOf(rPr: XNode): TextReflection | undefined {
+  const reflection = findChild(rPr, 'w14:reflection')
+  if (!reflection) return undefined
+  const attrs = attrsOf(reflection)
+  const num = (name: string) => parseInt(attrs[name] ?? '', 10) || 0
+  const startAlpha = num('w14:stA') / 100000
+  const endPos = num('w14:endPos') / 100000
+  if (!(startAlpha > 0) || !(endPos > 0)) return undefined
+  return {
+    startAlpha: Math.min(1, startAlpha),
+    endPos: Math.min(1, endPos),
+    blurPt: Math.round((num('w14:blurRad') / 12700) * 100) / 100,
+    distPt: Math.round((num('w14:dist') / 12700) * 100) / 100,
+  }
+}
+
 export interface ExtractTextboxOpts {
   /** include textless preset shapes (stars, block arrows…) as display boxes */
   shapes?: boolean
@@ -580,9 +749,34 @@ export interface GroupCtm {
   sy: number
   tx: number
   ty: number
+  /** the groups from the outermost in, once one of them is turned or mirrored (the affine part cannot say that) */
+  turned?: GroupLevel[]
+}
+
+interface GroupLevel {
+  group: GroupXfrm
+  chOff: { x: number; y: number }
+  chExt: { cx: number; cy: number }
 }
 
 export const IDENTITY_CTM: GroupCtm = { sx: 1, sy: 1, tx: 0, ty: 0 }
+
+function xfrmNumbers(xfrm: XNode): GroupXfrm {
+  const num = (node: XNode | undefined, key: string): number => {
+    const v = parseInt(attrsOf(node ?? {})[key] ?? '', 10)
+    return Number.isFinite(v) ? v : 0
+  }
+  const on = (key: string): boolean => /^(?:1|true)$/.test(attrsOf(xfrm)[key] ?? '')
+  return {
+    x: num(findChild(xfrm, 'a:off'), 'x'),
+    y: num(findChild(xfrm, 'a:off'), 'y'),
+    cx: num(findChild(xfrm, 'a:ext'), 'cx'),
+    cy: num(findChild(xfrm, 'a:ext'), 'cy'),
+    rot: num(xfrm, 'rot'),
+    flipH: on('flipH'),
+    flipV: on('flipV'),
+  }
+}
 
 /** wpg:wgp / wpg:grpSp xfrm (off/ext vs chOff/chExt) composed onto `outer` */
 export function composeGroupCtm(group: XNode, outer: GroupCtm): GroupCtm | null {
@@ -592,20 +786,74 @@ export function composeGroupCtm(group: XNode, outer: GroupCtm): GroupCtm | null 
     const v = parseInt(attrsOf(node ?? {})[key] ?? '', 10)
     return Number.isFinite(v) ? v : dflt
   }
-  const ox = num(findChild(xfrm, 'a:off'), 'x', 0)
-  const oy = num(findChild(xfrm, 'a:off'), 'y', 0)
-  const ex = num(findChild(xfrm, 'a:ext'), 'cx', 0)
-  const ey = num(findChild(xfrm, 'a:ext'), 'cy', 0)
+  const own = xfrmNumbers(xfrm)
+  const { x: ox, y: oy, cx: ex, cy: ey } = own
   const chOffX = num(findChild(xfrm, 'a:chOff'), 'x', 0)
   const chOffY = num(findChild(xfrm, 'a:chOff'), 'y', 0)
   const chExtX = num(findChild(xfrm, 'a:chExt'), 'cx', 0)
   const chExtY = num(findChild(xfrm, 'a:chExt'), 'cy', 0)
   const sx = ex > 0 && chExtX > 0 ? ex / chExtX : 1
   const sy = ey > 0 && chExtY > 0 ? ey / chExtY : 1
+  const level: GroupLevel = {
+    group: own,
+    chOff: { x: chOffX, y: chOffY },
+    chExt: { cx: chExtX > 0 ? chExtX : ex, cy: chExtY > 0 ? chExtY : ey },
+  }
+  const turns = own.rot !== 0 || own.flipH || own.flipV
+  const turned = outer.turned
+    ? [...outer.turned, level]
+    : turns
+      ? [...plainLevels(outer), level]
+      : undefined
   return {
     sx: outer.sx * sx,
     sy: outer.sy * sy,
     tx: outer.tx + outer.sx * (ox - chOffX * sx),
     ty: outer.ty + outer.sy * (oy - chOffY * sy),
+    ...(turned ? { turned } : {}),
   }
+}
+
+/** the unturned groups `ctm` stands for, as one level */
+function plainLevels(ctm: GroupCtm): GroupLevel[] {
+  if (ctm.sx === 1 && ctm.sy === 1 && ctm.tx === 0 && ctm.ty === 0) return []
+  return [
+    {
+      group: { x: ctm.tx, y: ctm.ty, cx: ctm.sx, cy: ctm.sy, rot: 0, flipH: false, flipV: false },
+      chOff: { x: 0, y: 0 },
+      chExt: { cx: 1, cy: 1 },
+    },
+  ]
+}
+
+/** Where a child of turned or mirrored groups stands, placed as Ungroup writes it; null when none is turned. */
+export function placedInGroups(xfrm: XNode | undefined, ctm: GroupCtm | null): GroupXfrm | null {
+  if (!xfrm || !ctm?.turned) return null
+  let placed = xfrmNumbers(xfrm)
+  for (let i = ctm.turned.length - 1; i >= 0; i--) {
+    const level = ctm.turned[i]
+    placed = placedOutsideGroup(placed, level.group, level.chOff, level.chExt)
+  }
+  return placed
+}
+
+export function placeGroupedBox(
+  box: {
+    offsetXEmu?: number
+    offsetYEmu?: number
+    rotDeg?: number
+    flipH?: boolean
+    flipV?: boolean
+  },
+  placed: GroupXfrm,
+): void {
+  box.offsetXEmu = Math.round(placed.x)
+  box.offsetYEmu = Math.round(placed.y)
+  const deg = Math.round(placed.rot / 60000) % 360
+  if (deg) box.rotDeg = deg
+  else delete box.rotDeg
+  if (placed.flipH) box.flipH = true
+  else delete box.flipH
+  if (placed.flipV) box.flipV = true
+  else delete box.flipV
 }

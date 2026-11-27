@@ -22,6 +22,8 @@ export function applyTocPageDisplays(
   tr: Transaction,
   headings: HeadingRef[],
   displays: Array<string | undefined>,
+  /** where the lines of locked tables stand: they keep the page they show */
+  locked?: ReadonlySet<number>,
 ): boolean {
   const pagesOfTitle = new Map<string, Array<string | undefined>>()
   headings.forEach((h, i) => {
@@ -39,15 +41,19 @@ export function applyTocPageDisplays(
       kind?: string
       left?: string
       right?: string
+      noPage?: boolean
     } | null
-    if (field?.kind !== 'tocLine') return
+    if (field?.kind !== 'tocLine' || field.noPage) return
+    // a generated index, table of figures or authorities line is not a heading's entry
+    const genXml = node.attrs.genXml as string | null
+    if (genXml && !/<w:pStyle w:val="TOC\d"/.test(genXml)) return
     const key = (field.left ?? '').trim()
     const list = pagesOfTitle.get(key)
     if (!list) return
     const nth = seen.get(key) ?? 0
     seen.set(key, nth + 1)
     const right = list[Math.min(nth, list.length - 1)]
-    if (right === undefined || (field.right ?? '') === right) return
+    if (right === undefined || (field.right ?? '') === right || locked?.has(offset)) return
     tr.setNodeMarkup(offset, undefined, {
       ...node.attrs,
       fieldDisplay: { ...field, right },
@@ -55,4 +61,30 @@ export function applyTocPageDisplays(
     changed = true
   })
   return changed
+}
+
+/**
+ * DOM-only TOC page refresh from the live layout. Until the document is edited
+ * (`dirty`) a stored field result stays, as in Word; empty ones take the live page.
+ */
+export function backfillTocPageDom(
+  tocLines: Iterable<HTMLElement>,
+  pageTextOf: (anchor: string) => string | undefined,
+  dirty: boolean,
+): number {
+  let n = 0
+  for (const el of tocLines) {
+    const pageEl = el.querySelector('.doc-toc-page')
+    if (!pageEl) continue
+    const live = el.hasAttribute('data-toc-live')
+    if (!dirty && !live && (pageEl.textContent ?? '').trim() !== '') continue
+    const text = pageTextOf(el.getAttribute('data-toc-anchor') ?? '')
+    if (text === undefined) continue
+    // a page we filled ourselves keeps following the layout on later passes
+    if (!dirty && !live) el.setAttribute('data-toc-live', '')
+    if (pageEl.textContent === text) continue
+    pageEl.textContent = text
+    n++
+  }
+  return n
 }

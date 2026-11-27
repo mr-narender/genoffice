@@ -1,4 +1,5 @@
 import type {
+  PageNumberChapter,
   ParsedDoc,
   SectionInfo,
   SectionSettings,
@@ -6,6 +7,8 @@ import type {
   NoteProps,
   LineNumbering,
 } from './types'
+import { onOffTagIn } from './parse-xml-text'
+import { escapeXmlAttr } from './xml-utils'
 
 /** US Letter, portrait, 1-inch margins */
 export const DEFAULT_SECTION: SectionSettings = {
@@ -24,14 +27,23 @@ export const DEFAULT_SECTION: SectionSettings = {
 
 /** Vertical alignment of page content (sectPr w:vAlign); top/default returns undefined */
 function vAlignOf(xml: string): 'center' | 'both' | 'bottom' | undefined {
-  const v = /<w:vAlign w:val="(center|both|bottom)"\s*\/>/.exec(xml)?.[1]
-  return v as 'center' | 'both' | 'bottom' | undefined
+  const v = strAttr(/<w:vAlign[^>]*\/?>/.exec(xml)?.[0] ?? '', 'w:val')
+  return v === 'center' || v === 'both' || v === 'bottom' ? v : undefined
 }
 
-/** Integer attribute of a tag; XML allows either quote style, so match both. */
+/** String attribute of a tag; matches either quote style. */
+function strAttr(tag: string, name: string): string | undefined {
+  return new RegExp(`${name}\\s*=\\s*["']([^"']*)["']`).exec(tag)?.[1]
+}
+
+/**
+ * Integer attribute of a tag; XML allows either quote style, so match both.
+ * Fractional twips (converter output like w:left="1987.1997") round like the
+ * paragraph spacing/indent readers do instead of dropping to the default.
+ */
 function intAttr(tag: string, name: string, fallback: number): number {
-  const m = new RegExp(`${name}=["'](-?\\d+)["']`).exec(tag)
-  const v = m ? parseInt(m[1], 10) : NaN
+  const m = new RegExp(`${name}=["'](-?\\d+(?:\\.\\d+)?)["']`).exec(tag)
+  const v = m ? Math.round(parseFloat(m[1])) : NaN
   return Number.isFinite(v) ? v : fallback
 }
 
@@ -45,13 +57,22 @@ function hasVisiblePageBorder(xml: string): boolean {
   if (!pgBorders) return false
   const sides = pgBorders.match(/<w:(?:top|left|bottom|right)\b[^>]*\/?>/g) ?? []
   return sides.some((side) => {
-    const val = /w:val="([^"]*)"/.exec(side)?.[1]
+    const val = strAttr(side, 'w:val')
     return val !== undefined && val !== 'none' && val !== 'nil'
   })
 }
 
+function onOffAttr(tag: string, attr: string): boolean {
+  const v = strAttr(tag, attr)
+  return v === '1' || v === 'true' || v === 'on'
+}
+
+function colsUnequal(colsTag: string): boolean {
+  return /^(?:0|false|off)$/.test(strAttr(colsTag, 'w:equalWidth') ?? '')
+}
+
 /** ST_Border line styles; every other w:val is an art (bitmap) border. */
-const LINE_BORDER_VALS = new Set([
+export const LINE_BORDER_VALS = new Set([
   'single',
   'thick',
   'double',
@@ -83,20 +104,18 @@ const LINE_BORDER_VALS = new Set([
 function pageBorderPropsOf(xml: string): SectionSettings['pageBorderProps'] {
   const pgBorders = /<w:pgBorders[^>]*\/>|<w:pgBorders[\s\S]*?<\/w:pgBorders>/.exec(xml)?.[0]
   if (!pgBorders || !hasVisiblePageBorder(xml)) return undefined
-  const display = /w:display="(firstPage|notFirstPage)"/.exec(pgBorders)?.[1] as
-    'firstPage' | 'notFirstPage' | undefined
-  const offsetFrom = /w:offsetFrom="(page|text)"/.exec(pgBorders)?.[1] as
-    'page' | 'text' | undefined
-  const zOrder = /<w:pgBorders[^>]*\bw:zOrder="back"/.test(pgBorders) ? 'back' : undefined
+  const display = strAttr(pgBorders, 'w:display') as 'firstPage' | 'notFirstPage' | undefined
+  const offsetFrom = strAttr(pgBorders, 'w:offsetFrom') as 'page' | 'text' | undefined
+  const zOrder = /\bw:zOrder\s*=\s*["']back["']/.test(pgBorders) ? 'back' : undefined
   let spacePt = 0
   let widthPt = 0
   let color: string | undefined
   const sides: NonNullable<SectionSettings['pageBorderProps']>['sides'] = {}
   for (const side of pgBorders.match(/<w:(?:top|left|bottom|right)\b[^>]*\/?>/g) ?? []) {
-    const val = /w:val="([^"]*)"/.exec(side)?.[1]
+    const val = strAttr(side, 'w:val')
     if (!val || val === 'none' || val === 'nil') continue
     const name = /<w:(top|left|bottom|right)\b/.exec(side)![1] as keyof typeof sides
-    const sideColor = /w:color="([0-9A-Fa-f]{6})"/.exec(side)?.[1]
+    const sideColor = /w:color\s*=\s*["']([0-9A-Fa-f]{6})["']/.exec(side)?.[1]
     // art borders: w:sz is the tiled pattern height in points, not eighth-points
     const art = !LINE_BORDER_VALS.has(val)
     const sz = intAttr(side, 'w:sz', 0)
@@ -106,6 +125,8 @@ function pageBorderPropsOf(xml: string): SectionSettings['pageBorderProps'] {
       spacePt: intAttr(side, 'w:space', 0),
       ...(sideColor ? { color: sideColor } : {}),
       ...(art ? { art } : {}),
+      ...(onOffAttr(side, 'w:shadow') ? { shadow: true } : {}),
+      ...(onOffAttr(side, 'w:frame') ? { frame: true } : {}),
     }
     spacePt = Math.max(spacePt, intAttr(side, 'w:space', 0))
     widthPt = Math.max(widthPt, sides[name]!.widthPt)
@@ -134,15 +155,14 @@ export function sectionSettingsFromXml(
   let docGrid: DocGrid | undefined
   const docGridTag = /<w:docGrid[^>]*\/?>/.exec(xml)?.[0]
   if (docGridTag) {
-    const typeMatch = /w:type="([^"]+)"/.exec(docGridTag)
-    const linePitchMatch = /w:linePitch="(\d+)"/.exec(docGridTag)
-    const charSpaceMatch = /w:charSpace="(-?\d+)"/.exec(docGridTag)
-    const gridType = (typeMatch?.[1] ?? 'default') as DocGrid['type']
+    const gridType = (strAttr(docGridTag, 'w:type') ?? 'default') as DocGrid['type']
     const validTypes: DocGrid['type'][] = ['default', 'lines', 'linesAndChars', 'snapToChars']
+    const linePitch = intAttr(docGridTag, 'w:linePitch', -1)
+    const charSpace = intAttr(docGridTag, 'w:charSpace', Number.NaN)
     docGrid = {
       type: validTypes.includes(gridType) ? gridType : 'default',
-      ...(linePitchMatch ? { linePitch: parseInt(linePitchMatch[1], 10) } : {}),
-      ...(charSpaceMatch ? { charSpace: parseInt(charSpaceMatch[1], 10) } : {}),
+      ...(linePitch >= 0 ? { linePitch } : {}),
+      ...(Number.isFinite(charSpace) ? { charSpace } : {}),
     }
   }
 
@@ -150,13 +170,16 @@ export function sectionSettingsFromXml(
   // element, so matching its start tag covers both the self-closing and the paired
   // spelling, and either attribute quote style
   const colsElement = /<w:cols[^>]*>[\s\S]*?<\/w:cols>/.exec(xml)?.[0]
-  const colWidths = (colsElement?.match(/<w:col [^>]*w:w=["']\d+["'][^>]*>/g) ?? [])
-    .map((tag) => intAttr(tag, 'w:w', 0))
-    .filter((w) => w > 0)
+  const colTags = (colsElement?.match(/<w:col [^>]*w:w=["'][\d.]+["'][^>]*>/g) ?? []).filter(
+    (tag) => intAttr(tag, 'w:w', 0) > 0,
+  )
+  const colWidths = colTags.map((tag) => intAttr(tag, 'w:w', 0))
+  const colSpaces = colTags.slice(0, -1).map((tag) => intAttr(tag, 'w:space', 0))
 
+  const colsTag = /<w:cols\b[^>]*>/.exec(xml)?.[0] ?? ''
   const pageBorderProps = pageBorderPropsOf(xml)
-  const footnotePr = notePropsFromXml(xml, 'w:footnotePr')
-  const endnotePr = notePropsFromXml(xml, 'w:endnotePr')
+  const footnotePr = notePropsFromXml(liveSectPr(xml), 'w:footnotePr')
+  const endnotePr = notePropsFromXml(liveSectPr(xml), 'w:endnotePr')
   const lineNumbers = lineNumberingOf(xml)
   const marginTop = intAttr(pgMar, 'w:top', DEFAULT_SECTION.marginTop)
   const marginBottom = intAttr(pgMar, 'w:bottom', DEFAULT_SECTION.marginBottom)
@@ -168,7 +191,7 @@ export function sectionSettingsFromXml(
   return {
     pageWidth: intAttr(pgSz, 'w:w', DEFAULT_SECTION.pageWidth),
     pageHeight: intAttr(pgSz, 'w:h', DEFAULT_SECTION.pageHeight),
-    orientation: pgSz.includes('w:orient="landscape"') ? 'landscape' : 'portrait',
+    orientation: strAttr(pgSz, 'w:orient') === 'landscape' ? 'landscape' : 'portrait',
     marginTop: Math.abs(marginTop) + (gutterAtTop ? gutter : 0),
     marginRight: intAttr(pgMar, 'w:right', DEFAULT_SECTION.marginRight),
     marginBottom: Math.abs(marginBottom),
@@ -184,14 +207,34 @@ export function sectionSettingsFromXml(
     ...(pageBorderProps ? { pageBorderProps } : {}),
     columns: intAttr(/<w:cols[^>]*\/?>/.exec(xml)?.[0] ?? '', 'w:num', 1),
     colSpace: intAttr(/<w:cols[^>]*\/?>/.exec(xml)?.[0] ?? '', 'w:space', 720),
-    ...(colWidths.length >= 2 ? { colWidths } : {}),
+    ...(colWidths.length >= 2 ? { colWidths, colSpaces } : {}),
+    ...(colsUnequal(colsTag) ? { colEqualWidth: false } : {}),
+    ...(onOffAttr(colsTag, 'w:sep') ? { colSep: true } : {}),
     ...(lineNumbers ? { lineNumbers } : {}),
-    ...(/<w:bidi\s*\/>/.test(xml) ? { bidi: true } : {}),
+    ...(onOffTagIn(xml, 'w:bidi') ? { bidi: true } : {}),
     ...(docGrid ? { docGrid } : {}),
     ...(textDirectionOf(xml) ? { textDirection: textDirectionOf(xml) } : {}),
+    ...(onOffTagIn(xml, 'w:noEndnote') ? { noEndnote: true } : {}),
+    ...(onOffTagIn(xml, 'w:formProt') === false ? { formProt: false as const } : {}),
     ...(footnotePr ? { footnotePr } : {}),
     ...(endnotePr ? { endnotePr } : {}),
+    ...(footnoteColumnsOf(xml) ? { footnoteColumns: footnoteColumnsOf(xml) } : {}),
   }
+}
+
+const FOOTNOTE_COLUMNS = /<w15:footnoteColumns\b[^>]*(?:\/>|>\s*<\/w15:footnoteColumns>)/
+
+/** w15:footnoteColumns of a sectPr slice (Word offers 1-4); undefined when absent or out of range */
+function footnoteColumnsOf(xml: string): number | undefined {
+  const tag = FOOTNOTE_COLUMNS.exec(liveSectPr(xml))?.[0]
+  const n = tag ? intAttr(tag, 'w:val', 0) : 0
+  return n >= 1 && n <= 4 ? n : undefined
+}
+
+/** a sectPr without the previous one a tracked w:sectPrChange nests in it */
+function liveSectPr(xml: string): string {
+  const at = xml.indexOf('<w:sectPrChange')
+  return at >= 0 ? xml.slice(0, at) : xml
 }
 
 /**
@@ -204,7 +247,10 @@ export function notePropsFromXml(
 ): NoteProps | undefined {
   const el = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(xml)?.[1]
   if (!el) return undefined
-  const val = (name: string) => new RegExp(`<w:${name} w:val="([^"]+)"`).exec(el)?.[1]
+  const val = (name: string) => {
+    const tag = new RegExp(`<w:${name}\\b[^>]*\\/?>`).exec(el)?.[0] ?? ''
+    return strAttr(tag, 'w:val')
+  }
   const pos = val('pos')
   const numFmt = val('numFmt')
   const numStart = val('numStart')
@@ -222,11 +268,97 @@ export function notePropsFromXml(
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+const NOTE_PR_FIELDS = ['pos', 'numFmt', 'numStart', 'numRestart'] as const
+
+/**
+ * Set the fields `props` carries on a w:footnotePr / w:endnotePr element's inner
+ * XML, in schema order; its other children (the separator references of the
+ * settings part) stay as they are.
+ */
+function notePrInner(inner: string, props: NoteProps): string {
+  const kept = new Map<string, string>()
+  let rest = inner
+  for (const name of NOTE_PR_FIELDS) {
+    const re = new RegExp(`<w:${name}\\b[^>]*?(?:/>|>\\s*</w:${name}>)`)
+    const hit = re.exec(rest)?.[0]
+    if (hit) {
+      kept.set(name, hit)
+      rest = rest.replace(re, '')
+    }
+  }
+  const lead = NOTE_PR_FIELDS.map((name) =>
+    props[name] === undefined
+      ? (kept.get(name) ?? '')
+      : `<w:${name} w:val="${escapeXmlAttr(String(props[name]))}"/>`,
+  ).join('')
+  return lead + rest
+}
+
+type NotePrTag = 'w:footnotePr' | 'w:endnotePr'
+const notePrRe = (tag: NotePrTag) => new RegExp(`<${tag}\\s*/>|<${tag}>([\\s\\S]*?)</${tag}>`)
+
+/** settings.xml with the document-wide note properties set; `insert` places a new element */
+export function applySettingsNoteProps(
+  xml: string,
+  tag: NotePrTag,
+  props: NoteProps,
+  insert: (xml: string, childXml: string) => string,
+): string {
+  const hit = notePrRe(tag).exec(xml)
+  const element = `<${tag}>${notePrInner(hit?.[1] ?? '', props)}</${tag}>`
+  return hit ? xml.replace(hit[0], element) : insert(xml, element)
+}
+
+/**
+ * Every live section of the body takes the note properties: a sectPr's own
+ * w:footnotePr / w:endnotePr overrides the document-wide one, so a setting made
+ * for the whole document has to reach each of them. The previous sectPr inside a
+ * tracked w:sectPrChange is left alone.
+ */
+export function applySectionNoteProps(
+  documentXml: string,
+  props: { footnote?: NoteProps; endnote?: NoteProps },
+): string {
+  return documentXml.replace(
+    /<w:sectPr\b[^>]*\/>|<w:sectPr\b[^>]*>[\s\S]*?<\/w:sectPr>/g,
+    (sectPr) => {
+      // a w:sectPrChange nests the previous sectPr: the match then ends at that one's close tag
+      const open = /^<w:sectPr\b[^>]*?(\/?)>/.exec(sectPr)!
+      let body = open[1] ? '' : sectPr.slice(open[0].length, -'</w:sectPr>'.length)
+      const changeAt = body.indexOf('<w:sectPrChange')
+      const tail = changeAt >= 0 ? body.slice(changeAt) : ''
+      if (changeAt >= 0) body = body.slice(0, changeAt)
+      let endnotePr = ''
+      let footnotePr = ''
+      for (const [tag, own] of [
+        ['w:endnotePr', props.endnote],
+        ['w:footnotePr', props.footnote],
+      ] as const) {
+        const hit = notePrRe(tag).exec(body)
+        if (hit) body = body.replace(hit[0], '')
+        const element =
+          own && Object.keys(own).length > 0
+            ? `<${tag}>${notePrInner(hit?.[1] ?? '', own)}</${tag}>`
+            : (hit?.[0] ?? '')
+        if (tag === 'w:endnotePr') endnotePr = element
+        else footnotePr = element
+      }
+      // CT_SectPr: header / footer references, then footnotePr, endnotePr
+      const refs =
+        /^(?:\s*<w:(?:headerReference|footerReference)\b[^>]*?(?:\/>|>\s*<\/w:(?:headerReference|footerReference)>))*/.exec(
+          body,
+        )![0]
+      const openTag = open[1] ? open[0].slice(0, -2) + '>' : open[0]
+      return `${openTag}${refs}${footnotePr}${endnotePr}${body.slice(refs.length)}${tail}</w:sectPr>`
+    },
+  )
+}
+
 /** w:lnNumType of a sectPr slice; undefined when the section has no line numbering */
 export function lineNumberingOf(xml: string): LineNumbering | undefined {
   const tag = /<w:lnNumType\b[^>]*\/?>/.exec(xml)?.[0]
   if (!tag) return undefined
-  const restart = /w:restart="([^"]+)"/.exec(tag)?.[1]
+  const restart = strAttr(tag, 'w:restart')
   const distance = intAttr(tag, 'w:distance', -1)
   return {
     countBy: Math.max(1, intAttr(tag, 'w:countBy', 1)),
@@ -238,7 +370,7 @@ export function lineNumberingOf(xml: string): LineNumbering | undefined {
 }
 
 function textDirectionOf(xml: string): string | undefined {
-  const val = /<w:textDirection[^>]*w:val="([^"]+)"/.exec(xml)?.[1]
+  const val = strAttr(/<w:textDirection[^>]*\/?>/.exec(xml)?.[0] ?? '', 'w:val')
   return val && val !== 'lrTb' ? val : undefined
 }
 
@@ -254,7 +386,7 @@ const SECT_PR_RE = /<w:sectPr[^>]*\/>|<w:sectPr[\s\S]*?<\/w:sectPr>/
  *  off: matches self-closing and paired forms, w:val="0|false|off" counts as off. */
 export function xmlFlagOn(xml: string, tag: string): boolean {
   for (const m of xml.matchAll(new RegExp(`<${tag}(?=[\\s/>])[^>]*>`, 'g'))) {
-    const val = /w:val="([^"]*)"/.exec(m[0])?.[1]
+    const val = strAttr(m[0], 'w:val')
     if (val === undefined || !/^(?:0|false|off)$/.test(val)) return true
   }
   return false
@@ -305,20 +437,32 @@ export function sectionFromSectPr(
   lastBlockIndex: number,
   gutterAtTop?: boolean,
 ): SectionInfo {
-  const type = /<w:type[^>]*w:val="(nextPage|continuous|evenPage|oddPage|nextColumn)"/.exec(
-    sectPrXml,
-  )?.[1]
-  const pgNumStart = /<w:pgNumType[^>]*w:start="(\d+)"/.exec(sectPrXml)?.[1]
-  const pgNumFmt = /<w:pgNumType[^>]*w:fmt="([^"]+)"/.exec(sectPrXml)?.[1]
+  const pgNumTag = /<w:pgNumType[^>]*\/?>/.exec(sectPrXml)?.[0] ?? ''
+  const type = strAttr(/<w:type[^>]*\/?>/.exec(sectPrXml)?.[0] ?? '', 'w:val')
+  const startType =
+    type === 'continuous' ||
+    type === 'evenPage' ||
+    type === 'oddPage' ||
+    type === 'nextColumn' ||
+    type === 'nextPage'
+      ? type
+      : 'nextPage'
+  const pgNumStart = /w:start\s*=\s*["'](\d+)["']/.exec(pgNumTag)?.[1]
+  const pgNumFmt = /w:fmt\s*=\s*["']([^"']+)["']/.exec(pgNumTag)?.[1]
+  const chapStyle = /w:chapStyle\s*=\s*["'](\d+)["']/.exec(pgNumTag)?.[1]
+  const chapSep = /w:chapSep\s*=\s*["'](\w+)["']/.exec(pgNumTag)?.[1]
   return {
     settings: sectionSettingsFromXml(sectPrXml, { gutterAtTop }),
-    startType: (type as SectionInfo['startType']) ?? 'nextPage',
+    startType,
     firstBlockIndex,
     lastBlockIndex,
     sectPrXml,
     titlePg: xmlFlagOn(sectPrXml, 'w:titlePg'),
     ...(pgNumStart !== undefined ? { pageNumberStart: parseInt(pgNumStart, 10) } : {}),
     ...(pgNumFmt !== undefined ? { pageNumberFmt: pgNumFmt } : {}),
+    ...(chapStyle !== undefined
+      ? { pageNumberChapter: { style: parseInt(chapStyle, 10), sep: chapSep ?? 'hyphen' } }
+      : {}),
     headerRefs: hfRefs(sectPrXml, 'header'),
     footerRefs: hfRefs(sectPrXml, 'footer'),
   }
@@ -336,17 +480,26 @@ function stripElement(xml: string, tag: string): string {
 
 /**
  * Rewrite the sectPr page numbering w:pgNumType (fmt = number format, start = starting
- * page number; undefined fields are omitted, and the tag is removed when both are unset).
+ * page number; undefined fields are omitted, and the tag is removed when nothing is left).
+ * `chapter`: the heading level whose number leads the page number and what separates
+ * them; null takes it off, undefined leaves the file's own.
  * Schema order: pgNumType comes after pgMar/pgBorders and before cols/docGrid.
  */
 export function applyPageNumType(
   sectPrXml: string,
   fmt: string | undefined,
   start: number | undefined,
+  chapter?: PageNumberChapter | null,
 ): string {
+  const kept =
+    chapter === undefined
+      ? (/<w:pgNumType\b[^>]*>/.exec(sectPrXml)?.[0].match(/\sw:chap\w+="[^"]*"/g) ?? []).join('')
+      : chapter === null
+        ? ''
+        : ` w:chapStyle="${chapter.style}"${chapter.sep === 'hyphen' ? '' : ` w:chapSep="${chapter.sep}"`}`
   const xml = stripElement(sectPrXml, 'w:pgNumType')
-  if (fmt === undefined && start === undefined) return xml
-  const tag = `<w:pgNumType${fmt !== undefined ? ` w:fmt="${fmt}"` : ''}${start !== undefined ? ` w:start="${start}"` : ''}/>`
+  if (fmt === undefined && start === undefined && !kept) return xml
+  const tag = `<w:pgNumType${fmt !== undefined ? ` w:fmt="${fmt}"` : ''}${start !== undefined ? ` w:start="${start}"` : ''}${kept}/>`
   return insertBefore(xml, tag, PG_NUM_TYPE_FOLLOWERS)
 }
 
@@ -365,12 +518,40 @@ export function injectIntoSectPr(xml: string, tag: string): string {
 /** CT_SectPr children that follow pgNumType / titlePg, in schema order */
 const PG_NUM_TYPE_FOLLOWERS =
   /<w:(?:cols|formProt|vAlign|noEndnote|titlePg|textDirection|bidi|rtlGutter|docGrid|printerSettings)[\s/>]/
+const LN_NUM_TYPE_FOLLOWERS =
+  /<w:(?:pgNumType|cols|formProt|vAlign|noEndnote|titlePg|textDirection|bidi|rtlGutter|docGrid|printerSettings)[\s/>]/
+const FORM_PROT_FOLLOWERS =
+  /<w:(?:vAlign|noEndnote|titlePg|textDirection|bidi|rtlGutter|docGrid|printerSettings|sectPrChange)[\s/>]/
+const V_ALIGN_FOLLOWERS =
+  /<w:(?:noEndnote|titlePg|textDirection|bidi|rtlGutter|docGrid|printerSettings)[\s/>]/
+const NO_ENDNOTE_FOLLOWERS =
+  /<w:(?:titlePg|textDirection|bidi|rtlGutter|docGrid|printerSettings|sectPrChange)[\s/>]/
 const TITLE_PG_FOLLOWERS = /<w:(?:textDirection|bidi|rtlGutter|docGrid|printerSettings)[\s/>]/
+const TEXT_DIRECTION_FOLLOWERS = /<w:(?:bidi|rtlGutter|docGrid|printerSettings|sectPrChange)[\s/>]/
+/** w:docGrid as a file may spell it: self-closing or paired */
+const DOC_GRID_ELEMENT = /<w:docGrid\b[^>]*(?:\/>|>\s*<\/w:docGrid>)/
+const DOC_GRID_FOLLOWERS = /<w:(?:printerSettings|sectPrChange)[\s/>]/
+/** the line pitch Word writes for a new Latin document */
+export const DEFAULT_LINE_PITCH_TWIPS = 360
+
+const FOOTNOTE_COLUMN_COUNTS = new Set([1, 2, 3, 4])
+
+/** `tag` as the last child Word's own order allows: w15:footnoteColumns stays behind it */
+function appendToSectPr(sectPrXml: string, tag: string): string {
+  const last = /<w15:footnoteColumns\b|<\/w:sectPr>/.exec(sectPrXml)
+  if (!last) return sectPrXml
+  return `${sectPrXml.slice(0, last.index)}${tag}${sectPrXml.slice(last.index)}`
+}
 
 function insertBefore(sectPrXml: string, tag: string, followers: RegExp): string {
   const m = followers.exec(sectPrXml)
   if (m) return `${sectPrXml.slice(0, m.index)}${tag}${sectPrXml.slice(m.index)}`
-  return sectPrXml.replace(/<\/w:sectPr>/, `${tag}</w:sectPr>`)
+  return appendToSectPr(sectPrXml, tag)
+}
+
+/** the section properties a body without a w:sectPr is read with, written out */
+export function defaultSectPrXml(settings: SectionSettings = DEFAULT_SECTION): string {
+  return applySectionSettings('<w:sectPr><w:pgSz/><w:pgMar w:gutter="0"/></w:sectPr>', settings)
 }
 
 /**
@@ -396,6 +577,51 @@ export function readSections(parsed: ParsedDoc): SectionInfo[] {
   return sections
 }
 
+/**
+ * A kept w:cols element whose values were loaded fractional: round them in
+ * place so the saved markup is schema-valid without touching its structure.
+ */
+function roundColsInPlace(xml: string, cols: string): string {
+  const rounded = cols.replace(
+    / w:(num|space|w)="(\d+\.\d+)"/g,
+    (_m, name: string, v: string) => ` w:${name}="${Math.round(parseFloat(v))}"`,
+  )
+  return rounded === cols ? xml : xml.replace(cols, rounded)
+}
+
+/**
+ * w:pgBorders for pageBorderProps. Without props the legacy single-line box
+ * (½ pt, 24 pt from the page edge) is written; props with no sides yield ''.
+ */
+export function pageBordersXml(props: SectionSettings['pageBorderProps']): string {
+  const sides = props?.sides
+  if (props && !(sides && Object.keys(sides).length > 0)) return ''
+  if (!props || !sides) {
+    const side = (name: string) =>
+      `<w:${name} w:val="single" w:sz="4" w:space="24" w:color="auto"/>`
+    return (
+      '<w:pgBorders w:offsetFrom="page">' +
+      `${side('top')}${side('left')}${side('bottom')}${side('right')}` +
+      '</w:pgBorders>'
+    )
+  }
+  let out = '<w:pgBorders'
+  if (props.zOrder === 'back') out += ' w:zOrder="back"'
+  if (props.display) out += ` w:display="${props.display}"`
+  out += ` w:offsetFrom="${props.offsetFrom ?? 'text'}">`
+  for (const name of ['top', 'left', 'bottom', 'right'] as const) {
+    const side = sides[name]
+    if (!side) continue
+    const sz = side.art ? Math.round(side.widthPt) : Math.round(side.widthPt * 8)
+    out += `<w:${name} w:val="${side.val}" w:sz="${sz}" w:space="${Math.round(side.spacePt)}"`
+    out += ` w:color="${side.color ?? 'auto'}"`
+    if (side.shadow) out += ' w:shadow="1"'
+    if (side.frame) out += ' w:frame="1"'
+    out += '/>'
+  }
+  return out + '</w:pgBorders>'
+}
+
 /** Rewrite pgSz / pgMar inside a w:sectPr XML slice, preserving everything else. */
 export function applySectionSettings(sectPrXml: string, settings: SectionSettings): string {
   const orient = settings.orientation === 'landscape' ? ' w:orient="landscape"' : ''
@@ -408,7 +634,7 @@ export function applySectionSettings(sectPrXml: string, settings: SectionSetting
   }
   const replaceMarAttr = (tag: string, name: string, value: number): string => {
     if (new RegExp(`${name}="`).test(tag)) {
-      return tag.replace(new RegExp(`${name}="-?\\d+"`), `${name}="${value}"`)
+      return tag.replace(new RegExp(`${name}="-?[\\d.]+"`), `${name}="${value}"`)
     }
     return tag.replace(/\/>$/, ` ${name}="${value}"/>`)
   }
@@ -442,87 +668,238 @@ export function applySectionSettings(sectPrXml: string, settings: SectionSetting
       `<w:pgMar w:top="${settings.marginTop - (settings.gutterAtTop ? gutter : 0)}" w:right="${settings.marginRight}"` +
       ` w:bottom="${settings.marginBottom}" w:left="${settings.marginLeft - (settings.gutterAtTop ? 0 : gutter)}"` +
       ` w:header="708" w:footer="708" w:gutter="${gutter}"/>`
-    xml = xml.replace(/<\/w:sectPr>/, `${pgMar}</w:sectPr>`)
+    xml = appendToSectPr(xml, pgMar)
   }
 
-  // page border: single-line box measured from the page edge (pgBorders sits
-  // between pgMar and cols in CT_SectPr)
+  // page border (pgBorders sits between pgMar and cols in CT_SectPr)
   xml = xml.replace(/<w:pgBorders[^>]*\/>|<w:pgBorders[\s\S]*?<\/w:pgBorders>/, '')
   if (settings.pageBorder) {
-    const side = (name: string) =>
-      `<w:${name} w:val="single" w:sz="4" w:space="24" w:color="auto"/>`
-    const pgBorders =
-      '<w:pgBorders w:offsetFrom="page">' +
-      `${side('top')}${side('left')}${side('bottom')}${side('right')}` +
-      '</w:pgBorders>'
-    xml = xml.replace(/(<w:pgMar[^>]*\/>)/, `$1${pgBorders}`)
+    const pgBorders = pageBordersXml(settings.pageBorderProps)
+    if (pgBorders) xml = xml.replace(/(<w:pgMar[^>]*\/>)/, `$1${pgBorders}`)
+  }
+
+  // line numbering (w:lnNumType, between pgBorders and pgNumType): rewritten
+  // only when it differs from what the section already says
+  const sameNumbering = (x?: LineNumbering, y?: LineNumbering): boolean =>
+    x === y ||
+    (!!x &&
+      !!y &&
+      x.countBy === y.countBy &&
+      x.start === y.start &&
+      x.restart === y.restart &&
+      x.distance === y.distance)
+  if (!sameNumbering(settings.lineNumbers, lineNumberingOf(xml))) {
+    xml = xml.replace(/<w:lnNumType\b[^>]*(?:\/>|>\s*<\/w:lnNumType>)/, '')
+    const ln = settings.lineNumbers
+    if (ln) {
+      const attrs =
+        ` w:countBy="${ln.countBy}"` +
+        (ln.start > 1 ? ` w:start="${ln.start - 1}"` : '') +
+        (ln.distance !== undefined ? ` w:distance="${ln.distance}"` : '') +
+        ` w:restart="${ln.restart}"`
+      xml = insertBefore(xml, `<w:lnNumType${attrs}/>`, LN_NUM_TYPE_FOLLOWERS)
+    }
   }
 
   // columns (w:cols may be self-closing or carry explicit <w:col> children)
-  const colsMatch = /<w:cols[^>]*\/>|<w:cols[^>]*>[\s\S]*?<\/w:cols>/.exec(xml)
+  const COLS_ELEMENT = /<w:cols[^>]*\/>|<w:cols[^>]*>[\s\S]*?<\/w:cols>/
+  const equalCols = settings.colEqualWidth === true
+  const declared = COLS_ELEMENT.exec(xml)
+  if (equalCols && declared && (!declared[0].endsWith('/>') || colsUnequal(declared[0]))) {
+    const open = /^<w:cols[^>]*>/.exec(declared[0])![0]
+    xml = xml.replace(
+      declared[0],
+      open.replace(/ w:equalWidth=["'][^"']*["']/, '').replace(/\/?>$/, '/>'),
+    )
+  }
+  const colsMatch = COLS_ELEMENT.exec(xml)
   const numAttr = settings.columns > 1 ? ` w:num="${settings.columns}"` : ''
   const colsAnchor = (tag: string): string => {
-    const anchor = /(<w:pgBorders[\s\S]*?<\/w:pgBorders>|<w:pgMar[^>]*\/>)/.exec(xml)
-    if (anchor) return xml.replace(anchor[0], `${anchor[0]}${tag}`)
-    return xml.replace(/<\/w:sectPr>/, `${tag}</w:sectPr>`)
+    // w:cols follows whichever of these the section has last (CT_SectPr order)
+    const before = [
+      ...xml.matchAll(
+        /<w:pgBorders[\s\S]*?<\/w:pgBorders>|<w:(pgMar|lnNumType|pgNumType)\b[^>]*(?:\/>|>\s*<\/w:\1>)/g,
+      ),
+    ].at(-1)
+    if (before) {
+      const at = before.index + before[0].length
+      return `${xml.slice(0, at)}${tag}${xml.slice(at)}`
+    }
+    return appendToSectPr(xml, tag)
   }
   if (
+    !equalCols &&
     settings.colWidths !== undefined &&
     settings.columns > 1 &&
     settings.colWidths.length === settings.columns
   ) {
     // explicit unequal widths: rebuild the element (opt-in via colWidths) —
     // unless the document already carries exactly these values (round-trip)
-    const currentWidths = (colsMatch?.[0].match(/<w:col [^>]*w:w=["']\d+["'][^>]*>/g) ?? []).map(
-      (t) => intAttr(t, 'w:w', 0),
-    )
+    const currentTags = colsMatch?.[0].match(/<w:col [^>]*w:w=["'][\d.]+["'][^>]*>/g) ?? []
+    const currentWidths = currentTags.map((t) => intAttr(t, 'w:w', 0))
+    const space = settings.colSpace ?? 720
+    const spaces = settings.colSpaces
     const unchanged =
       colsMatch !== null &&
       intAttr(colsMatch[0], 'w:num', 1) === settings.columns &&
       currentWidths.length === settings.colWidths.length &&
-      currentWidths.every((w, i) => w === settings.colWidths![i])
+      currentWidths.every((w, i) => w === settings.colWidths![i]) &&
+      (spaces === undefined ||
+        currentTags.slice(0, -1).every((t, i) => intAttr(t, 'w:space', 0) === (spaces[i] ?? space)))
     if (!unchanged) {
-      const space = settings.colSpace ?? 720
       const children = settings.colWidths
         .map((w, i) =>
           i < settings.colWidths!.length - 1
-            ? `<w:col w:w="${w}" w:space="${space}"/>`
+            ? `<w:col w:w="${w}" w:space="${spaces?.[i] ?? space}"/>`
             : `<w:col w:w="${w}"/>`,
         )
         .join('')
       const tag = `<w:cols${numAttr} w:space="${space}" w:equalWidth="0">${children}</w:cols>`
       xml = colsMatch ? xml.replace(colsMatch[0], tag) : colsAnchor(tag)
+    } else if (colsMatch) {
+      xml = roundColsInPlace(xml, colsMatch[0])
     }
   } else if (colsMatch) {
     const openTag = /^<w:cols[^>]*>/.exec(colsMatch[0])?.[0] ?? colsMatch[0]
     const selfClosing = colsMatch[0].endsWith('/>')
-    const currentNum = / w:num="(\d+)"/.exec(openTag)?.[1] ?? '1'
+    const currentNum = String(intAttr(openTag, 'w:num', 1))
     if (selfClosing || currentNum !== String(settings.columns)) {
       // explicit per-column widths only stay valid while the count is unchanged
-      let tag = openTag.replace(/ w:num="\d+"/, '').replace(/\/?>$/, '/>')
+      let tag = openTag
+        .replace(/ w:num="[\d.]+"/, '')
+        .replace(/ w:equalWidth=["'][^"']*["']/, '')
+        .replace(/\/?>$/, '/>')
       if (numAttr) tag = tag.replace(/^<w:cols/, `<w:cols${numAttr}`)
       // honor an explicitly different column gap (720 = OOXML default); equal
       // values leave the tag byte-identical for round-trip safety
       if (settings.colSpace !== undefined && settings.colSpace !== intAttr(tag, 'w:space', 720)) {
-        tag = / w:space="\d+"/.test(tag)
-          ? tag.replace(/ w:space="\d+"/, ` w:space="${settings.colSpace}"`)
+        tag = / w:space="[\d.]+"/.test(tag)
+          ? tag.replace(/ w:space="[\d.]+"/, ` w:space="${settings.colSpace}"`)
           : tag.replace(/\/>$/, ` w:space="${settings.colSpace}"/>`)
       }
       xml = xml.replace(colsMatch[0], tag)
+    } else {
+      xml = roundColsInPlace(xml, colsMatch[0])
     }
   } else if (numAttr) {
     xml = colsAnchor(`<w:cols${numAttr} w:space="${settings.colSpace ?? 425}"/>`)
   }
 
+  // the rule between columns (w:cols w:sep): an unchanged one stays as the file has it
+  const colsOpen = /<w:cols\b[^>]*>/.exec(xml)?.[0]
+  if (colsOpen && !!settings.colSep !== onOffAttr(colsOpen, 'w:sep')) {
+    const bare = colsOpen.replace(/ w:sep=["'][^"']*["']/, '')
+    xml = xml.replace(colsOpen, settings.colSep ? bare.replace(/(\/?>)$/, ' w:sep="1"$1') : bare)
+  }
+
+  // vertical alignment of the page (w:vAlign, after cols and formProt): top is
+  // written by leaving the tag out; an unchanged one stays as the file has it
+  const vAlign = settings.vAlign === 'top' ? undefined : settings.vAlign
+  if (vAlign !== vAlignOf(xml)) {
+    xml = xml.replace(/<w:vAlign\b[^>]*(?:\/>|>\s*<\/w:vAlign>)/, '')
+    if (vAlign) xml = insertBefore(xml, `<w:vAlign w:val="${vAlign}"/>`, V_ALIGN_FOLLOWERS)
+  }
+
+  // w:formProt (after cols): Word writes it only to switch a section's protection off
+  if ((settings.formProt === false) !== (onOffTagIn(xml, 'w:formProt') === false)) {
+    xml = stripElement(xml, 'w:formProt')
+    if (settings.formProt === false)
+      xml = insertBefore(xml, '<w:formProt w:val="0"/>', FORM_PROT_FOLLOWERS)
+  }
+
+  // w:noEndnote (after vAlign): an unchanged one stays as the file has it
+  if (!!settings.noEndnote !== !!onOffTagIn(xml, 'w:noEndnote')) {
+    xml = stripElement(xml, 'w:noEndnote')
+    if (settings.noEndnote) xml = insertBefore(xml, '<w:noEndnote/>', NO_ENDNOTE_FOLLOWERS)
+  }
+
+  // the section's own note properties: the fields it states that the sectPr does not have yet
+  const noteDelta = (tag: 'w:footnotePr' | 'w:endnotePr', own?: NoteProps): NoteProps => {
+    const has = notePropsFromXml(liveSectPr(xml), tag)
+    return Object.fromEntries(
+      NOTE_PR_FIELDS.filter((f) => own?.[f] !== undefined && own[f] !== has?.[f]).map((f) => [
+        f,
+        own![f],
+      ]),
+    )
+  }
+  const footnote = noteDelta('w:footnotePr', settings.footnotePr)
+  const endnote = noteDelta('w:endnotePr', settings.endnotePr)
+  if (Object.keys(footnote).length + Object.keys(endnote).length > 0)
+    xml = applySectionNoteProps(xml, { footnote, endnote })
+
+  // footnote columns (w15:footnoteColumns, where Word writes it: last, before a tracked
+  // change): absent means the section's own column count, so it is written by leaving it out
+  const noteCols = settings.footnoteColumns
+  if (
+    noteCols !== footnoteColumnsOf(xml) &&
+    (noteCols === undefined || FOOTNOTE_COLUMN_COUNTS.has(noteCols))
+  ) {
+    const live = liveSectPr(xml)
+    xml = live.replace(new RegExp(FOOTNOTE_COLUMNS, 'g'), '') + xml.slice(live.length)
+    if (noteCols)
+      xml = insertBefore(xml, `<w15:footnoteColumns w:val="${noteCols}"/>`, /<w:sectPrChange[\s/>]/)
+  }
+
+  // text flow (w:textDirection, after titlePg): horizontal is written by leaving
+  // the tag out; an unchanged one stays as the file has it
+  const flow = settings.textDirection === 'lrTb' ? undefined : settings.textDirection
+  if (flow !== textDirectionOf(xml) && (flow === undefined || /^[A-Za-z]+$/.test(flow))) {
+    xml = stripElement(xml, 'w:textDirection')
+    if (flow)
+      xml = insertBefore(xml, `<w:textDirection w:val="${flow}"/>`, TEXT_DIRECTION_FOLLOWERS)
+  }
+
+  // document grid type (w:docGrid w:type, default written by leaving the attribute
+  // out): an unchanged one stays as the file has it, and so do its other attributes
+  const gridTag = DOC_GRID_ELEMENT.exec(xml)?.[0]
+  const gridType = settings.docGrid?.type ?? 'default'
+  if (gridType !== ((gridTag && strAttr(gridTag, 'w:type')) || 'default')) {
+    const pitch = settings.docGrid?.linePitch ?? DEFAULT_LINE_PITCH_TWIPS
+    let tag = (gridTag ?? '<w:docGrid/>')
+      .replace(/>\s*<\/w:docGrid>$/, '/>')
+      .replace(/ w:type=["'][^"']*["']/, '')
+    if (gridType !== 'default') tag = tag.replace('<w:docGrid', `<w:docGrid w:type="${gridType}"`)
+    if (!/ w:linePitch=/.test(tag)) tag = tag.replace(/\/>$/, ` w:linePitch="${pitch}"/>`)
+    xml = gridTag ? xml.replace(gridTag, tag) : insertBefore(xml, tag, DOC_GRID_FOLLOWERS)
+  }
+  // the line pitch of a grid the section states: an unchanged one stays as the file has it
+  const pitchTag = DOC_GRID_ELEMENT.exec(xml)?.[0]
+  const linePitch = settings.docGrid?.linePitch
+  if (pitchTag && linePitch !== undefined && linePitch !== intAttr(pitchTag, 'w:linePitch', -1)) {
+    const bare = pitchTag
+      .replace(/>\s*<\/w:docGrid>$/, '/>')
+      .replace(/ w:linePitch=["'][^"']*["']/, '')
+    xml = xml.replace(pitchTag, bare.replace(/\/>$/, ` w:linePitch="${linePitch}"/>`))
+  }
+  // the character pitch of a grid the section states (w:charSpace, 0 written by leaving it out)
+  const spaceTag = DOC_GRID_ELEMENT.exec(xml)?.[0]
+  const charSpace = settings.docGrid?.charSpace
+  if (spaceTag && charSpace !== undefined && charSpace !== intAttr(spaceTag, 'w:charSpace', 0)) {
+    const bare = spaceTag
+      .replace(/>\s*<\/w:docGrid>$/, '/>')
+      .replace(/ w:charSpace=["'][^"']*["']/, '')
+    xml = xml.replace(
+      spaceTag,
+      charSpace === 0 ? bare : bare.replace(/\/>$/, ` w:charSpace="${Math.round(charSpace)}"/>`),
+    )
+  }
+
   // section direction (w:bidi, after cols in CT_SectPr): undefined = keep the
   // document's tag untouched; true/false = ensure present/absent
+  // w:bidi as Word may write it: self-closing, paired, or carrying an explicit w:val.
+  // The reader sees all three spellings, so the writer has to match and remove all
+  // three or a round-trip over a paired element leaves a second w:bidi behind.
+  const BIDI_ELEMENT = /<w:bidi(?=[\s/>])[^>]*(?:\/>|>[\s\S]*?<\/w:bidi>)/i
   if (settings.bidi !== undefined) {
-    const hasBidi = /<w:bidi\s*\/>/.test(xml)
-    if (settings.bidi && !hasBidi) {
+    const hasBidi = BIDI_ELEMENT.test(xml)
+    if (settings.bidi && hasBidi && !onOffTagIn(xml, 'w:bidi')) {
+      xml = xml.replace(BIDI_ELEMENT, '<w:bidi/>')
+    } else if (settings.bidi && !hasBidi) {
       if (/<w:docGrid/.test(xml)) xml = xml.replace(/(<w:docGrid)/, '<w:bidi/>$1')
-      else xml = xml.replace(/<\/w:sectPr>/, '<w:bidi/></w:sectPr>')
+      else xml = appendToSectPr(xml, '<w:bidi/>')
     } else if (!settings.bidi && hasBidi) {
-      xml = xml.replace(/<w:bidi\s*\/>/, '')
+      xml = xml.replace(BIDI_ELEMENT, '')
     }
   }
   return xml

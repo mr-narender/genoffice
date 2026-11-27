@@ -1,26 +1,33 @@
+import { eastAsianAndLatinOf } from '../text-layout/script-rules'
 import { Extension, Mark, combineTransactionSteps, getChangedRanges } from '@tiptap/core'
+import { runFaceDecls } from '../text-layout/run-faces'
 import type { Mark as PmMark } from '@tiptap/pm/model'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
-import {} from '@tiptap/pm/tables'
-import { cssCsFontFamily, cssRunFontFamily, cssFontFamily } from '../line-metrics'
-import { isEastAsianFontName } from '../font-list'
+import { cssRunFontFamily, wordSlotFaces } from '../text-layout/font-rules'
 import { t } from '../i18n/locale'
 import { dkBackground } from './dark-page'
 import { runBorderDecls } from './run-border'
+import { eaLayoutDecls, fitTextDecls, parseEaLayoutAttr } from './asian-layout'
 import { fillInk } from './shading-ink'
 import { textColorDecls } from './text-color'
-import type { RevisionDisplayMode } from './revision-view'
+import { emphasisDecls, otfFeatureSettings, parseOtfAttr, underlineDecls } from './run-typography'
+import { DEFAULT_BALLOON_MODE, type BalloonMode, type RevisionDisplayMode } from './revision-view'
 import { parseTextOutlineAttr, textOutlineDecl } from './text-outline'
 import {
   charScaleXDecls,
   doubleStrikeDecl,
-  glowDecl,
+  glowAndShadowDecl,
+  parseReflectionAttr,
+  parseTextShadowAttr,
+  liveTextFill,
+  reflectionDecl,
   paperColorEffect,
   parseGlowAttr,
   parseTextEffectAttr,
   positionDecl,
   textEffectDecls,
+  textFillDecls,
 } from './text-effects'
 import { symbolGlyph, symbolPuaChar } from '@genoffice/docx-engine'
 import { symbolFontCovers } from '../font-check'
@@ -82,8 +89,24 @@ export const UnderlineMark = Mark.create({
       },
     ]
   },
-  renderHTML() {
-    return ['u', 0]
+  addAttributes() {
+    const attr = (name: string) => ({
+      default: null as string | null,
+      rendered: false,
+      // a style rule hands the declaration's value over, not an element
+      parseHTML: (el: HTMLElement) => el.getAttribute?.(name) ?? null,
+    })
+    // the run's own w:u w:val (null = single) and w:color (hex, null = the text colour)
+    return { line: attr('data-u-line'), color: attr('data-u-color') }
+  },
+  renderHTML({ mark }) {
+    const { line, color } = mark.attrs as { line: string | null; color: string | null }
+    const attrs: Record<string, string> = {}
+    if (line) attrs['data-u-line'] = line
+    if (color) attrs['data-u-color'] = color
+    const decls = underlineDecls(line, color)
+    if (decls.length > 0) attrs.style = decls.join(';')
+    return ['u', attrs, 0]
   },
   addKeyboardShortcuts() {
     return { 'Mod-u': () => this.editor.commands.toggleMark('underline') }
@@ -115,6 +138,10 @@ export const LinkMark = Mark.create({
     return {
       href: { default: '' },
       rId: { default: null as string | null },
+      anchor: { default: null as string | null },
+      history: { default: null as string | null },
+      targetFrame: { default: null as string | null },
+      docLocation: { default: null as string | null },
       tooltip: { default: null as string | null },
       plain: { default: false },
     }
@@ -183,19 +210,22 @@ export const InsMark = Mark.create({
     return {
       author: { default: '' },
       date: { default: null as string | null },
+      dateUtc: { default: null as string | null },
       id: { default: null as string | null },
+      move: { default: null as string | null },
     }
   },
   parseHTML() {
     return [{ tag: 'span[data-ins-author]' }]
   },
   renderHTML({ mark }) {
+    const moved = !!mark.attrs.move
     return [
       'span',
       {
         'data-ins-author': mark.attrs.author,
-        class: 'doc-ins',
-        title: `${t('editorInsertedBy', { author: String(mark.attrs.author) })}${mark.attrs.date ? ` · ${String(mark.attrs.date).slice(0, 10)}` : ''}`,
+        class: moved ? 'doc-ins doc-move-to' : 'doc-ins',
+        title: `${t(moved ? 'editorMovedBy' : 'editorInsertedBy', { author: String(mark.attrs.author) })}${mark.attrs.date ? ` · ${String(mark.attrs.date).slice(0, 10)}` : ''}`,
       },
       0,
     ]
@@ -210,19 +240,22 @@ export const DelMark = Mark.create({
     return {
       author: { default: '' },
       date: { default: null as string | null },
+      dateUtc: { default: null as string | null },
       id: { default: null as string | null },
+      move: { default: null as string | null },
     }
   },
   parseHTML() {
     return [{ tag: 'span[data-del-author]' }]
   },
   renderHTML({ mark }) {
+    const moved = !!mark.attrs.move
     return [
       'span',
       {
         'data-del-author': mark.attrs.author,
-        class: 'doc-del',
-        title: `${t('editorDeletedBy', { author: String(mark.attrs.author) })}${mark.attrs.date ? ` · ${String(mark.attrs.date).slice(0, 10)}` : ''}`,
+        class: moved ? 'doc-del doc-move-from' : 'doc-del',
+        title: `${t(moved ? 'editorMovedBy' : 'editorDeletedBy', { author: String(mark.attrs.author) })}${mark.attrs.date ? ` · ${String(mark.attrs.date).slice(0, 10)}` : ''}`,
       },
       0,
     ]
@@ -254,7 +287,12 @@ export const RefFieldMark = Mark.create({
   name: 'refField',
   addAttributes() {
     // instr: the original instruction with its switches (null = plain REF name \h); dirty: Word recomputes on open
-    return { name: { default: '' }, instr: { default: null }, dirty: { default: false } }
+    return {
+      name: { default: '' },
+      instr: { default: null },
+      dirty: { default: false },
+      locked: { default: false, rendered: false },
+    }
   },
   parseHTML() {
     return [{ tag: 'span[data-ref-field]' }]
@@ -307,7 +345,12 @@ export const SymMark = Mark.create({
 })
 
 /** Revision display mode (synced by App; in original mode the extension below restores old formatting via decorations) */
-export const revisionDisplayState = { mode: 'all' as RevisionDisplayMode }
+export const revisionDisplayState = {
+  mode: 'all' as RevisionDisplayMode,
+  balloons: DEFAULT_BALLOON_MODE as BalloonMode,
+  /** balloons exist on screen (All Markup, print layout) — the root carries data-balloons */
+  balloonsActive: false,
+}
 
 const revisionOriginalKey = new PluginKey('revisionOriginal')
 
@@ -343,6 +386,7 @@ export const RevisionOriginalExtension = Extension.create({
                 const ascii = old.fontAscii ? String(old.fontAscii) : null
                 styles.push(`font-family:${cssRunFontFamily(ascii, ea)}`)
               }
+              // inline-rules: allow — paints a tracked format change's old run properties
               decos.push(Decoration.inline(pos, pos + node.nodeSize, { style: styles.join(';') }))
             })
             return decos.length > 0 ? DecorationSet.create(state.doc, decos) : DecorationSet.empty
@@ -360,8 +404,11 @@ export const RprChangeMark = Mark.create({
     return {
       author: { default: '' },
       date: { default: null as string | null },
+      dateUtc: { default: null as string | null },
       id: { default: null as string | null },
       old: { default: null as Record<string, unknown> | null, rendered: false },
+      /** the recorded previous w:rPr's inner XML; reject writes it back verbatim */
+      oldRPr: { default: null as string | null, rendered: false },
     }
   },
   parseHTML() {
@@ -372,6 +419,7 @@ export const RprChangeMark = Mark.create({
       'span',
       {
         'data-rpr-change': '1',
+        'data-rpr-author': mark.attrs.author,
         class: 'has-rpr-change',
         title: t('editorFormatChangeBy', {
           author: String(mark.attrs.author || t('editorUnknownAuthor')),
@@ -394,14 +442,35 @@ export const InstrFieldMark = Mark.create({
       instr: { default: '' },
       beginXml: { default: null },
       dirty: { default: false },
+      locked: { default: false, rendered: false },
+      // Cmd+F9: the text is the code being typed, not a result yet (field-chars.ts)
+      codeEdit: { default: false, rendered: false },
       fieldId: { default: null, rendered: false },
       fieldPart: { default: null, rendered: false },
+      // a SET / ASK Word has run: the text its bookmark holds
+      bookmarkText: { default: null, rendered: false },
     }
   },
   parseHTML() {
-    return [{ tag: 'span[data-instr-field]' }]
+    return [
+      {
+        tag: 'span[data-instr-field]',
+        // read the instruction back out of the clipboard payload. Without
+        // getAttrs the mark falls back to its defaults, so a pasted citation
+        // loses its instruction and saves as an empty w:instrText — which the
+        // next parse turns into a protected passthrough, locking the whole
+        // paragraph (genoffice#2099).
+        // a code still being typed pastes as its text: it has no instruction to carry
+        getAttrs: (el) =>
+          el.classList.contains('doc-field-code-open')
+            ? false
+            : { instr: el.getAttribute('data-instr-field') ?? '' },
+      },
+    ]
   },
   renderHTML({ mark }) {
+    if (mark.attrs.codeEdit === true)
+      return ['span', { 'data-instr-field': '', class: 'doc-field-code doc-field-code-open' }, 0]
     const instruction = String(mark.attrs.instr)
     const zoteroClass = /^\s*(?:ADDIN\s+)?(?:ZOTERO_|CSL_)/i.test(instruction)
       ? ' zotero-ref-field'
@@ -435,6 +504,18 @@ export const CtrlCheckboxMark = Mark.create({
 })
 
 /**
+ * CSS-only system keywords: names that resolve to a face inside a UA, never a
+ * real font family. They reach a pasted chain as ordinary-looking entries — a
+ * GitHub copy in Safari starts `-apple-system, BlinkMacSystemFont, "Segoe UI"…`
+ * — but persisting one pins w:rFonts to a name that Word, LibreOffice, Pages
+ * and Google Docs cannot resolve, so the run silently falls back to whatever
+ * default the reader picks. Same list the sheets canvas path already treats as
+ * non-concrete (PASSTHROUGH_FAMILY in cell-font-fallback.ts).
+ */
+const CSS_ONLY_FAMILY =
+  /^(?:math|ui-serif|ui-sans-serif|ui-monospace|ui-rounded|-apple-system|BlinkMacSystemFont)$/i
+
+/**
  * font-family chain → dual-slot font attrs, inverting renderHTML's encoding:
  * the Latin slot is the chain's first Latin family, the eastAsia slot its first
  * East Asian family. Generic families and the bundled CJK tofu-fallbacks that
@@ -452,6 +533,7 @@ export function fontAttrsFromFamilyChain(chain: string | undefined): Record<stri
         // var(--doc-latin-chain, ...) fragments from eastAsia-only chains
         !/^var\(|\)$/.test(x) &&
         !/^(serif|sans-serif|monospace|cursive|fantasy|system-ui)$/i.test(x) &&
+        !CSS_ONLY_FAMILY.test(x) &&
         // internal fonts.css aliases are not user picks: 'GenOffice *', the
         // '* GO' renamed/range-limited faces (Carlito GO, KR Theme Latin GO,
         // Noto Sans/Serif CJK GO...) and the size-adjusted Noto Arabic aliases
@@ -459,10 +541,7 @@ export function fontAttrsFromFamilyChain(chain: string | undefined): Record<stri
         !/ go$/i.test(x) &&
         !/^noto (naskh|sans) arabic (w|ta|tnr)$/i.test(x),
     )
-  const ea = families.find(
-    (f, i) => isEastAsianFontName(f) && (i === 0 || !/^noto (sans|serif) cjk sc$/i.test(f)),
-  )
-  const latin = families.find((f) => !isEastAsianFontName(f))
+  const { ea, latin } = eastAsianAndLatinOf(families)
   if (!ea && !latin) return {}
   return { font: ea ?? latin, ...(latin ? { fontAscii: latin } : {}) }
 }
@@ -494,15 +573,27 @@ const CLIPBOARD_TEXT_STYLE_TYPES: Record<string, 'string' | 'number' | 'boolean'
   textEffect: 'string',
   dstrike: 'boolean',
   glow: 'string',
+  textShadow: 'string',
+  textReflection: 'string',
+  textFill: 'string',
+  fxOwn: 'string',
   positionHalfPoints: 'number',
   bdr: 'string',
+  fitText: 'number',
+  eaLayout: 'string',
+  lang: 'string',
+  noProof: 'boolean',
   vertAlign: 'string',
   em: 'string',
+  otf: 'string',
   boldOff: 'boolean',
   italicOff: 'boolean',
   caps: 'string',
   vanish: 'boolean',
   vanishOwn: 'boolean',
+  offGrid: 'boolean',
+  snapToGridOwn: 'boolean',
+  bdrOwn: 'string',
   eaLang: 'string',
   styleId: 'string',
 }
@@ -607,13 +698,34 @@ export const TextStyleMark = Mark.create({
       dstrike: { default: null as boolean | null },
       // w14:glow as JSON {color,radiusPt,alpha}; saving is kept faithful by rawRPr
       glow: { default: null as string | null },
+      // w14:shadow as JSON {color,alpha,blurPt,distPt,dirDeg}
+      textShadow: { default: null as string | null },
+      // w14:reflection as JSON {startAlpha,endPos,blurPt,distPt}
+      textReflection: { default: null as string | null },
+      // w14:textFill as JSON (TextFill plus `over`, the text colour it came with)
+      textFill: { default: null as string | null },
+      // the outline, shadow and glow set in the editor, as JSON (see TextFxOwn): what the save writes
+      fxOwn: { default: null as string | null, rendered: false },
       // w:position baseline shift (half-points)
       positionHalfPoints: { default: null as number | null },
-      // character border (w:bdr) as JSON {val,sz,color,space}; saving is kept faithful by rawRPr
+      // character border (w:bdr) as JSON {val,sz,color,space}, resolved through the style chain
       bdr: { default: null as string | null },
+      // the run's own w:bdr (what saves; `bdr` may be inherited): the same JSON, or 'none'
+      bdrOwn: { default: null as string | null, rendered: false },
+      // the run's own w:fitText width in twips; 0 is an explicit none
+      fitText: { default: null as number | null },
+      // the run's own w:eastAsianLayout as JSON (see asian-layout.ts); '{}' is an explicit none
+      eaLayout: { default: null as string | null },
+      // the run's own w:lang slots as JSON (proofing language); not rendered: a lang attribute
+      // on the page would change hyphenation and CJK font fallback
+      lang: { default: null as string | null, rendered: false },
+      // the run's own w:noProof: the text is not spell checked
+      noProof: { default: null as boolean | null, rendered: false },
       vertAlign: { default: null as 'superscript' | 'subscript' | null },
-      // East Asian emphasis mark (w:em val); saving is kept faithful by rawRPr
+      // the run's own emphasis mark (w:em val); 'none' removes the file's own
       em: { default: null as string | null },
+      // the run's own w14 OpenType features as JSON (Run.otf)
+      otf: { default: null as string | null },
       // run-level explicit off (w:b/w:i w:val="0"): counters style-inherited bold/italic CSS
       boldOff: { default: null as boolean | null },
       italicOff: { default: null as boolean | null },
@@ -623,6 +735,10 @@ export const TextStyleMark = Mark.create({
       vanish: { default: null as boolean | null },
       // the run's own w:vanish (what saves; `vanish` may be inherited)
       vanishOwn: { default: null as boolean | null },
+      // off the character grid (w:snapToGrid off, style chain resolved at parse)
+      offGrid: { default: null as boolean | null },
+      // the run's own w:snapToGrid (what saves)
+      snapToGridOwn: { default: null as boolean | null },
       // w:lang w:eastAsia of the run / its character style: gates Word's East Asian line rules
       eaLang: { default: null as string | null },
       // rtl run (w:rtl, explicit or style-inherited): save-side decode selects the Cs twins.
@@ -637,6 +753,16 @@ export const TextStyleMark = Mark.create({
       themeRFonts: { default: null as string | null, rendered: false },
       // Run.themeColor (theme-resolved hex); keeps the raw w:themeColor ref and cached w:val on save
       themeColor: { default: null as string | null, rendered: false },
+      // Cs size an rtl run inherits from its style chain: the paragraph strut reads it
+      // (markSizeHalfPoints); the paint comes from the .doc-cs style CSS. Never saved
+      csSize: { default: null as number | null, rendered: false },
+      // Run.effective bold / italic of an rtl run, or of a run whose character style
+      // toggle XORs against the paragraph style: painted as doc-cs-(n)b / doc-cs-(n)i
+      // classes (styles.css) so a user strong/em wrapper still shows. Never saved
+      csBold: { default: null as boolean | null, rendered: false },
+      csItalic: { default: null as boolean | null, rendered: false },
+      // JSON of the table-style run properties (convert.ts tableStyleRunAttr); display only
+      tblRun: { default: null as string | null, rendered: false },
     }
   },
   parseHTML() {
@@ -657,40 +783,35 @@ export const TextStyleMark = Mark.create({
   },
   renderHTML({ mark }) {
     const styles: string[] = []
+    let cutAdjusted = false
     const effect = parseTextEffectAttr(mark.attrs.textEffect)
     // authored colors stay the declaration; the --dk-* twins feed the dark page (dark-page.ts)
     if (mark.attrs.color && !paperColorEffect(effect))
       styles.push(...textColorDecls(String(mark.attrs.color)))
-    if (mark.attrs.sizeHalfPoints) {
-      const half = Number(mark.attrs.sizeHalfPoints)
+    const tbl = tblRunOf(mark.attrs)
+    if (mark.attrs.sizeHalfPoints || tbl?.sizeHalfPoints) {
+      const half = Number(mark.attrs.sizeHalfPoints || tbl?.sizeHalfPoints)
       styles.push(`font-size:${half / 2}pt`)
       // a spacer run of 1pt or less inherits the block's absolute line-height and, centred
       // on its own tiny glyph, would push the line box bottom down (Word: no effect)
       if (half <= 2) styles.push('line-height:0')
     }
     if (mark.attrs.font || mark.attrs.fontAscii || mark.attrs.csFont) {
-      const ea = mark.attrs.font ? String(mark.attrs.font) : null
-      const ascii = mark.attrs.fontAscii ? String(mark.attrs.fontAscii) : null
-      const cs = mark.attrs.csFont ? String(mark.attrs.csFont) : null
-      // a Latin-only chain fills both slots (fontAttrsFromFamilyChain), so an
-      // unparsed run's font only names an East Asian face when the slots differ
-      const explicitEa = mark.attrs.eastAsiaFont ?? (!mark.attrs.rawRPr && ea !== ascii ? ea : null)
-      if (explicitEa && !mark.attrs.eaSlotEmpty)
-        styles.push(`--doc-east-asian-font:${cssFontFamily(String(explicitEa))}`)
-      styles.push(
-        `font-family:${
-          cs
-            ? cssCsFontFamily(cs, ascii ?? undefined, ea ?? undefined)
-            : cssRunFontFamily(ascii, ea)
-        }`,
-      )
+      const face = runFaceDecls(mark.attrs, mark.attrs.csFont ? String(mark.attrs.csFont) : null)
+      styles.push(...face.decls)
+      cutAdjusted = face.cutAdjusted
     }
-    const spacingPt = mark.attrs.charSpacingTwips ? Number(mark.attrs.charSpacingTwips) / 20 : 0
+    if (!mark.attrs.font && !mark.attrs.fontAscii && !mark.attrs.csFont && tbl?.fontAscii) {
+      const family = cssRunFontFamily(wordSlotFaces(tbl.fontAscii, null).ascii, null)
+      styles.push(`font-family:${family}`, `--doc-run-ff:${family}`)
+    }
+    const charSpacingTwips = mark.attrs.charSpacingTwips ?? tbl?.charSpacingTwips
+    const spacingPt = charSpacingTwips ? Number(charSpacingTwips) / 20 : 0
     const scaleEm = mark.attrs.charScaleEm ? Number(mark.attrs.charScaleEm) : 0
     if (spacingPt && scaleEm) styles.push(`letter-spacing:calc(${spacingPt}pt + ${scaleEm}em)`)
     else if (spacingPt) styles.push(`letter-spacing:${spacingPt}pt`)
     else if (scaleEm) styles.push(`letter-spacing:${scaleEm}em`)
-    else if (mark.attrs.charSpacingTwips === 0) styles.push('letter-spacing:0')
+    else if (charSpacingTwips === 0) styles.push('letter-spacing:0')
     if (mark.attrs.kern != null) styles.push(`font-kerning:${mark.attrs.kern ? 'normal' : 'none'}`)
     const shading = (mark.attrs.shadingDisplay ?? mark.attrs.shading) as string | null
     // shading first: when both are set the later highlight declaration wins (Word behavior)
@@ -715,32 +836,45 @@ export const TextStyleMark = Mark.create({
       if (outline) styles.push(textOutlineDecl(outline))
     }
     if (effect) styles.push(...textEffectDecls(effect))
+    const textFill = paperColorEffect(effect)
+      ? undefined
+      : liveTextFill(mark.attrs.textFill, mark.attrs.color)
+    if (textFill) styles.push(...textFillDecls(textFill, !!(mark.attrs.highlight || shading)))
     if (mark.attrs.dstrike) styles.push(doubleStrikeDecl())
-    if (mark.attrs.glow) {
-      const glow = parseGlowAttr(String(mark.attrs.glow))
-      if (glow) styles.push(glowDecl(glow))
+    const glowAndShadow = glowAndShadowDecl(
+      mark.attrs.glow ? parseGlowAttr(String(mark.attrs.glow)) : undefined,
+      mark.attrs.textShadow ? parseTextShadowAttr(String(mark.attrs.textShadow)) : undefined,
+    )
+    if (glowAndShadow) styles.push(glowAndShadow)
+    if (mark.attrs.textReflection) {
+      const reflection = parseReflectionAttr(String(mark.attrs.textReflection))
+      if (reflection) styles.push(reflectionDecl(reflection))
     }
     if (mark.attrs.positionHalfPoints)
       styles.push(positionDecl(Number(mark.attrs.positionHalfPoints)))
     if (mark.attrs.charScaleX) styles.push(...charScaleXDecls(String(mark.attrs.charScaleX)))
     if (mark.attrs.bdr) styles.push(...runBorderDecls(String(mark.attrs.bdr)))
+    if (Number(mark.attrs.fitText) > 0) styles.push(...fitTextDecls(Number(mark.attrs.fitText)))
+    const eaLayout = parseEaLayoutAttr(mark.attrs.eaLayout)
+    if (eaLayout)
+      styles.push(
+        ...eaLayoutDecls(
+          eaLayout,
+          Number(mark.attrs.sizeHalfPoints || tbl?.sizeHalfPoints) || null,
+        ),
+      )
     if (mark.attrs.vertAlign === 'superscript') styles.push('vertical-align:super;font-size:0.75em')
     if (mark.attrs.vertAlign === 'subscript') styles.push('vertical-align:sub;font-size:0.75em')
-    if (mark.attrs.em) {
-      const em = String(mark.attrs.em)
-      const shape =
-        em === 'circle' ? 'open circle' : em === 'comma' ? 'filled sesame' : 'filled dot'
-      // Word renders Chinese emphasis marks (dot/underDot) below the text; comma/circle kenten go above
-      const pos = em === 'comma' || em === 'circle' ? 'over' : 'under'
-      styles.push(`text-emphasis:${shape}`, `text-emphasis-position:${pos} right`)
-    }
+    const features = otfFeatureSettings(parseOtfAttr(mark.attrs.otf))
+    if (features) styles.push(`font-feature-settings:${features}`)
+    styles.push(...emphasisDecls(mark.attrs.em as string | null))
     if (mark.attrs.boldOff) styles.push('font-weight:normal')
     if (mark.attrs.italicOff) styles.push('font-style:normal')
     if (mark.attrs.vanish) styles.push('display:none')
-    if (mark.attrs.caps === 'all') styles.push('text-transform:uppercase')
-    else if (mark.attrs.caps === 'small') styles.push('font-variant-caps:small-caps')
-    else if (mark.attrs.caps === 'none')
-      styles.push('text-transform:none', 'font-variant-caps:normal')
+    const caps = mark.attrs.caps ?? tbl?.caps
+    if (caps === 'all') styles.push('text-transform:uppercase')
+    else if (caps === 'small') styles.push('font-variant-caps:small-caps')
+    else if (caps === 'none') styles.push('text-transform:none', 'font-variant-caps:normal')
     // the attr value carries the exact attrs for clipboard round-trip; '1'
     // (nothing set) keeps the attribute present for CSS/selector consumers
     const clip: Record<string, unknown> = {}
@@ -753,6 +887,22 @@ export const TextStyleMark = Mark.create({
       style: styles.join(';'),
     }
     if (mark.attrs.styleId) attrs['data-style'] = String(mark.attrs.styleId)
+    if (mark.attrs.noProof) attrs['spellcheck'] = 'false'
+    if (eaLayout?.combine && eaLayout.brackets) attrs['data-ea-brackets'] = eaLayout.brackets
+    if (eaLayout?.vert && !eaLayout.combine) attrs['data-ea-vert'] = '1'
+    // rtl run: the .doc-cs gate in doc-style-css paints the Cs size of its style
+    // chain; weight and style come resolved from the engine (includes the table
+    // style layer the paragraph-style CSS cannot see)
+    const cls: string[] = []
+    if (mark.attrs.cs) cls.push('doc-cs')
+    if (mark.attrs.csBold != null) cls.push(mark.attrs.csBold ? 'doc-cs-b' : 'doc-cs-nb')
+    if (mark.attrs.csItalic != null) cls.push(mark.attrs.csItalic ? 'doc-cs-i' : 'doc-cs-ni')
+    if (mark.attrs.offGrid) cls.push('doc-off-grid')
+    if (cls.length > 0) attrs['class'] = cls.join(' ')
+    // cs-slot run: styles.css .doc-cs-mixed collapses its line box
+    if (mark.attrs.csFont) attrs['data-cs'] = ''
+    // bold/italic cut of a per-cut size-adjusted alias: styles.css .doc-cut-adjusted collapses its line box
+    if (cutAdjusted) attrs['data-cut-adj'] = ''
     {
       const ink = fillInk(shading)
       if (ink) attrs['data-ink'] = ink
@@ -760,6 +910,22 @@ export const TextStyleMark = Mark.create({
     return ['span', attrs, 0]
   },
 })
+
+interface TblRunProps {
+  sizeHalfPoints?: number
+  fontAscii?: string
+  caps?: 'none' | 'all' | 'small'
+  charSpacingTwips?: number
+}
+
+function tblRunOf(attrs: Record<string, unknown>): TblRunProps | undefined {
+  if (typeof attrs.tblRun !== 'string') return undefined
+  try {
+    return JSON.parse(attrs.tblRun) as TblRunProps
+  } catch {
+    return undefined
+  }
+}
 
 /** Imported runs carry explicit Word off-switches (w:b/w:i val=0 → docTextStyle
  * boldOff/italicOff, painted as font-weight/style:normal). They coexist with a
@@ -835,4 +1001,20 @@ export const FormatOffClearExtension = Extension.create({
   },
 })
 
-// ---- textbox sub-editor schema ----
+/**
+ * The text a bookmark covers when it covers a range rather than a paragraph
+ * (what Paste link points at). Saved as the bookmark's start before the first
+ * marked piece and its end after the last. Not read from pasted HTML: a copy
+ * of the text is not the bookmark.
+ */
+export const RangeBookmarkMark = Mark.create({
+  name: 'docRangeBookmark',
+  inclusive: false,
+  excludes: '',
+  addAttributes() {
+    return { name: { default: '', rendered: false } }
+  },
+  renderHTML() {
+    return ['span', { class: 'doc-range-bookmark' }, 0]
+  },
+})

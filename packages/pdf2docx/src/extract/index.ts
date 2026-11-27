@@ -9,6 +9,8 @@ import {
   bboxOfPoints,
   coversBox,
   intersectArea,
+  maxOf,
+  minOf,
   overlapRatio,
   printContentBox,
   rectArea,
@@ -627,10 +629,10 @@ function readImages(
       const xs = [e, a + e, c + e, a + c + e]
       const ys = [f, b + f, d + f, b + d + f]
       box = {
-        x0: Math.min(...xs),
-        y0: Math.min(...ys),
-        x1: Math.max(...xs),
-        y1: Math.max(...ys),
+        x0: minOf(xs),
+        y0: minOf(ys),
+        x1: maxOf(xs),
+        y1: maxOf(ys),
       }
     }
     if (rectArea(box) <= 0) return
@@ -922,7 +924,7 @@ function mapRectByMatrix(mat: Matrix, r: Rect): Rect {
     b * r.x0 + d * r.y1 + f,
     b * r.x1 + d * r.y1 + f,
   ]
-  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }
+  return { x0: minOf(xs), y0: minOf(ys), x1: maxOf(xs), y1: maxOf(ys) }
 }
 
 /** rect intersection; null when empty */
@@ -1877,7 +1879,11 @@ export function renderPagePng(m: PdfiumModule, page: number, scale: number): Pag
   if (!bitmap) return null
   try {
     m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
-    m._FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, 0)
+    // FPDF_ANNOT (1): a mark-up drawn in the app is saved as an annotation with
+    // an appearance stream, not as page content. Without the flag the bitmap is
+    // blank wherever the page holds only drawings, and a rasterized page loses
+    // them; the bytes on disk already carry them, so the render must too.
+    m._FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, 1 /* FPDF_ANNOT */)
     const px = bitmapToRgba(m, bitmap)
     if (!px) return null
     return {
