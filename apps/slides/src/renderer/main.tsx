@@ -1,12 +1,17 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
-import { htmlLang, type Lang } from '@genoffice/i18n'
+import { htmlDir, htmlLang, type Lang } from '@genoffice/i18n'
 import { App } from './App'
+import { installCanvasKerning } from './canvas-kerning'
 import { AudienceView } from './components/AudienceView'
 import { LocaleProvider, setModuleLang } from './i18n/locale'
 import type { UiTheme } from '../shared/ipc'
 import '@genoffice/ui/tokens.css'
 import '@genoffice/ui/screentip.css'
+import '@genoffice/ui/ai-model-picker.css'
+import '@genoffice/ui/ai-queue-strip.css'
+import '@genoffice/ui/ai-usage.css'
+import '@genoffice/ui/ai-skills.css'
 import '@genoffice/ui/color-picker.css'
 import '@genoffice/ui/dropdown.css'
 import '@genoffice/ui/ribbon-collapse.css'
@@ -15,6 +20,9 @@ import '@genoffice/ui/ai-panel-prefs.css'
 import '@genoffice/ui/ai-scope-quote.css'
 import './styles.css'
 import { applyAiPanelPrefs, installScreenTips } from '@genoffice/ui'
+import { connectMeasurementUnit } from './measurement-unit'
+
+installCanvasKerning()
 
 installScreenTips()
 
@@ -53,10 +61,17 @@ async function bootstrap(): Promise<void> {
   }
   setModuleLang(lang)
   document.documentElement.lang = htmlLang(lang)
+  document.documentElement.dir = htmlDir(lang)
   // the audience show window renders slide content only — it never themes
   if (mode !== 'audience') {
     applyTheme(theme)
     window.slidesApi?.onThemeChanged(applyTheme)
+    const api = window.slidesApi
+    if (api?.getMeasurementUnit && api.onMeasurementUnitChanged)
+      connectMeasurementUnit({
+        get: api.getMeasurementUnit,
+        onChanged: api.onMeasurementUnitChanged,
+      })
     await window.slidesApi
       ?.getAiPanelPrefs?.()
       .then(applyAiPanelPrefs)

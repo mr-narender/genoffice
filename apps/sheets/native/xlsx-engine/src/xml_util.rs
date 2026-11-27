@@ -2,8 +2,17 @@
 //! lookup, attribute access and text decoding.
 
 use std::borrow::Cow;
+use std::io::BufRead;
+
+use quick_xml::XmlVersion;
 
 use super::*;
+
+/// Budget for the parts `read_zip_string` materialises whole (workbook.xml,
+/// its rels, styles, table definitions). These never approach this size in a
+/// real workbook, whereas `MAX_EXTRACTED_ENTRY_BYTES` is sized for densely
+/// styled worksheets and would let one metadata part inflate to 500 MiB.
+pub(crate) const MAX_METADATA_PART_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(crate) fn decode_uri_path(value: &str) -> Result<String, SidecarError> {
     let bytes = value.as_bytes();
@@ -42,6 +51,24 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
+/// quick-xml's `Reader` only takes UTF-8, so part bytes go through
+/// `DecodingReader`. It picks UTF-16 up from the BOM; a code page that is
+/// only named in the XML declaration (windows-1252) is applied here.
+pub(crate) fn xml_reader<R: Read>(
+    source: R,
+) -> Result<Reader<quick_xml::encoding::DecodingReader<BufReader<R>>>, SidecarError> {
+    let mut source = BufReader::new(source);
+    let declared = match Reader::from_reader(source.fill_buf()?).read_event() {
+        Ok(Event::Decl(declaration)) => declaration.encoder(),
+        _ => None,
+    };
+    let mut decoding = quick_xml::encoding::DecodingReader::new(source);
+    if let Some(encoding) = declared.filter(|encoding| encoding.is_ascii_compatible()) {
+        decoding.set_encoding(encoding);
+    }
+    Ok(Reader::from_reader(decoding))
+}
+
 /// Entry lookup tolerant of non-conformant producers: '\' separators,
 /// leading '/', and case drift in entry names. Excel opens such packages
 /// (tdf131575: .NET-written `xl\workbook.xml` with `sharedstrings.xml`).
@@ -61,9 +88,10 @@ pub(crate) fn zip_entry<'a>(
             let wanted = normalize(candidate);
             if let Some(found) = archive
                 .file_names()
+                .filter_map(Result::ok)
                 .find(|candidate| normalize(candidate) == wanted)
             {
-                resolved = Some(found.to_owned());
+                resolved = Some(found.into_owned());
                 break;
             }
         }
@@ -72,27 +100,62 @@ pub(crate) fn zip_entry<'a>(
     archive.by_name(resolved.as_deref().unwrap_or(name))
 }
 
+/// Reads a zip entry as a string under a metered limit (see
+/// `copy_entry_bounded` for why a declared size alone bounds nothing): one
+/// byte past the smaller of the claim and `MAX_METADATA_PART_BYTES` is read,
+/// and a part that inflates past that is refused rather than materialised.
+///
+/// This is the path nearly every workbook part arrives through, so an uncapped
+/// read here undoes the work genoffice#781 did for media and `@genoffice/zip-gate` does
+/// for the docx and pptx hosts.
 pub(crate) fn read_zip_string(
     archive: &mut ZipArchive<File>,
     path: &str,
 ) -> Result<String, SidecarError> {
     let mut entry = zip_entry(archive, path)?;
-    let mut value = String::new();
-    entry.read_to_string(&mut value)?;
-    Ok(value)
+    let declared = entry.size();
+    if declared > MAX_METADATA_PART_BYTES {
+        return Err(SidecarError::Workbook(format!(
+            "{path} is {declared} bytes uncompressed, above the {MAX_METADATA_PART_BYTES} byte metadata part limit."
+        )));
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(declared.min(1 << 20) as usize);
+    copy_entry_bounded(&mut entry, declared, MAX_METADATA_PART_BYTES, &mut out)?;
+    String::from_utf8(out)
+        .map_err(|_| SidecarError::Workbook(format!("{path} is not valid UTF-8.")))
+}
+
+/// `ZipFile::size()` is only the declared length and zip bounds just the
+/// compressed input, so an entry may inflate past its claim; reading one byte
+/// past `min(declared, cap)` catches that (same rule as `@genoffice/zip-gate`,
+/// genoffice#781 / genoffice#1386).
+pub(crate) fn copy_entry_bounded<R: Read, W: Write>(
+    entry: &mut R,
+    declared: u64,
+    cap: u64,
+    out: &mut W,
+) -> Result<u64, SidecarError> {
+    let allowance = declared.min(cap);
+    let copied = std::io::copy(&mut entry.take(allowance.saturating_add(1)), out)?;
+    if copied > allowance {
+        return Err(SidecarError::Workbook(
+            "ZIP entry inflates past the size it declares.".into(),
+        ));
+    }
+    Ok(copied)
 }
 
 pub(crate) fn attribute_value<R: std::io::BufRead>(
-    reader: &Reader<R>,
+    _reader: &Reader<R>,
     element: &BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> Result<Option<String>, SidecarError> {
     for attribute in element.attributes().with_checks(false) {
         let attribute = attribute.map_err(|error| SidecarError::Workbook(error.to_string()))?;
         if attribute.key.local_name().as_ref() == name {
             return Ok(Some(
                 attribute
-                    .decode_and_unescape_value(reader.decoder())?
+                    .normalized_value(XmlVersion::Implicit1_0)?
                     .into_owned(),
             ));
         }
@@ -112,9 +175,7 @@ pub(crate) fn general_ref_text(
     {
         return Ok(character.to_string());
     }
-    let name = reference
-        .decode()
-        .map_err(|error| SidecarError::Workbook(error.to_string()))?;
+    let name = reference.xml10_content();
     Ok(match name.as_ref() {
         "amp" => "&".into(),
         "lt" => "<".into(),
@@ -203,14 +264,11 @@ pub(crate) fn preserves_space<R: std::io::BufRead>(
     reader: &Reader<R>,
     element: &BytesStart<'_>,
 ) -> Result<bool, SidecarError> {
-    Ok(attribute_value(reader, element, b"space")?.as_deref() == Some("preserve"))
+    Ok(attribute_value(reader, element, "space")?.as_deref() == Some("preserve"))
 }
 
 pub(crate) fn decode_text(text: &quick_xml::events::BytesText<'_>) -> Result<String, SidecarError> {
-    let decoded = text
-        .decode()
-        .map_err(|error| SidecarError::Workbook(error.to_string()))?;
-    quick_xml::escape::unescape(&decoded)
+    quick_xml::escape::unescape(&text.xml10_content())
         .map(|value| value.into_owned())
         .map_err(|error| SidecarError::Workbook(error.to_string()))
 }
@@ -220,7 +278,5 @@ pub(crate) fn decode_text(text: &quick_xml::events::BytesText<'_>) -> Result<Str
 pub(crate) fn decode_cdata(
     text: &quick_xml::events::BytesCData<'_>,
 ) -> Result<String, SidecarError> {
-    text.decode()
-        .map(|value| value.into_owned())
-        .map_err(|error| SidecarError::Workbook(error.to_string()))
+    Ok(text.xml10_content().into_owned())
 }

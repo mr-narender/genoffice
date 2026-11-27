@@ -3,6 +3,7 @@ import { TextSelection } from '@tiptap/pm/state'
 import { Fragment, Slice, type Mark, type Node as PmNode } from '@tiptap/pm/model'
 import type { ZoteroRendererRequest } from '../../shared/ipc'
 import { parseZoteroRtf, zoteroRtfToText, type ZoteroRtfParagraph, type ZoteroRtfRun } from './rtf'
+import { fieldTypeForDisk, fieldTypeForSession } from './field-type'
 
 const ZOTERO_INSTR_RE = /^\s*(?:ADDIN\s+)?(?:ZOTERO_|CSL_)(?:ITEM|BIBL|TEMP)\b/i
 
@@ -76,9 +77,11 @@ export class ZoteroDocumentController {
         return field ? this.fieldDescriptor(field) : null
       }
       case 'Document_getDocumentData':
-        return this.documentData.get()
+        // the stored value spells Field; the session is the LibreOffice bridge
+        return fieldTypeForSession(this.documentData.get())
       case 'Document_setDocumentData':
-        this.documentData.set(String(args[1] ?? ''))
+        // the session reports LibreOffice storages; the file holds Word fields
+        this.documentData.set(fieldTypeForDisk(String(args[1] ?? '')))
         return null
       case 'Document_insertField':
         return this.insertField(Number(args[2] ?? 0))
@@ -160,14 +163,16 @@ export class ZoteroDocumentController {
     state.doc.forEach((block, blockOffset, blockIndex) => {
       block.descendants((node, relativePos) => {
         if (!node.isText) return
+        // a CITATION field numbers its runs from the same series
+        const any = Number(node.marks.find((candidate) => candidate.type === type)?.attrs.fieldId)
+        if (Number.isSafeInteger(any) && any > 0) maxId = Math.max(maxId, any)
         const mark = node.marks.find(
           (candidate) =>
             candidate.type === type && ZOTERO_INSTR_RE.test(String(candidate.attrs.instr ?? '')),
         )
         if (!mark) return
         const id = Number(mark.attrs.fieldId)
-        if (Number.isSafeInteger(id) && id > 0) maxId = Math.max(maxId, id)
-        else {
+        if (!(Number.isSafeInteger(id) && id > 0)) {
           const from = blockOffset + 1 + relativePos
           lost.push({
             from,

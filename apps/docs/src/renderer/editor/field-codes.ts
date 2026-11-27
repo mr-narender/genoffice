@@ -66,6 +66,9 @@ function fieldAround(parent: PmNode, base: number, index: number, mark: Mark): F
   return { from, to, instr: String(mark.attrs.instr ?? ''), mark }
 }
 
+/** Word's Lock Fields: the result stands until the field is unlocked */
+export const isFieldLocked = (mark: Mark): boolean => mark.attrs.locked === true
+
 /** every field in the document, in order */
 export function collectFields(
   doc: PmNode,
@@ -97,6 +100,9 @@ export function collectFields(
   return out
 }
 
+/** the code as typed, with the quotes AutoCorrect curled made straight again: a switch takes no others */
+export const typedFieldCode = (text: string): string => text.replace(/[\u201c\u201d]/g, '"').trim()
+
 /** Word's code view text: braces with one space padding around the instruction */
 export function fieldCodeText(instr: string): string {
   return `{ ${instr.trim()} }`
@@ -124,6 +130,8 @@ function buildDecorations(doc: PmNode, all: boolean, toggled: Range[]): Decorati
   if (!all && toggled.length === 0) return DecorationSet.empty
   const decos: Decoration[] = []
   for (const field of collectFields(doc)) {
+    // a code still being typed already reads as a code
+    if (field.mark.attrs.codeEdit === true) continue
     if (all === toggled.some((r) => overlaps(r, field))) continue
     const code = fieldCodeText(field.instr)
     decos.push(Decoration.inline(field.from, field.to, { class: 'doc-field-result-hidden' }))
@@ -184,10 +192,14 @@ export const FieldCodesExtension = Extension.create({
   },
 })
 
+/** the fields whose result is a page of the layout: marked `w:dirty` until a layout gives it (field-results) */
+export const PAGE_FIELD_INSTR = /^\s*(PAGE|NUMPAGES|SECTIONPAGES|PAGEREF)\b/i
+
 /**
  * Edit Field… OK: rewrite the instruction and refresh the cached result in
- * one step (`value` empty = keep the old result, e.g. REF fields Word
- * recomputes on open). The run's other marks survive.
+ * one step. `value` empty = this editor has no result for the new code: the
+ * old one stays and the field is marked for Word to update on open. The
+ * run's other marks survive.
  */
 export function setFieldInstr(
   editor: Editor,
@@ -200,7 +212,12 @@ export function setFieldInstr(
   const { state } = editor
   const markType = state.schema.marks.instrField
   if (!markType) return false
-  const mark = markType.create({ ...range.mark.attrs, instr: next, dirty: true })
+  // a page field waits for the layout: the value given here is the page in view
+  const mark = markType.create({
+    ...range.mark.attrs,
+    instr: next,
+    dirty: !value || PAGE_FIELD_INSTR.test(next),
+  })
   const text = value || state.doc.textBetween(range.from, range.to, '')
   if (!text) return false
   const runMarks = state.doc.nodeAt(range.from)?.marks ?? []

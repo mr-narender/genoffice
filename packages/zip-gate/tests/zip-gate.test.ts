@@ -1,9 +1,11 @@
 import JSZip from 'jszip'
+import { deflateRawSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import {
   assertDeclaredSizesWithinLimits,
   assertZipInflatesWithinLimits,
   DEFAULT_ZIP_LIMITS,
+  inflateRawWithinCap,
   type DeclaredPart,
 } from '../src/index'
 
@@ -68,6 +70,27 @@ describe('assertZipInflatesWithinLimits', () => {
         LIMITS,
       ),
     ).resolves.toBeUndefined()
+  })
+
+  it('ignores an EOCD signature written inside the archive comment', async () => {
+    // A comment may legally contain the EOCD signature. Taking the last bare
+    // signature reads an empty directory from the comment, skips every real
+    // entry, and lets a lying part through the gate unchecked.
+    const good = await onePart(1024 * KB, 300)
+    const eocd = good.length - 22
+    const fake = Buffer.from('PK\u0005\u0006' + '\u0000'.repeat(18), 'latin1')
+    const commented = Buffer.concat([good, fake])
+    commented.writeUInt16LE(fake.length, eocd + 20)
+    await expect(assertZipInflatesWithinLimits(commented, LIMITS)).rejects.toThrow(/inflates past/)
+  })
+
+  it('accepts an honest archive that has a comment', async () => {
+    const good = await onePart(300, 300, { method: 'store' })
+    const eocd = good.length - 22
+    const comment = Buffer.from('genoffice', 'utf8')
+    const commented = Buffer.concat([good, comment])
+    commented.writeUInt16LE(comment.length, eocd + 20)
+    await expect(assertZipInflatesWithinLimits(commented, LIMITS)).resolves.toBeUndefined()
   })
 
   it('refuses a stored part that holds more bytes than it declares', async () => {
@@ -136,5 +159,44 @@ describe('assertDeclaredSizesWithinLimits', () => {
     expect(() =>
       assertDeclaredSizesWithinLimits([{ name: 'a.xml', usize: 10 }], LIMITS),
     ).not.toThrow()
+  })
+})
+
+describe('inflateRawWithinCap', () => {
+  it('returns the inflated bytes for an honest stream', async () => {
+    const raw = deflateRawSync(Buffer.alloc(64 * KB))
+    const out = await inflateRawWithinCap(raw, 128 * KB)
+    expect(out).not.toBeNull()
+    expect(out!.byteLength).toBe(64 * KB)
+    expect(out![0]).toBe(0)
+    expect(out![63 * KB]).toBe(0)
+  })
+
+  it('accepts output exactly at the cap and refuses one byte past it', async () => {
+    const raw = deflateRawSync(Buffer.alloc(100))
+    await expect(inflateRawWithinCap(raw, 100)).resolves.not.toBeNull()
+    await expect(inflateRawWithinCap(raw, 99)).resolves.toBeNull()
+  })
+
+  it('refuses a non-finite or negative cap', async () => {
+    // NaN makes `seen > maxBytes` false for every chunk, so the old gate let
+    // the entire part through instead of refusing a meaningless budget
+    const raw = deflateRawSync(Buffer.alloc(100))
+    for (const cap of [NaN, Infinity, -Infinity, -1]) {
+      await expect(inflateRawWithinCap(raw, cap)).resolves.toBeNull()
+    }
+  })
+
+  it('cancels a lying stream at the cap instead of materialising the payload', async () => {
+    // 1 MB of output behind a small compressed block — the serving-side twin
+    // of the #759 bomb, where the caller never gate-checked the declaration.
+    const raw = deflateRawSync(Buffer.alloc(1024 * KB))
+    const before = process.memoryUsage().rss
+    await expect(inflateRawWithinCap(raw, 128 * KB)).resolves.toBeNull()
+    expect(process.memoryUsage().rss - before).toBeLessThan(32 * MB)
+  })
+
+  it('returns null for corrupt input instead of throwing', async () => {
+    await expect(inflateRawWithinCap(Buffer.from('not a deflate stream'), 1024)).resolves.toBeNull()
   })
 })

@@ -29,6 +29,11 @@ import { ConditionalFormattingService } from '@univerjs/preset-sheets-conditiona
 import { INTERCEPTOR_POINT, SheetInterceptorService } from '@univerjs/sheets'
 
 import { getWorkbookMdw } from './app-constants'
+import {
+  getNumberSeparators,
+  numfmtDisplayLocale,
+  onNumberSeparatorsChange,
+} from './number-separators'
 import { isSubstitutedCellFamily } from './cell-font-fallback'
 import type { UniverRuntime } from './univer-state'
 
@@ -36,6 +41,12 @@ import type { UniverRuntime } from './univer-state'
 /// plus the 1px blur offset. Every width-vs-text rule here (General digit
 /// budget, #### overflow, `*x` fill) measures against `width - CELL_INSET_PX`.
 export const CELL_INSET_PX = 5
+
+/// Excel lets a number spill into the cell margins before hashing — only the
+/// gridline is off limits (Calibri 11 "123456789", 63px, shows in the 64px
+/// default column; an Aptos Narrow "2026/8/10", 66px GDI, shows in
+/// the 69px default column).
+export const HASH_INSET_PX = 1
 
 /// Shares the per-workbook max-digit-width with characterWidthToPixels
 /// (univer-sync.ts), so a column imported as N chars yields a budget of
@@ -57,7 +68,9 @@ function toScientific(value: number, decimals: number): string {
  */
 export function formatGeneral(value: number, budget: number): string {
   if (!Number.isFinite(value)) return String(value)
-  const base = numfmt.format('General', value)
+  const decimal = getNumberSeparators().decimal
+  const local = (text: string): string => (decimal === '.' ? text : text.replace('.', decimal))
+  const base = local(numfmt.format('General', value))
   if (base.length <= budget) return base
   const abs = Math.abs(value)
   const intLen = (abs < 1 ? 1 : Math.floor(Math.log10(abs)) + 1) + (value < 0 ? 1 : 0)
@@ -67,11 +80,11 @@ export function formatGeneral(value: number, budget: number): string {
     let t = value.toFixed(dec)
     if (t.includes('.')) t = t.replace(/0+$/, '').replace(/\.$/, '')
     if (Number(t) === 0 && value !== 0) break
-    if (t.length <= budget) return t
+    if (t.length <= budget) return local(t)
   }
   for (let dec = 5; dec > 0; dec -= 1) {
     const t = toScientific(value, dec)
-    if (t.length <= budget) return t
+    if (t.length <= budget) return local(t)
   }
   return toScientific(value, 0)
 }
@@ -104,7 +117,11 @@ export function hostLocalePattern(pattern: string): string {
 
 function safeFormat(pattern: string, value: number | string): string | null {
   try {
-    return numfmt.format(hostLocalePattern(pattern), value, { nbsp: true, throws: false })
+    return numfmt.format(hostLocalePattern(pattern), value, {
+      nbsp: true,
+      throws: false,
+      locale: numfmtDisplayLocale(),
+    })
   } catch {
     return null
   }
@@ -340,11 +357,14 @@ export function exponentialDecimalRepair(pattern: string, value: number): string
   const percent = pattern.endsWith('%')
   const scaled = percent ? value * 100 : value
   if (!Number.isFinite(scaled)) return null
-  const text = scaled.toLocaleString('en-US', {
+  const en = scaled.toLocaleString('en-US', {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
     useGrouping: pattern.includes(','),
   })
+  const sep = getNumberSeparators()
+  const text =
+    sep.decimal === '.' ? en : en.replace(/[.,]/g, (ch) => (ch === '.' ? sep.decimal : sep.group))
   return percent ? `${text}%` : text
 }
 
@@ -375,7 +395,7 @@ export function isCalendarDatePattern(pattern: string): boolean {
 
 const patternTypeCache = new Map<string, string>()
 
-function patternType(pattern: string): string {
+export function patternType(pattern: string): string {
   let type = patternTypeCache.get(pattern)
   if (type === undefined) {
     try {
@@ -405,27 +425,31 @@ export function overflowHashes(
   calibrated = scale !== 1,
 ): string | null {
   if (display === '') return null
-  const available = columnWidthPx - CELL_INSET_PX
-  // A calibrated (GDI-normalized) measurement follows Excel's real rule — a
-  // digit width of slack before hashing (prod refs pin it in both
-  // directions: 36.3px content hashes in a 42px cell, 75.5px shows in 98px).
-  // A genuine local face measuring at its GDI width counts as calibrated:
-  // its scale clamps to exactly 1 but the numbers are true. Uncalibrated
-  // measurements keep a 5% noise band instead: macOS glyph advances run a
-  // few percent wide of Excel's GDI metrics (Arial bold "2026/8/30"
-  // measures 65.2px here vs ≤63px in Excel), and a borderline spurious ####
-  // loses the whole value while a clip loses a few pixels.
-  const limit = calibrated ? available - measure('0') * scale : available * 1.05
-  if (measure(display) * scale <= limit) return null
+  const available = columnWidthPx - HASH_INSET_PX
+  // Calibrated measurements follow Excel's rule exactly, with GDI's
+  // whole-pixel advances. Uncalibrated ones keep a 5% noise band: macOS
+  // advances run a few percent wide of GDI, and a spurious #### loses the
+  // whole value while a clip loses a few pixels.
+  const fits = calibrated
+    ? gdiWidth(display, measure, scale) <= available
+    : measure(display) * scale <= available * 1.05
+  if (fits) return null
   return hashFill(columnWidthPx, measure)
+}
+
+/// Excel's width of a numeric display: GDI advances per glyph, each rounded
+/// to whole pixels (numbers do not kern, so the sum equals the run width).
+export function gdiWidth(display: string, measure: (text: string) => number, scale = 1): number {
+  let total = 0
+  for (const glyph of display) total += Math.round(measure(glyph) * scale)
+  return total
 }
 
 /// True for the faces whose GDI digit width is pinned em-exactly: when
 /// the genuine face is installed the scale clamps to exactly 1, but the
-/// measurement still matches Excel, so the digit-slack rule (not the noise
-/// band) applies. Deliberately NOT the wider MDW table — extending Excel's
-/// digit-slack semantics to every Calibri cell needs more calibration
-/// samples than the one Yu Gothic ref that pinned it.
+/// measurement still matches Excel, so the exact GDI rule (not the noise
+/// band) applies. Deliberately NOT the wider MDW table — extending the
+/// exact rule to every Calibri cell needs more calibration samples.
 export function hasGdiDigitCalibration(family: string | undefined): boolean {
   return family !== undefined && SUBSTITUTED_DIGIT_PER_PT[family] !== undefined
 }
@@ -704,6 +728,7 @@ export function installNumberFormatFix(
   const interceptorService = injector.get(SheetInterceptorService)
   const cfService = injector.get(ConditionalFormattingService)
   const cache = new Map<string, string | null>()
+  const stopSeparatorWatch = onNumberSeparatorsChange(() => cache.clear())
   // Below the value fixes (9.5) so it sees the final displayed text.
   const yenFix = interceptorService.intercept(INTERCEPTOR_POINT.CELL_CONTENT, {
     priority: 9.4,
@@ -949,6 +974,7 @@ export function installNumberFormatFix(
     dispose() {
       valueFix.dispose()
       yenFix.dispose()
+      stopSeparatorWatch()
     },
   }
 }

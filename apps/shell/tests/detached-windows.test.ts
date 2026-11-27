@@ -74,6 +74,7 @@ const cursor = { x: 0, y: 0 }
 const workArea = { x: 0, y: 0, width: 2000, height: 1200 }
 
 vi.mock('electron', () => ({
+  app: { on: vi.fn(), quit: vi.fn() },
   BrowserWindow: FakeWindow,
   screen: {
     getCursorScreenPoint: () => ({ ...cursor }),
@@ -251,6 +252,89 @@ describe('close guard', () => {
     expect(win.destroyed).toBe(true)
   })
 
+  // app.quit() runs before-quit, then closes every window in the same pass
+  const beginQuit = async () => {
+    const { app } = await import('electron')
+    // the shell window's guard creates the tracker at startup
+    ;(await import('../src/main/window-close-guard')).shellQuitTracker()
+    // the tracker of this test's module instance registered last
+    const registered = vi.mocked(app.on).mock.calls.filter(([name]) => name === 'before-quit')
+    vi.mocked(app.quit).mockClear()
+    ;(registered[registered.length - 1]![1] as () => void)()
+    return app
+  }
+  const openClean = (id: number) => {
+    detached.createDetachedEditorWindow({
+      view: fakeView(id) as never,
+      kind: 'docs',
+      title: `${id}.docx`,
+      applyMenuFor: () => {},
+    })
+    return instances[instances.length - 1]!
+  }
+
+  it('a quit that this window cancelled is issued again once the window may close', async () => {
+    const win = openClean(8)
+    const app = await beginQuit()
+    win.emit('close', { preventDefault: vi.fn() })
+    await flush()
+    expect(win.destroyed).toBe(true)
+    expect(app.quit).toHaveBeenCalledTimes(1)
+  })
+
+  it('closing the window alone quits nothing', async () => {
+    const win = openClean(9)
+    const { app } = await import('electron')
+    vi.mocked(app.quit).mockClear()
+    win.emit('close', { preventDefault: vi.fn() })
+    await flush()
+    expect(win.destroyed).toBe(true)
+    expect(app.quit).not.toHaveBeenCalled()
+  })
+
+  it('a denied prompt leaves the quit cancelled, also for a later close', async () => {
+    const { docsQueryDirty, requestDocsClose } = await import('../../docs/src/main/docs-main')
+    vi.mocked(docsQueryDirty).mockResolvedValueOnce(true).mockResolvedValueOnce(true)
+    vi.mocked(requestDocsClose).mockResolvedValueOnce(false)
+    const win = openClean(10)
+    const app = await beginQuit()
+    win.emit('close', { preventDefault: vi.fn() })
+    await flush()
+    expect(win.destroyed).toBe(false)
+    expect(app.quit).not.toHaveBeenCalled()
+
+    vi.mocked(requestDocsClose).mockResolvedValueOnce(true)
+    win.emit('close', { preventDefault: vi.fn() })
+    await flush()
+    expect(win.destroyed).toBe(true)
+    expect(app.quit).not.toHaveBeenCalled()
+  })
+
+  it('with two windows the quit goes through after the second one has answered', async () => {
+    const { docsQueryDirty, requestDocsClose } = await import('../../docs/src/main/docs-main')
+    vi.mocked(docsQueryDirty).mockResolvedValueOnce(true).mockResolvedValueOnce(true)
+    let answerSecond = (_ok: boolean): void => {}
+    vi.mocked(requestDocsClose)
+      .mockResolvedValueOnce(true)
+      .mockReturnValueOnce(new Promise<boolean>((resolve) => (answerSecond = resolve)))
+    const first = openClean(11)
+    const second = openClean(12)
+    const app = await beginQuit()
+    first.emit('close', { preventDefault: vi.fn() })
+    second.emit('close', { preventDefault: vi.fn() })
+    await flush()
+    expect(first.destroyed).toBe(true)
+    expect(app.quit).toHaveBeenCalledTimes(1)
+    // that quit reaches the second window while its prompt is still open
+    const again = { preventDefault: vi.fn() }
+    second.emit('close', again)
+    expect(again.preventDefault).toHaveBeenCalled()
+    answerSecond(true)
+    await flush()
+    expect(second.destroyed).toBe(true)
+    expect(app.quit).toHaveBeenCalledTimes(2)
+  })
+
   it('docs never has its webContents closed: the teardown path owns it', async () => {
     const { teardownDocsRenderer } = await import('../../docs/src/main/docs-main')
     const view = fakeView(7)
@@ -284,6 +368,26 @@ describe('focused window as menu target', () => {
       filePath: '/tmp/scan.pdf',
     })
     expect(detached.focusedDetachedKind()).toBe('pdf')
+  })
+
+  it('lists the windows of a kind for window switching, with the one that has the keys', () => {
+    for (const [id, kind] of [
+      [21, 'docs'],
+      [22, 'sheets'],
+      [23, 'docs'],
+    ] as const) {
+      detached.createDetachedEditorWindow({
+        view: fakeView(id) as never,
+        kind,
+        title: `window ${id}`,
+        applyMenuFor: () => {},
+      })
+    }
+    instances.at(-1)!.focused = true
+    expect(detached.detachedTabsOf('docs')).toEqual([
+      { id: 'detached:21', title: 'window 21', focused: false },
+      { id: 'detached:23', title: 'window 23', focused: true },
+    ])
   })
 
   it('claims the slides menu target on focus', async () => {
@@ -324,6 +428,13 @@ describe('tear-off', () => {
 
     detached.dragTornWindow(560, 340)
     expect(win.setPosition).toHaveBeenLastCalledWith(x0 + 60, y0 + 40)
+
+    // steered to the screen edge: a (-0.5, 0) offset must not reach Electron as -0
+    detached.dragTornWindow(500 - x0 - 0.25, 300 - y0 - 0.25)
+    const [ex, ey] = win.setPosition.mock.lastCall as [number, number]
+    expect(Object.is(ex, -0)).toBe(false)
+    expect(Object.is(ey, -0)).toBe(false)
+    expect([ex, ey]).toEqual([0, 0])
 
     detached.endTornDrag()
     expect(win.focus).toHaveBeenCalled()
@@ -385,6 +496,35 @@ describe('tear-off', () => {
     cursor.y = 20
     instances[0]!.emit('move')
     expect(host.preview).not.toHaveBeenCalled()
+  })
+})
+
+describe('releaseDetachedOf', () => {
+  it('hands back every window of the kind with its live view and leaves the other kinds open', () => {
+    const views = [fakeView(21), fakeView(22), fakeView(23)]
+    const open = (view: (typeof views)[number], kind: 'docs' | 'pdf', title: string) =>
+      detached.createDetachedEditorWindow({
+        view: view as never,
+        kind,
+        title,
+        filePath: `/tmp/${title}`,
+        applyMenuFor: () => {},
+      })
+    open(views[0]!, 'docs', 'a.docx')
+    open(views[1]!, 'pdf', 'scan.pdf')
+    open(views[2]!, 'docs', 'b.docx')
+
+    const tabs = detached.releaseDetachedOf('docs')
+    expect(tabs.map((tab) => tab.title)).toEqual(['a.docx', 'b.docx'])
+    expect(tabs.map((tab) => tab.view)).toEqual([views[0], views[2]])
+    expect(tabs[0]).toMatchObject({ kind: 'docs', filePath: '/tmp/a.docx' })
+    expect(instances.map((win) => win.destroyed)).toEqual([true, false, true])
+    expect(instances[0]!.contentView.removeChildView).toHaveBeenCalledWith(views[0])
+    // the renderers stay alive: nothing was closed or asked to save
+    for (const view of views) expect(view.webContents.close).not.toHaveBeenCalled()
+    expect(detached.isDetachedTabId('detached:21')).toBe(false)
+    expect(detached.isDetachedTabId('detached:22')).toBe(true)
+    expect(detached.releaseDetachedOf('docs')).toEqual([])
   })
 })
 

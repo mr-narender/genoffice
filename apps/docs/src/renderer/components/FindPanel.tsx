@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Editor } from '@tiptap/core'
-import { TextSelection, type Transaction } from '@tiptap/pm/state'
+import type { Transaction } from '@tiptap/pm/state'
 import { useI18n, type StringKey } from '../i18n/locale'
 import { searchPluginKey } from '../editor/extensions'
+import { HEADING_BODY_KEEP } from '../editor/heading-collapse'
 import {
   HIGHLIGHT_CAP,
   RESULTS_LIST_CAP,
@@ -18,15 +19,10 @@ import {
 } from '../editor/find'
 import {
   GOTO_TARGETS,
-  blockIndexAtPos,
-  lineCounts,
-  lineIndexAtPos,
-  linePosition,
+  goToPosition,
+  jumpTo,
   listGoToItems,
-  pageOfBlock,
-  pagePositions,
-  resolveGoToIndex,
-  sectionPositions,
+  setBrowseObject,
   type GoToTarget,
   type PageLayout,
 } from '../editor/goto'
@@ -60,6 +56,8 @@ interface FindPanelProps {
   focusReplaceNonce?: number
   /** Go To shortcut / menu: switch to the Go To tab */
   focusGoToNonce?: number
+  /** Find Next / Find Previous from the menu: each new nonce steps once in that direction */
+  stepRequest?: { dir: 1 | -1; nonce: number } | null
   /** last pagination pass, for page / section / line targets */
   layout?: () => PageLayout | null
 }
@@ -86,29 +84,17 @@ const TARGET_KEYS: Record<GoToTarget, StringKey> = {
   comment: 'appGoToComment',
   footnote: 'appGoToFootnote',
   endnote: 'appGoToEndnote',
+  field: 'ribbonField',
   table: 'appGoToTable',
+  graphic: 'appGoToGraphic',
+  equation: 'ribbonCaptionEquation',
+  object: 'appGoToObject',
   heading: 'appGoToHeading',
 }
 
 /** index of the last item at or before the caret, -1 when none */
-function lastAtOrBefore(positions: Array<number | null>, caret: number): number {
-  let idx = -1
-  positions.forEach((p, i) => {
-    if (p !== null && p <= caret) idx = i
-  })
-  return idx
-}
-
-/** place the caret at `pos` (nearest valid text position) and bring it on screen */
-function jumpTo(editor: Editor, pos: number): void {
-  const { state, view } = editor
-  const clamped = Math.max(0, Math.min(pos, state.doc.content.size))
-  const sel = TextSelection.near(state.doc.resolve(clamped), 1)
-  view.dispatch(state.tr.setSelection(sel).scrollIntoView())
-  const { node } = view.domAtPos(sel.from)
-  const el = node instanceof HTMLElement ? node : node.parentElement
-  el?.scrollIntoView({ block: 'center' })
-}
+// the scan a closed panel left running to keep its hits; a later close or search drops it
+let lateKeep: { aborted: boolean } | null = null
 
 export function FindPanel({
   editor,
@@ -116,6 +102,7 @@ export function FindPanel({
   focusFindNonce,
   focusReplaceNonce,
   focusGoToNonce,
+  stepRequest,
   layout,
 }: FindPanelProps) {
   const { t } = useI18n()
@@ -140,6 +127,12 @@ export function FindPanel({
   const indexRef = useRef(0)
   const matchesRef = useRef<FindMatch[]>([])
   const scanTokenRef = useRef<{ aborted: boolean } | null>(null)
+  // Word's "Current Selection" scope: the range chosen when the scope was set, kept in step with edits
+  const scopeRef = useRef<Range | null>(null)
+  const [inSelection, setInSelection] = useState(false)
+  // Word's "Highlight all items found in": the hits stay marked on the page once the panel is closed
+  const [highlightAll, setHighlightAll] = useState(false)
+  const [hasSelection, setHasSelection] = useState(() => !editor.state.selection.empty)
 
   const options = useMemo<FindOptions>(
     () => ({ matchCase, wholeWord, mode, matchWidth }),
@@ -167,7 +160,9 @@ export function FindPanel({
   )
 
   const commit = useCallback(
-    (ranges: FindMatch[], keepIndex: number) => {
+    (found: FindMatch[], keepIndex: number) => {
+      const scope = scopeRef.current
+      const ranges = scope ? found.filter((m) => m.from >= scope.from && m.to <= scope.to) : found
       const active = ranges.length === 0 ? 0 : Math.min(keepIndex, ranges.length - 1)
       setMatches(ranges)
       matchesRef.current = ranges
@@ -185,6 +180,7 @@ export function FindPanel({
     (q: string, keepIndex = 0, opts: FindOptions = options): FindMatch[] | null => {
       if (scanTokenRef.current) scanTokenRef.current.aborted = true
       scanTokenRef.current = null
+      if (lateKeep) lateKeep.aborted = true
       setScanning(false)
       // hits of a superseded query must never drive Next / Replace
       matchesRef.current = []
@@ -305,13 +301,68 @@ export function FindPanel({
     }
   }, [editor, scheduleRefresh])
 
+  useEffect(() => {
+    const onTransaction = ({ transaction }: { transaction: Transaction }) => {
+      const scope = scopeRef.current
+      if (scope && transaction.docChanged)
+        scopeRef.current = {
+          from: transaction.mapping.map(scope.from, -1),
+          to: transaction.mapping.map(scope.to, 1),
+        }
+    }
+    const onSelection = () => setHasSelection(!editor.state.selection.empty)
+    editor.on('transaction', onTransaction)
+    editor.on('selectionUpdate', onSelection)
+    return () => {
+      editor.off('transaction', onTransaction)
+      editor.off('selectionUpdate', onSelection)
+    }
+  }, [editor])
+
+  const pickScope = (selection: boolean) => {
+    const { from, to, empty } = editor.state.selection
+    if (selection && empty) return
+    scopeRef.current = selection ? { from, to } : null
+    setInSelection(selection)
+    refresh(query)
+  }
+
   const close = useCallback(() => {
+    // a query typed just before closing has not been scanned yet
+    if (highlightAll) flushPending(queryRef.current)
     if (timerRef.current !== null) window.clearTimeout(timerRef.current)
     timerRef.current = null
-    if (scanTokenRef.current) scanTokenRef.current.aborted = true
-    highlight([], 0)
+    const keep = (ranges: FindMatch[]) =>
+      editor.view.dispatch(
+        editor.state.tr.setMeta(searchPluginKey, {
+          ranges: ranges.slice(0, HIGHLIGHT_CAP),
+          activeIndex: -1,
+          kept: true,
+        }),
+      )
+    const running = scanTokenRef.current
+    if (running) running.aborted = true
+    if (lateKeep) lateKeep.aborted = true
+    lateKeep = null
+    const compiled = highlightAll && running ? compileFind(queryRef.current, options) : null
+    if (compiled?.ok) {
+      // a large document is still being scanned: its hits are kept once the scan ends
+      highlight([], 0)
+      const doc = editor.state.doc
+      const scope = scopeRef.current
+      const { selection } = editor.state
+      const late = (lateKeep = { aborted: false })
+      void findInDocAsync(doc, compiled.query, options, late).then((found) => {
+        if (!found || editor.isDestroyed || editor.state.doc !== doc) return
+        // a click, a caret move or a new search since then has moved on from this one
+        if (!editor.state.selection.eq(selection)) return
+        if (searchPluginKey.getState(editor.state)?.find().length) return
+        keep(scope ? found.filter((m) => m.from >= scope.from && m.to <= scope.to) : found)
+      })
+    } else if (highlightAll && matchesRef.current.length > 0) keep(matchesRef.current)
+    else highlight([], 0)
     onClose()
-  }, [highlight, onClose])
+  }, [editor, flushPending, highlight, highlightAll, onClose, options])
 
   const setOption = (next: Partial<FindOptions>) => {
     const merged = { ...options, ...next }
@@ -338,6 +389,7 @@ export function FindPanel({
       if (scanTokenRef.current) return
       const ranges = fresh ? fresh.ranges : matchesRef.current
       if (ranges.length === 0) return
+      setBrowseObject('find')
       // A flushed scan for a new query already landed on the first match — Enter should
       // visit it, not skip past it. A keep-current refresh (document changed underneath)
       // must still move in the requested direction from the refreshed position.
@@ -348,13 +400,20 @@ export function FindPanel({
     },
     [flushPending, query, goTo],
   )
+  const stepRef = useRef(step)
+  stepRef.current = step
+  const stepNonce = stepRequest?.nonce ?? 0
+  const stepDir = stepRequest?.dir ?? 1
+  useEffect(() => {
+    if (stepNonce) stepRef.current(stepDir)
+  }, [stepNonce, stepDir])
 
   /** insert the replacement, splitting the block wherever the template had a paragraph mark */
   const applyReplacement = useCallback(
     (tr: Transaction, m: FindMatch) => {
       const segs = expandReplacement(replacement, m, mode)
       const joined = segs.join('\u0000')
-      tr.insertText(joined, m.from, m.to)
+      tr.insertText(joined, m.from, m.to).setMeta(HEADING_BODY_KEEP, true)
       const splitsAt: number[] = []
       let offset = 0
       for (let k = 0; k < segs.length - 1; k++) {
@@ -415,43 +474,16 @@ export function FindPanel({
   )
 
   const runGoTo = (dir: 1 | -1, explicit = false) => {
-    const lay = layout?.() ?? null
-    const caret = editor.state.selection.from
-    const view = editor.view
-    let positions: Array<number | null>
-    let current: number
-    if (target === 'page' || target === 'section') {
-      if (!lay) return setGotoMiss(true)
-      positions = target === 'page' ? pagePositions(view, lay) : sectionPositions(view, lay)
-      const bi = blockIndexAtPos(view, lay, caret)
-      current =
-        target === 'page'
-          ? pageOfBlock(lay, Math.max(bi, 0)) - 1
-          : Math.max(0, lastAtOrBefore(positions, caret))
-    } else if (target === 'line') {
-      if (!lay) return setGotoMiss(true)
-      const total = lineCounts(lay).reduce((a, b) => a + b, 0)
-      current = lineIndexAtPos(view, lay, caret)
-      const idx = resolveGoToIndex(explicit ? gotoInput : '', current, total, dir)
-      if (idx === null) return setGotoMiss(true)
-      const pos = linePosition(view, lay, idx + 1)
-      if (pos === null) return setGotoMiss(true)
-      setGotoMiss(false)
-      jumpTo(editor, pos)
-      return
-    } else {
-      positions = gotoItems.map((i) => i.pos)
-      current = lastAtOrBefore(positions, caret)
-    }
-    let idx: number | null
-    if (target === 'bookmark' && explicit && gotoInput) {
-      idx = gotoItems.findIndex((i) => i.label === gotoInput)
-      if (idx < 0) idx = null
-    } else idx = resolveGoToIndex(explicit ? gotoInput : '', current, positions.length, dir)
-    const pos = idx === null ? null : positions[idx]
-    if (pos === null || pos === undefined) return setGotoMiss(true)
-    setGotoMiss(false)
-    jumpTo(editor, pos)
+    setBrowseObject(target)
+    const pos = goToPosition(
+      editor.view,
+      layout?.() ?? null,
+      target,
+      dir,
+      explicit ? gotoInput : '',
+    )
+    setGotoMiss(pos === null)
+    if (pos !== null) jumpTo(editor.view, pos)
   }
 
   const chip = (on: boolean, label: string, tip: StringKey, onClick: () => void) => (
@@ -487,7 +519,9 @@ export function FindPanel({
             className={`find-tab ${tab === k ? 'on' : ''}`}
             onClick={() => {
               setTab(k)
-              focusTabInput(k)
+              // Word/Excel parity: entering Replace keeps the caret in the
+              // find field — the search term comes before its replacement
+              focusTabInput(k === 'replace' ? 'find' : k)
             }}
           >
             {t(
@@ -572,6 +606,32 @@ export function FindPanel({
                 {t('appFindResults', { count: matches.length })}
               </button>
             )}
+          </div>
+          <div className="find-row find-scope">
+            <label className="find-hint find-highlight-all">
+              <input
+                type="checkbox"
+                name="find-highlight-all"
+                checked={highlightAll}
+                onChange={(e) => setHighlightAll(e.target.checked)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') close()
+                }}
+              />
+              {t('appFindHighlightAll')}
+            </label>
+            <select
+              className="find-select"
+              name="find-scope"
+              aria-label={t('appFindHighlightAll')}
+              value={inSelection ? 'selection' : 'main'}
+              onChange={(e) => pickScope(e.target.value === 'selection')}
+            >
+              <option value="main">{t('ribbonPbApplyWhole')}</option>
+              <option value="selection" disabled={!inSelection && !hasSelection}>
+                {t('appFindInSelection')}
+              </option>
+            </select>
           </div>
           {error && (
             <div className="find-error" role="alert">

@@ -3,6 +3,9 @@ import type { Node as PmNode } from '@tiptap/pm/model'
 import type { Transaction } from '@tiptap/pm/state'
 import type { NoteInfo, NoteRun } from '@genoffice/docx-engine'
 import { posAfterText } from './after-text'
+import { refreshNoteRefFields } from '../editor/note-ref-fields'
+import { assignNoteNumbers, noteNumbering, type NoteSection } from '../note-format'
+import { topBlockSections } from '../editor/section-endnotes'
 
 export type NoteKind = 'footnote' | 'endnote'
 
@@ -167,14 +170,53 @@ export function noteInsertPos(
   return posAfterText(block, start + 1, afterText, `block ${blockIndex}`)
 }
 
-function renumber(tr: Transaction, kind: NoteKind): void {
-  let num = 0
-  tr.doc.descendants((node, pos) => {
-    if (node.type.name !== 'docNoteRef' || node.attrs.kind !== kind) return true
-    num++
-    if (node.attrs.num !== num) tr.setNodeMarkup(pos, undefined, { ...node.attrs, num })
-    return false
+/**
+ * The section each top-level block's notes are numbered in. A block that is
+ * not in the file yet and follows a saved section-break paragraph is in the
+ * section that break opens: that is where a save puts it.
+ */
+export function noteBlockSections(doc: PmNode, sections: readonly NoteSection[]): number[] {
+  const { sectionOf } = topBlockSections(doc, sections)
+  const last = Math.max(sections.length - 1, 0)
+  let afterBreak = false
+  doc.forEach((block, _offset, index) => {
+    const docxIndex = block.attrs.docxIndex
+    if (typeof docxIndex === 'number') {
+      const sec = sections[sectionOf[index]!]
+      afterBreak = !!sec && sec.lastBlockIndex === docxIndex && !sec.pendingBreak
+    } else if (afterBreak) sectionOf[index] = Math.min(sectionOf[index]! + 1, last)
   })
+  return sectionOf
+}
+
+/**
+ * Rewrite every reference mark of `kind` in `tr` to its number under its
+ * section's note properties (assignNoteNumbers); custom marks are skipped.
+ * `fmt` rides on the mark: the section's number format, which also redraws it.
+ */
+export function renumber(tr: Transaction, kind: NoteKind): void {
+  const { sections, of, pageOf } = noteNumbering(kind)
+  const sectionOf = noteBlockSections(tr.doc, sections)
+  const marks: Array<{ pos: number; node: PmNode; id: string; section: number }> = []
+  tr.doc.forEach((block, offset, index) => {
+    const section = sectionOf[index] ?? 0
+    block.descendants((node, pos) => {
+      if (node.type.name !== 'docNoteRef' || node.attrs.kind !== kind) return true
+      if (node.attrs.mark == null)
+        marks.push({ pos: offset + 1 + pos, node, id: String(node.attrs.id), section })
+      return false
+    })
+  })
+  const shown = assignNoteNumbers(
+    marks.map(({ id, section }) => ({ id, section, page: pageOf(id) })),
+    of,
+  )
+  for (const { pos, node, id } of marks) {
+    const mark = shown.get(id)!
+    if (node.attrs.num !== mark.num || node.attrs.fmt !== mark.fmt)
+      tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...mark })
+  }
+  refreshNoteRefFields(tr)
 }
 
 /** insert the reference mark and renumber the marks of that kind in document order */

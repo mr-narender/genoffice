@@ -18,17 +18,37 @@ function parsedDoc(opts: {
   for (const s of opts.styles ?? []) styles.set(s.styleId, s)
   return {
     styles,
-    docDefaults: opts.docDefaults ?? {},
+    docDefaults: opts.docDefaults ?? { lang: 'en-US' },
     blocks: [],
     ...(opts.autoHyphenation ? { autoHyphenation: true } : {}),
   } as unknown as ParsedDocFull
 }
 
-const AUTO = '.doc-page { hyphens:auto; -webkit-hyphens:auto }'
+const AUTO = '.doc-page { hyphens:auto; -webkit-hyphens:auto; --doc-shy:"\\AD" }'
 
 describe('autoHyphenation CSS', () => {
   it('emits document-wide hyphens:auto for plain autoHyphenation', () => {
-    expect(docStyleCss(parsedDoc({ autoHyphenation: true }))).toContain(AUTO)
+    const css = docStyleCss(parsedDoc({ autoHyphenation: true }))
+    expect(css).toContain(AUTO)
+    // the strips and notes beside the editor root draw our break points too
+    expect(css).toContain('.page-wrap, .pv-page { --doc-shy:"\\AD" }')
+  })
+
+  it('leaves Chromium out of a document that declares no language and still draws our break points', () => {
+    const css = docStyleCss(parsedDoc({ autoHyphenation: true, docDefaults: {} }))
+    expect(css).not.toContain('hyphens:auto')
+    // a run or a style may name a language of its own (editor/hyphenation.ts)
+    expect(css).toContain('.doc-page { --doc-shy:"\\AD" }')
+    const normal = {
+      styleId: 'Normal',
+      name: 'Normal',
+      type: 'paragraph',
+      isDefault: true,
+      display: { lang: 'de-DE' },
+    } as StyleInfo
+    expect(
+      docStyleCss(parsedDoc({ autoHyphenation: true, docDefaults: {}, styles: [normal] })),
+    ).toContain(AUTO)
   })
 
   it('emits nothing without autoHyphenation', () => {
@@ -64,7 +84,7 @@ describe('autoHyphenation CSS', () => {
     const css = docStyleCss(
       parsedDoc({
         autoHyphenation: true,
-        docDefaults: { suppressAutoHyphens: true },
+        docDefaults: { lang: 'en-US', suppressAutoHyphens: true },
         styles: [
           {
             styleId: 'Normal',
@@ -101,8 +121,12 @@ describe('autoHyphenation CSS', () => {
         ],
       }),
     )
-    expect(css).toContain('[data-style="NoHyph"] { hyphens:manual;-webkit-hyphens:manual }')
-    expect(css).toContain('[data-style="ReHyph"] { hyphens:auto;-webkit-hyphens:auto }')
+    expect(css).toContain(
+      '[data-style="NoHyph"] { hyphens:manual;-webkit-hyphens:manual;--doc-shy:none }',
+    )
+    expect(css).toContain(
+      '[data-style="ReHyph"] { hyphens:auto;-webkit-hyphens:auto;--doc-shy:"\\AD" }',
+    )
   })
 
   it('style values are inert without autoHyphenation', () => {

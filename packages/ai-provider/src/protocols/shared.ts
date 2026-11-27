@@ -1,4 +1,5 @@
 import type { AgentToolCall } from '@genoffice/agent-core'
+import type { AiTokenUsage } from '../types'
 
 // ---- endpoint URL composition ----
 
@@ -156,6 +157,75 @@ export async function* sseLines(
  */
 export const MAX_TOOL_JSON_CHARS = 512_000
 
+export interface SseDataEvent {
+  raw: string
+  /** Parsed JSON body, undefined for a non-JSON payload such as `[DONE]` or a keep-alive. */
+  json: unknown
+}
+
+/**
+ * Frames the `data:` payloads of an SSE stream into whole events.
+ *
+ * A server may split one JSON body across several `data:` lines (one event, joined
+ * with a newline), or close every event with a single newline and no blank line at
+ * all. So a value that already parses as JSON is dispatched on its own and only
+ * fragments are held back and joined. The parsed body rides along so callers do
+ * not parse twice. `[DONE]` counts as whole: holding it back as a fragment left a
+ * newline-only stream that keeps its socket open waiting forever.
+ */
+export async function* sseDataEvents(
+  body: NodeJS.ReadableStream | ReadableStream<Uint8Array>,
+  onBytes?: () => void,
+): AsyncGenerator<SseDataEvent> {
+  let parts: string[] = []
+  const flush = (): SseDataEvent | undefined => {
+    if (!parts.length) return undefined
+    const raw = parts.join('\n')
+    parts = []
+    return { raw, json: parseJson(raw) }
+  }
+  for await (const line of sseLines(body, onBytes)) {
+    if (!line.startsWith('data:')) {
+      const held = flush()
+      if (held) yield held
+      continue
+    }
+    const raw = line.slice(5).trim()
+    if (!raw) continue
+    const json = parseJson(raw)
+    if (raw === '[DONE]' || json !== undefined) {
+      const held = flush()
+      if (held) yield held
+      yield { raw, json }
+      continue
+    }
+    // Only a JSON opener starts a fragment; anything else alone is a keep-alive.
+    if (!parts.length && !/^[[{]/.test(raw)) {
+      yield { raw, json }
+      continue
+    }
+    parts.push(raw)
+    // Dispatch as soon as the joined fragments form a body, so a later keep-alive
+    // is not glued onto it.
+    const joined = parts.join('\n')
+    const whole = parseJson(joined)
+    if (whole !== undefined) {
+      parts = []
+      yield { raw: joined, json: whole }
+    }
+  }
+  const held = flush()
+  if (held) yield held
+}
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
+
 export function throwIfToolJsonOverBudget(jsonLength: number, provider: string): void {
   if (jsonLength > MAX_TOOL_JSON_CHARS) {
     throw new Error(
@@ -188,6 +258,8 @@ export interface StreamCallbacks {
   onReasoningDelta?: (text: string) => void
   /** normalized stop reason ('max_tokens' when the output was cut off by the token limit) */
   onStopReason?: (reason: string) => void
+  /** tokens the provider billed for this turn; fires once at stream end when the provider reports usage at all */
+  onUsage?: (usage: AiTokenUsage) => void
   /** bytes arrived on the wire (fires per network chunk, including SSE pings; used for keepalive) */
   onActivity?: () => void
   /** Stable renderer transport id for providers with native sessions. */
@@ -195,17 +267,51 @@ export interface StreamCallbacks {
   signal: AbortSignal
 }
 
+/** Coerce a provider's usage figure (number on the wire, sometimes a numeric string) to a finite count. */
+export function usageCount(value: unknown): number | undefined {
+  const n = typeof value === 'string' ? Number(value) : value
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined
+}
+
+/** OpenAI-shaped usage (Chat Completions and Responses name the same figures differently). */
+export function openAiUsage(
+  input: unknown,
+  output: unknown,
+  details: { cached_tokens?: unknown } | null | undefined,
+): AiTokenUsage | undefined {
+  const usage: AiTokenUsage = {}
+  const inputTokens = usageCount(input)
+  const outputTokens = usageCount(output)
+  const cached = usageCount(details?.cached_tokens)
+  if (inputTokens !== undefined) usage.inputTokens = inputTokens
+  if (outputTokens !== undefined) usage.outputTokens = outputTokens
+  if (cached !== undefined) usage.cacheReadTokens = cached
+  return inputTokens !== undefined || outputTokens !== undefined ? usage : undefined
+}
+
+/** `, "key":` right after a quote: the string ended and the next member starts. */
+const KEY_BOUNDARY = /^\s*,\s*"[^"\\\n]{1,64}"\s*:/
+
 /**
  * Models occasionally emit unescaped " inside string values (e.g. English quotes in Chinese copy).
  * Single-pass scan: a " inside a string whose next non-whitespace char is not structural gets escaped.
+ *
+ * A low-9 opening quote („, U+201E: Hungarian, German, Czech, Polish…) is often closed with a plain
+ * " (`„Minta Kft", a…`, `a „hónap terméke": …`). While such a quote is open, the next " is its
+ * closer and is escaped even when a comma or colon follows it. `lowQuotes: false` turns that off, for
+ * the rare value that opens „ and never closes it.
  */
-function repairUnescapedQuotes(json: string): string {
+function repairUnescapedQuotes(json: string, lowQuotes = true): string {
   let out = ''
   let inStr = false
+  let lowQuoteOpen = false
   for (let i = 0; i < json.length; i++) {
     const c = json[i]!
     if (!inStr) {
-      if (c === '"') inStr = true
+      if (c === '"') {
+        inStr = true
+        lowQuoteOpen = false
+      }
       out += c
       continue
     }
@@ -213,7 +319,17 @@ function repairUnescapedQuotes(json: string): string {
       out += c + (json[++i] ?? '')
       continue
     }
+    if (c === '\u201E') lowQuoteOpen = lowQuotes
+    else if (c === '\u201D' || c === '\u201C') lowQuoteOpen = false
     if (c === '"') {
+      // A " that starts the next key (`", "key":`) is never a low-9 closer: escaping it would
+      // swallow the key into this value and parse as wrong data instead of failing.
+      if (lowQuoteOpen && !KEY_BOUNDARY.test(json.slice(i + 1, i + 80))) {
+        lowQuoteOpen = false
+        out += '\\"'
+        continue
+      }
+      lowQuoteOpen = false
       let j = i + 1
       while (j < json.length && ' \n\r\t'.includes(json[j]!)) j++
       const next = json[j]
@@ -308,6 +424,22 @@ export function throwIfCreditsNotice(bodyText: string): void {
   if (notice) throw new AiCreditsError(notice)
 }
 
+/** A swallowed member boundary inside a string: `…", "key": …`. */
+const SWALLOWED_MEMBER = /",\s*"[\w.-]{1,64}"\s*:/
+
+/**
+ * A repair that parsed but merged two members into one, or turned value text into a key, is
+ * wrong data; failing lets the loop ask the model again instead.
+ */
+function looksMisrepaired(value: unknown): boolean {
+  if (typeof value === 'string') return SWALLOWED_MEMBER.test(value)
+  if (Array.isArray(value)) return value.some(looksMisrepaired)
+  if (value && typeof value === 'object') {
+    return Object.entries(value).some(([k, v]) => /[",]/.test(k) || looksMisrepaired(v))
+  }
+  return false
+}
+
 /** Don't throw on parse failure (it would kill the whole stream); return error so the loop feeds it back for retry */
 export function parseToolInput(json: string): { input: Record<string, unknown>; error?: string } {
   if (!json.trim()) return { input: {} }
@@ -315,9 +447,19 @@ export function parseToolInput(json: string): { input: Record<string, unknown>; 
   try {
     parsed = JSON.parse(json)
   } catch (e) {
-    try {
-      parsed = JSON.parse(repairUnescapedQuotes(json))
-    } catch {
+    parsed = undefined
+    for (const lowQuotes of [true, false]) {
+      try {
+        const repaired: unknown = JSON.parse(repairUnescapedQuotes(json, lowQuotes))
+        if (!looksMisrepaired(repaired)) {
+          parsed = repaired
+          break
+        }
+      } catch {
+        // try the next repair
+      }
+    }
+    if (parsed === undefined) {
       const msg = e instanceof Error ? e.message : String(e)
       return { input: {}, error: `${msg}; raw: ${json.slice(0, 500)}` }
     }

@@ -18,6 +18,20 @@ const BLOCK_SDT_P =
   '</w:sdtContent>' +
   '</w:sdt>'
 
+/** Block-level SDT whose w:val attributes are single-quoted (also valid XML) */
+const SINGLE_QUOTED_SDT_P =
+  '<w:sdt>' +
+  '<w:sdtPr>' +
+  "<w:alias w:val='Binder'/>" +
+  "<w:tag w:val='tag1'/>" +
+  '<w:text/>' +
+  '</w:sdtPr>' +
+  '<w:sdtEndPr/>' +
+  '<w:sdtContent>' +
+  '<w:p><w:r><w:t>Jane Doe</w:t></w:r></w:p>' +
+  '</w:sdtContent>' +
+  '</w:sdt>'
+
 /** Block-level SDT with date picker */
 const DATE_SDT_P =
   '<w:sdt>' +
@@ -58,6 +72,14 @@ describe('SDT parsing', () => {
     expect(block.sdtShell!.alias).toBe('Author Name')
     expect(block.sdtShell!.tag).toBe('author')
     expect(block.sdtShell!.controlType).toBe('text')
+  })
+
+  it('reads a single-quoted w:alias and w:tag', async () => {
+    const doc = await parseDocx(await buildDocx({ bodyXml: SINGLE_QUOTED_SDT_P }))
+    const sdtShell = doc.blocks[0].sdtShell
+    expect(sdtShell).toBeDefined()
+    expect(sdtShell!.alias).toBe('Binder')
+    expect(sdtShell!.tag).toBe('tag1')
   })
 
   it('parses date SDT as controlType "date"', async () => {
@@ -301,5 +323,44 @@ describe('nested SDT (Word cover-page building blocks)', () => {
     const visible = doc.blocks.filter((b) => !b.hidden)
     expect(visible[0].type).toBe('passthrough')
     expect(visible[0].previewText).toContain('bare run text')
+  })
+})
+
+describe('block-level custom XML in tables', () => {
+  const custom = (inner: string) =>
+    '<w:customXml w:uri="urn:example" w:element="part">' +
+    '<w:customXmlPr><w:attr w:name="source" w:val="metadata-only"/></w:customXmlPr>' +
+    inner +
+    '</w:customXml>'
+
+  it.each(['row', 'cell', 'paragraph'] as const)(
+    'reads cell text through a wrapped %s',
+    async (level) => {
+      const para = '<w:p><w:r><w:t>Sample</w:t></w:r></w:p>'
+      const p = level === 'paragraph' ? custom(para) : para
+      const tc =
+        level === 'cell' ? custom(`<w:tc><w:tcPr/>${p}</w:tc>`) : `<w:tc><w:tcPr/>${p}</w:tc>`
+      const tr = level === 'row' ? custom(`<w:tr>${tc}</w:tr>`) : `<w:tr>${tc}</w:tr>`
+      const bodyXml =
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>' + tr + '</w:tbl>'
+
+      const doc = await parseDocx(await buildDocx({ bodyXml }))
+      const table = doc.blocks.find((b) => b.table)?.table
+      expect(table?.rows).toHaveLength(1)
+      expect(table?.rows[0]).toHaveLength(1)
+      expect(table?.rows[0][0].paras).toEqual(['Sample'])
+      expect(table?.rows[0][0].paras.join('')).not.toContain('metadata-only')
+    },
+  )
+
+  it('unwraps nested custom XML around an sdt-wrapped cell paragraph', async () => {
+    const p = custom(
+      '<w:sdt><w:sdtContent><w:p><w:r><w:t>Nested</w:t></w:r></w:p></w:sdtContent></w:sdt>',
+    )
+    const bodyXml =
+      '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>' +
+      `<w:tr><w:tc><w:tcPr/>${p}</w:tc></w:tr></w:tbl>`
+    const doc = await parseDocx(await buildDocx({ bodyXml }))
+    expect(doc.blocks.find((b) => b.table)?.table?.rows[0][0].paras).toEqual(['Nested'])
   })
 })

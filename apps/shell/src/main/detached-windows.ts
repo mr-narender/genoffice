@@ -24,8 +24,15 @@ import { markdownIsDirty, requestMarkdownClose } from '../../../markdown/src/mai
 import { htmlIsDirty, requestHtmlClose } from '../../../html/src/main/html-main'
 import { canonicalPath } from './tab-manager'
 import type { DetachedTab } from './tab-manager'
+import { shellQuitTracker } from './window-close-guard'
 import type { OpenDocumentTab, TabKind } from '../shared/tabs-api'
-import { DOCK_DWELL_MS, dockBand, pointInRect } from '../shared/tab-drag-geometry'
+import {
+  DOCK_BAND_SLACK,
+  DOCK_DWELL_MS,
+  dockBand,
+  isSettledRect,
+  pointInRect,
+} from '../shared/tab-drag-geometry'
 
 /**
  * Detached editor windows: a tab's live WebContentsView reparented into its
@@ -149,9 +156,51 @@ export function findDetachedTabByPath(
 
 /** the detached window hosting this webContents (dialog parenting: fromWebContents
  *  cannot resolve a WebContentsView's host) */
+export function detachedFileForWebContents(wcId: number): string | undefined {
+  return detached.get(wcId)?.filePath
+}
+
 export function detachedWindowForWebContents(wcId: number): BrowserWindow | undefined {
   const rec = detached.get(wcId)
   return rec && !rec.window.isDestroyed() ? rec.window : undefined
+}
+
+export function detachedWindowsOf(kind: TabKind): BrowserWindow[] {
+  const out: BrowserWindow[] = []
+  for (const rec of detached.values())
+    if (rec.kind === kind && !rec.released && !rec.window.isDestroyed()) out.push(rec.window)
+  return out
+}
+
+/** the detached windows of a kind as window-switching sees them, oldest first */
+export function detachedTabsOf(kind: TabKind): { id: string; title: string; focused: boolean }[] {
+  const out: { id: string; title: string; focused: boolean }[] = []
+  for (const [wcId, rec] of detached) {
+    if (rec.kind !== kind || rec.released || rec.window.isDestroyed()) continue
+    out.push({
+      id: ID_PREFIX + wcId,
+      title: rec.window.getTitle(),
+      focused: rec.window.isFocused(),
+    })
+  }
+  return out
+}
+
+/** takes the documents out of every detached window of a kind, closing the windows, for the shell to make tabs of */
+export function releaseDetachedOf(kind: TabKind): DetachedTab[] {
+  const out: DetachedTab[] = []
+  for (const rec of [...detached.values()]) {
+    if (rec.kind !== kind || rec.released || rec.window.isDestroyed() || torn?.rec === rec) continue
+    out.push(releaseDetached(rec))
+  }
+  return out
+}
+
+let dockingHeldUntil = 0
+
+/** a window moved by the app must not dock when it lands under the pointer */
+export function holdDocking(ms = 1500): void {
+  dockingHeldUntil = Date.now() + ms
 }
 
 /** editor kind of the focused detached window, if a detached window has focus */
@@ -360,7 +409,7 @@ function dockDetachedWindow(rec: DetachedRecord): void {
  * outside → clear both.
  */
 function trackDockHover(rec: DetachedRecord): void {
-  if (rec.released || !dockHost) return
+  if (rec.released || !dockHost || Date.now() < dockingHeldUntil) return
   const band = dockHost.band()
   const cursor = screen.getCursorScreenPoint()
   if (!band || !pointInRect(cursor.x, cursor.y, band)) {
@@ -379,11 +428,14 @@ function trackDockHover(rec: DetachedRecord): void {
   }, DOCK_DWELL_MS)
 }
 
-/** screen rect of the shell's dock band for a given shell window (null when hidden) */
-export function dockBandFor(shellWindow: BrowserWindow | null): Rectangle | null {
+/** screen rect of the shell's dock band for a given shell window (null when hidden).
+ *  `scale` is the live interface scale: the band has to cover the strip as it is
+ *  actually rendered, or a scaled-up strip outgrows the band and re-docking
+ *  misses. */
+export function dockBandFor(shellWindow: BrowserWindow | null, scale = 1): Rectangle | null {
   if (!shellWindow || shellWindow.isDestroyed() || !shellWindow.isVisible()) return null
   if (shellWindow.isMinimized()) return null
-  return dockBand(shellWindow.getContentBounds())
+  return dockBand(shellWindow.getContentBounds(), DOCK_BAND_SLACK, scale)
 }
 
 /** frame origin that puts the pointer (at) inside the new window's title bar,
@@ -392,7 +444,13 @@ function tearOffOrigin(at: { x: number; y: number }, size: { width: number; heig
   const area = screen.getDisplayNearestPoint(at).workArea
   const x = Math.min(Math.max(at.x - TEAR_GRAB.dx, area.x), area.x + area.width - size.width)
   const y = Math.min(Math.max(at.y - TEAR_GRAB.dy, area.y), area.y + area.height - size.height)
-  return { x: Math.round(x), y: Math.round(y) }
+  return { x: toInt(x), y: toInt(y) }
+}
+
+// Electron rejects -0 as an int argument ("conversion failure"); Math.round
+// yields -0 for values in (-0.5, 0), e.g. a window steered to the screen edge
+function toInt(v: number): number {
+  return Math.round(v) || 0
 }
 
 export function createDetachedEditorWindow(options: {
@@ -455,11 +513,21 @@ export function createDetachedEditorWindow(options: {
   const layout = () => {
     if (win.isDestroyed()) return
     const bounds = win.getContentBounds()
+    // A minimized or mid-restore window can report a degenerate client rect;
+    // applying it would blank the document view (the white screen after a
+    // Windows taskbar restore). Keep the last good layout instead.
+    if (!isSettledRect(bounds)) return
     view.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height })
   }
   // same Linux/X11 quirk as the shell window: `resize` fires before the WM
   // applies the new size, so a follow-up layout on the next tick is required
   win.on('resize', () => {
+    layout()
+    setImmediate(() => layout())
+  })
+  // a taskbar restore needs the same sync + next-tick reconciliation: on
+  // Windows the client bounds may not have settled when `restore` fires
+  win.on('restore', () => {
     layout()
     setImmediate(() => layout())
   })
@@ -506,14 +574,45 @@ export function createDetachedEditorWindow(options: {
   }
 
   // Unsaved-changes guard, same helpers as the tab close path.
+  // a second close event while the prompt is open must not re-enter the
+  // prompt (the same double-trigger the main window guards against)
+  let promptInFlight = false
+  let holdingQuit = false
+  const vetoQuit = (): void => {
+    resetSheetsShuttingDown()
+    shellQuitTracker().reset()
+  }
   win.on('close', (event) => {
     if (closeConfirmed || rec.released) return
+    const quitTracker = shellQuitTracker()
+    // cancelling the close also cancels an in-flight app.quit(): the quit is
+    // held here and issued again once this window may close, or the app is
+    // left running with no window (macOS)
     event.preventDefault()
+    if (quitTracker.quitting() && !holdingQuit) {
+      holdingQuit = true
+      quitTracker.hold()
+    }
+    if (promptInFlight) return
+    promptInFlight = true
     void (async () => {
-      // a denied close vetoes any quit that was in flight: the sheets close
-      // guard must prompt again on later closes instead of silently proceeding
-      if (await confirmDetachedClose(rec)) tearDown()
-      else resetSheetsShuttingDown()
+      try {
+        // a denied close vetoes any quit that was in flight: the sheets close
+        // guard must prompt again on later closes instead of silently proceeding
+        if (await confirmDetachedClose(rec)) {
+          tearDown()
+          if (quitTracker.quitting()) quitTracker.quit()
+        } else vetoQuit()
+      } catch (err) {
+        console.error('[shell] detached window close prompt failed:', err)
+        vetoQuit()
+      } finally {
+        promptInFlight = false
+        if (holdingQuit) {
+          holdingQuit = false
+          quitTracker.release()
+        }
+      }
     })()
   })
   win.on('closed', () => {
@@ -528,7 +627,7 @@ export function createDetachedEditorWindow(options: {
 /** steer the torn-off window after the held pointer (screen coordinates) */
 export function dragTornWindow(x: number, y: number): void {
   if (!torn || torn.rec.window.isDestroyed()) return
-  torn.rec.window.setPosition(Math.round(x - torn.grabDx), Math.round(y - torn.grabDy))
+  torn.rec.window.setPosition(toInt(x - torn.grabDx), toInt(y - torn.grabDy))
 }
 
 /** the pointer was released: the torn-off window is an ordinary detached window now */

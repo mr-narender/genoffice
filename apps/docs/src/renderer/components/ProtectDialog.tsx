@@ -20,6 +20,7 @@ import {
 } from '@genoffice/docx-engine'
 import { useI18n } from '../i18n/locale'
 import { FieldError, PasswordInput } from './PasswordInput'
+import { useModalKeys } from './modal-keys'
 
 /** every field: undefined = unchanged; null = remove; value = set */
 export interface ProtectDialogResult {
@@ -27,6 +28,8 @@ export interface ProtectDialogResult {
   writeProtection?: WriteProtection | null
   protection?: DocProtection | null
   removePersonalInfo?: boolean
+  /** per section: protected under forms protection (w:formProt); present when it changed */
+  sectionsProtected?: boolean[]
 }
 
 export const PROTECTION_MODES = ['trackedChanges', 'comments', 'readOnly', 'forms'] as const
@@ -52,6 +55,7 @@ export function ProtectDialog({
   encrypted,
   writeProtection,
   protection,
+  sectionsProtected = [],
   removePersonalInfo,
   onCancel,
   onApply,
@@ -60,6 +64,8 @@ export function ProtectDialog({
   encrypted: boolean
   writeProtection: WriteProtection | null
   protection: DocProtection | null
+  /** per section: protected when the document is protected for forms */
+  sectionsProtected?: boolean[]
   removePersonalInfo: boolean
   onCancel: () => void
   onApply: (result: ProtectDialogResult) => void
@@ -83,12 +89,19 @@ export function ProtectDialog({
   const [protectPwd, setProtectPwd] = useState(locked ? KEEP : '')
   const [unlockPwd, setUnlockPwd] = useState('')
   const [removePersonal, setRemovePersonal] = useState(removePersonalInfo)
+  const [sectionChecks, setSectionChecks] = useState(sectionsProtected)
+  const [showSections, setShowSections] = useState(false)
+  const sectionsChanged = sectionChecks.some((on, i) => on !== sectionsProtected[i])
   const [errorKey, setErrorKey] = useState<ErrorKey>('')
   const [busy, setBusy] = useState(false)
 
+  // which sections a forms protection covers is part of the restriction: it takes the password too
   const protectionChanged =
     protectOn !== wasEnforced ||
-    (protectOn && (mode !== protection?.edit || protectPwd !== (locked ? KEEP : '')))
+    (protectOn &&
+      (mode !== protection?.edit ||
+        protectPwd !== (locked ? KEEP : '') ||
+        (mode === 'forms' && sectionsChanged)))
 
   const submit = async () => {
     if (busy) return
@@ -139,6 +152,15 @@ export function ProtectDialog({
 
       if (removePersonal !== removePersonalInfo) {
         result.removePersonalInfo = removePersonal
+      }
+      // a forms protection that starts now covers every section left checked, whatever the file said
+      const formsStarts =
+        protectOn && mode === 'forms' && !(wasEnforced && protection?.edit === 'forms')
+      if (
+        sectionChecks.length > 0 &&
+        (formsStarts || (protectOn && mode === 'forms' && sectionsChanged))
+      ) {
+        result.sectionsProtected = sectionChecks
       }
 
       onApply(result)
@@ -252,22 +274,29 @@ export function ProtectDialog({
               {t(MODE_LABEL_KEYS[m])}
             </label>
           ))}
+          <button
+            type="button"
+            className="protect-sections"
+            disabled={!protectOn || mode !== 'forms' || sectionChecks.length === 0}
+            onClick={() => setShowSections(true)}
+          >
+            {t('appProtectSections')}
+          </button>
         </div>
-        {protectOn && (
-          <label className="fld">
-            {t('appProtectPwdOptional')} <span className="fld-opt">{t('appOptionalBlank')}</span>
-            <PasswordInput
-              maxLength={255}
-              value={protectPwd}
-              hideReveal={protectPwd === KEEP}
-              onChange={(v) => {
-                setProtectPwd(v)
-                clearError()
-              }}
-              onKeyDown={onEnter}
-            />
-          </label>
-        )}
+        <label className="fld">
+          {t('appProtectPwdOptional')} <span className="fld-opt">{t('appOptionalBlank')}</span>
+          <PasswordInput
+            maxLength={255}
+            disabled={!protectOn}
+            value={protectOn ? protectPwd : ''}
+            hideReveal={protectPwd === KEEP}
+            onChange={(v) => {
+              setProtectPwd(v)
+              clearError()
+            }}
+            onKeyDown={onEnter}
+          />
+        </label>
         {locked && protectionChanged && (
           <label className="fld">
             {t('appProtectUnlockPwd')}
@@ -298,6 +327,71 @@ export function ProtectDialog({
         <div className="modal-actions">
           <button onClick={onCancel}>{t('appCancel')}</button>
           <button className="btn-primary" disabled={busy} onClick={() => void submit()}>
+            {t('appOk')}
+          </button>
+        </div>
+      </div>
+      {showSections && (
+        <SectionProtectionDialog
+          checks={sectionChecks}
+          onCancel={() => setShowSections(false)}
+          onOk={(next) => {
+            setSectionChecks(next)
+            setShowSections(false)
+            clearError()
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+/** Word's Section Protection: the sections a forms protection covers */
+function SectionProtectionDialog({
+  checks,
+  onCancel,
+  onOk,
+}: {
+  checks: boolean[]
+  onCancel: () => void
+  onOk: (checks: boolean[]) => void
+}) {
+  const { t } = useI18n()
+  const keys = useModalKeys(onCancel)
+  const [draft, setDraft] = useState(checks)
+  return (
+    <div
+      className="modal-backdrop"
+      ref={keys.ref}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        keys.onKeyDown(e)
+      }}
+    >
+      <div
+        className="modal protect-dialog protect-sections-dialog gs-form"
+        role="dialog"
+        aria-label={t('appProtectSectionsTitle')}
+      >
+        <h2>{t('appProtectSectionsTitle')}</h2>
+        <p className="modal-desc">{t('appProtectSectionsLabel')}</p>
+        <div className="protect-sections-list">
+          {draft.map((on, i) => (
+            <label key={i} className="protect-check">
+              <input
+                type="checkbox"
+                checked={on}
+                autoFocus={i === 0}
+                onChange={(e) => setDraft(draft.map((v, k) => (k === i ? e.target.checked : v)))}
+              />
+              <span className="ctl" aria-hidden="true" />
+              {t('appProtectSectionN', { n: i + 1 })}
+            </label>
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button onClick={onCancel}>{t('appCancel')}</button>
+          <button className="btn-primary" onClick={() => onOk(draft)}>
             {t('appOk')}
           </button>
         </div>

@@ -24,51 +24,51 @@ pub(crate) fn read_sheet_declarations(
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"workbookPr" =>
+                if element.local_name().as_ref() == "workbookPr" =>
             {
-                date_1904 = attribute_value(&reader, &element, b"date1904")?
+                date_1904 = attribute_value(&reader, &element, "date1904")?
                     .is_some_and(|value| value == "1" || value == "true");
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"workbookView" =>
+                if element.local_name().as_ref() == "workbookView" =>
             {
-                if let Some(value) = attribute_value(&reader, &element, b"activeTab")? {
+                if let Some(value) = attribute_value(&reader, &element, "activeTab")? {
                     active_tab = value.parse::<usize>().unwrap_or(0);
                 }
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"workbookProtection" =>
+                if element.local_name().as_ref() == "workbookProtection" =>
             {
-                let lock_structure = attribute_value(&reader, &element, b"lockStructure")?
+                let lock_structure = attribute_value(&reader, &element, "lockStructure")?
                     .is_some_and(|value| value == "1" || value == "true");
-                let has_password = attribute_value(&reader, &element, b"workbookPassword")?
+                let has_password = attribute_value(&reader, &element, "workbookPassword")?
                     .is_some()
-                    || attribute_value(&reader, &element, b"workbookHashValue")?.is_some();
+                    || attribute_value(&reader, &element, "workbookHashValue")?.is_some();
                 protection = Some(WorkbookProtectionInfo {
                     lock_structure,
                     has_password,
                 });
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"sheet" =>
+                if element.local_name().as_ref() == "sheet" =>
             {
-                let name = attribute_value(&reader, &element, b"name")?
+                let name = attribute_value(&reader, &element, "name")?
                     .ok_or_else(|| SidecarError::Workbook("Sheet has no name.".into()))?;
-                let sheet_id = attribute_value(&reader, &element, b"sheetId")?
+                let sheet_id = attribute_value(&reader, &element, "sheetId")?
                     .ok_or_else(|| SidecarError::Workbook("Sheet has no sheetId.".into()))?;
                 let relationship_id =
-                    attribute_value(&reader, &element, b"id")?.ok_or_else(|| {
+                    attribute_value(&reader, &element, "id")?.ok_or_else(|| {
                         SidecarError::Workbook("Sheet has no relationship id.".into())
                     })?;
-                let hidden = matches!(
-                    attribute_value(&reader, &element, b"state")?.as_deref(),
-                    Some("hidden") | Some("veryHidden")
-                );
+                let state = attribute_value(&reader, &element, "state")?;
+                let very_hidden = state.as_deref() == Some("veryHidden");
+                let hidden = very_hidden || state.as_deref() == Some("hidden");
                 sheets.push(SheetDeclaration {
                     name,
                     sheet_id,
                     relationship_id,
                     hidden,
+                    very_hidden,
                 });
             }
             Event::Eof => break,
@@ -87,11 +87,11 @@ pub(crate) fn read_workbook_relationships(
     loop {
         match reader.read_event()? {
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"Relationship" =>
+                if element.local_name().as_ref() == "Relationship" =>
             {
                 if let (Some(id), Some(target)) = (
-                    attribute_value(&reader, &element, b"Id")?,
-                    attribute_value(&reader, &element, b"Target")?,
+                    attribute_value(&reader, &element, "Id")?,
+                    attribute_value(&reader, &element, "Target")?,
                 ) {
                     relationships.insert(id, target);
                 }
@@ -115,6 +115,13 @@ pub(crate) fn normalize_worksheet_path(target: &str) -> Result<String, SidecarEr
 pub(crate) struct SheetDimensions {
     pub(crate) row_count: usize,
     pub(crate) column_count: usize,
+    /// `<c>` elements carrying a value, formula or style; None when the
+    /// workbook's counting budget ran out before this sheet was walked.
+    pub(crate) stored_cell_count: Option<usize>,
+    /// The subset of stored cells carrying a value or formula, and the
+    /// (rows, columns) box those cells span; None with stored_cell_count.
+    pub(crate) value_cell_count: Option<usize>,
+    pub(crate) value_extent: Option<(usize, usize)>,
     pub(crate) column_widths: Vec<ColumnWidth>,
     pub(crate) default_row_height: Option<f64>,
     pub(crate) default_row_height_fixed: bool,
@@ -127,6 +134,10 @@ pub(crate) struct SheetDimensions {
     pub(crate) show_row_col_headers: bool,
     pub(crate) right_to_left: bool,
     pub(crate) zoom_scale: Option<u16>,
+    pub(crate) outline_level_row: u8,
+    pub(crate) outline_level_col: u8,
+    pub(crate) outline_summary_below: bool,
+    pub(crate) outline_summary_right: bool,
 }
 
 /// Excel keeps a zoom per view type; the app always opens the normal view,
@@ -150,9 +161,10 @@ pub(crate) fn read_sheet_dimensions(
     archive: &mut ZipArchive<File>,
     worksheet_path: &str,
     colors: &ColorContext,
+    count_budget: &mut usize,
 ) -> Result<SheetDimensions, SidecarError> {
     let entry = zip_entry(archive, worksheet_path)?;
-    let mut reader = Reader::from_reader(BufReader::new(entry));
+    let mut reader = xml_reader(entry)?;
     let mut buffer = Vec::new();
     let mut maximum_row = 0;
     let mut maximum_column = 0;
@@ -173,110 +185,141 @@ pub(crate) fn read_sheet_dimensions(
     let mut show_row_col_headers = true;
     let mut right_to_left = false;
     let mut zoom_scale = None;
-    loop {
+    let mut dimension_trusted = false;
+    let mut stored_cell_count = 0usize;
+    let mut value_cell_count = 0usize;
+    let mut value_extent = (0usize, 0usize);
+    // Some(true) once the open <c> has shown a value/formula/style.
+    let mut open_cell_stored: Option<bool> = None;
+    let mut open_cell_position = (0usize, 0usize);
+    let mut open_cell_has_value = false;
+    let mut outline_level_row = 0u8;
+    let mut outline_level_col = 0u8;
+    let mut outline_summary_below = true;
+    let mut outline_summary_right = true;
+    let counted = loop {
         match reader.read_event_into(&mut buffer)? {
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"dimension" =>
+                if element.local_name().as_ref() == "dimension" =>
             {
-                if let Some(reference) = attribute_value(&reader, &element, b"ref")? {
+                if let Some(reference) = attribute_value(&reader, &element, "ref")? {
                     // A malformed ref means "no usable dimension", not a broken file.
                     dimensions = dimensions_from_reference(&reference).ok();
                 }
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"tabColor" =>
+                if element.local_name().as_ref() == "outlinePr" =>
+            {
+                let flag = |name: &str| -> Result<bool, SidecarError> {
+                    Ok(!matches!(
+                        attribute_value(&reader, &element, name)?.as_deref(),
+                        Some("0") | Some("false")
+                    ))
+                };
+                outline_summary_below = flag("summaryBelow")?;
+                outline_summary_right = flag("summaryRight")?;
+            }
+            Event::Start(element) | Event::Empty(element)
+                if element.local_name().as_ref() == "tabColor" =>
             {
                 tab_color = visuals::resolve_color(
-                    attribute_value(&reader, &element, b"rgb")?.as_deref(),
-                    attribute_value(&reader, &element, b"indexed")?.as_deref(),
-                    attribute_value(&reader, &element, b"theme")?.as_deref(),
-                    attribute_value(&reader, &element, b"tint")?.as_deref(),
+                    attribute_value(&reader, &element, "rgb")?.as_deref(),
+                    attribute_value(&reader, &element, "indexed")?.as_deref(),
+                    attribute_value(&reader, &element, "theme")?.as_deref(),
+                    attribute_value(&reader, &element, "tint")?.as_deref(),
                     colors,
                 );
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"sheetView" =>
+                if element.local_name().as_ref() == "sheetView" =>
             {
-                if let Some(value) = attribute_value(&reader, &element, b"showGridLines")? {
+                if let Some(value) = attribute_value(&reader, &element, "showGridLines")? {
                     show_grid_lines = value != "0" && value != "false";
                 }
-                if let Some(value) = attribute_value(&reader, &element, b"showFormulas")? {
+                if let Some(value) = attribute_value(&reader, &element, "showFormulas")? {
                     show_formulas = value == "1" || value == "true";
                 }
-                if let Some(value) = attribute_value(&reader, &element, b"showRowColHeaders")? {
+                if let Some(value) = attribute_value(&reader, &element, "showRowColHeaders")? {
                     show_row_col_headers = value != "0" && value != "false";
                 }
-                if let Some(value) = attribute_value(&reader, &element, b"rightToLeft")? {
+                if let Some(value) = attribute_value(&reader, &element, "rightToLeft")? {
                     right_to_left = value == "1" || value == "true";
                 }
-                let percent = |name: &[u8]| -> Result<Option<u16>, SidecarError> {
+                let percent = |name: &str| -> Result<Option<u16>, SidecarError> {
                     Ok(attribute_value(&reader, &element, name)?
                         .and_then(|value| value.parse::<f64>().ok())
                         .filter(|value| *value > 0.0)
                         .map(|value| value.round() as u16))
                 };
                 zoom_scale = normal_view_zoom(
-                    attribute_value(&reader, &element, b"view")?.as_deref(),
-                    percent(b"zoomScale")?,
-                    percent(b"zoomScaleNormal")?,
+                    attribute_value(&reader, &element, "view")?.as_deref(),
+                    percent("zoomScale")?,
+                    percent("zoomScaleNormal")?,
                 );
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"sheetFormatPr" =>
+                if element.local_name().as_ref() == "sheetFormatPr" =>
             {
                 // defaultColWidth="0" is legal (Excel writes it with
                 // zeroHeight="1" on all-hidden sheets) and means "no default —
                 // use the built-in width"; normalize 0 to None (#173).
-                default_row_height = attribute_value(&reader, &element, b"defaultRowHeight")?
+                default_row_height = attribute_value(&reader, &element, "defaultRowHeight")?
                     .and_then(|value| value.parse::<f64>().ok())
                     .filter(|value| *value > 0.0);
                 default_row_height_fixed = matches!(
-                    attribute_value(&reader, &element, b"customHeight")?.as_deref(),
+                    attribute_value(&reader, &element, "customHeight")?.as_deref(),
                     Some("1") | Some("true")
                 );
-                default_column_width = attribute_value(&reader, &element, b"defaultColWidth")?
+                default_column_width = attribute_value(&reader, &element, "defaultColWidth")?
                     .and_then(|value| value.parse::<f64>().ok())
                     .filter(|value| *value > 0.0);
-                base_column_width = attribute_value(&reader, &element, b"baseColWidth")?
+                base_column_width = attribute_value(&reader, &element, "baseColWidth")?
                     .and_then(|value| value.parse::<f64>().ok())
                     .filter(|value| *value > 0.0);
+                let level = |name: &str| -> Result<u8, SidecarError> {
+                    Ok(attribute_value(&reader, &element, name)?
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .map_or(0, |value| value.min(7)))
+                };
+                outline_level_row = level("outlineLevelRow")?;
+                outline_level_col = level("outlineLevelCol")?;
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"pane" =>
+                if element.local_name().as_ref() == "pane" =>
             {
-                let state = attribute_value(&reader, &element, b"state")?;
+                let state = attribute_value(&reader, &element, "state")?;
                 if matches!(state.as_deref(), Some("frozen") | Some("frozenSplit")) {
-                    let split = |name: &[u8]| -> Result<usize, SidecarError> {
+                    let split = |name: &str| -> Result<usize, SidecarError> {
                         Ok(attribute_value(&reader, &element, name)?
                             .and_then(|value| value.parse::<f64>().ok())
                             .map(|value| value as usize)
                             .unwrap_or(0))
                     };
                     freeze = Some(FreezePane {
-                        frozen_columns: split(b"xSplit")?,
-                        frozen_rows: split(b"ySplit")?,
+                        frozen_columns: split("xSplit")?,
+                        frozen_rows: split("ySplit")?,
                     });
                 }
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"col" =>
+                if element.local_name().as_ref() == "col" =>
             {
-                let minimum = attribute_value(&reader, &element, b"min")?
+                let minimum = attribute_value(&reader, &element, "min")?
                     .and_then(|value| value.parse::<usize>().ok());
-                let maximum = attribute_value(&reader, &element, b"max")?
+                let maximum = attribute_value(&reader, &element, "max")?
                     .and_then(|value| value.parse::<usize>().ok());
-                let width = attribute_value(&reader, &element, b"width")?
+                let width = attribute_value(&reader, &element, "width")?
                     .and_then(|value| value.parse::<f64>().ok());
-                let hidden = attribute_value(&reader, &element, b"hidden")?
+                let hidden = attribute_value(&reader, &element, "hidden")?
                     .is_some_and(|value| value == "1" || value == "true");
-                let outline_level = attribute_value(&reader, &element, b"outlineLevel")?
+                let outline_level = attribute_value(&reader, &element, "outlineLevel")?
                     .and_then(|value| value.parse::<u8>().ok())
                     .map(|value| value.min(7))
                     .filter(|value| *value > 0);
-                let collapsed = attribute_value(&reader, &element, b"collapsed")?
+                let collapsed = attribute_value(&reader, &element, "collapsed")?
                     .is_some_and(|value| value == "1" || value == "true");
                 // xf 0 is the workbook default; carrying it would only bloat the metadata.
-                let style_index = attribute_value(&reader, &element, b"style")?
+                let style_index = attribute_value(&reader, &element, "style")?
                     .and_then(|value| value.parse::<usize>().ok())
                     .filter(|value| *value > 0);
                 if let (Some(minimum), Some(maximum)) = (minimum, maximum) {
@@ -299,7 +342,7 @@ pub(crate) fn read_sheet_dimensions(
                 }
             }
             Event::Start(element)
-                if element.local_name().as_ref() == b"sheetData"
+                if element.local_name().as_ref() == "sheetData"
                     // Single-row/column dimensions are the signature of writers
                     // that never update <dimension> (POI SXSSF, OpenXML SDK
                     // producers emitting A1 or A1:G1). Small dimensions can be
@@ -307,7 +350,8 @@ pub(crate) fn read_sheet_dimensions(
                     // are cheap to verify — trust only refs large enough that
                     // scanning them would cost real time. A ref reaching the
                     // sheet's last column or row (A1:XFD32, Yozo) declares the
-                    // whole sheet, not the used range.
+                    // whole sheet, not the used range. A trusted ref still
+                    // walks the cells, count-only, within the counting budget.
                     && dimensions.is_some_and(|(rows, columns)| {
                         rows > 1
                             && columns > 1
@@ -315,28 +359,23 @@ pub(crate) fn read_sheet_dimensions(
                             && rows * columns >= DIMENSION_TRUST_CELLS
                     }) =>
             {
+                dimension_trusted = true;
+                if *count_budget == 0 {
+                    let (row_count, column_count) = dimensions.unwrap_or((1, 1));
+                    break (row_count, column_count, false);
+                }
+            }
+            Event::End(element)
+                if element.local_name().as_ref() == "sheetData" && dimension_trusted =>
+            {
                 let (row_count, column_count) = dimensions.unwrap_or((1, 1));
-                return Ok(SheetDimensions {
-                    row_count,
-                    column_count,
-                    column_widths,
-                    default_row_height,
-                    default_row_height_fixed,
-                    default_column_width,
-                    base_column_width,
-                    freeze,
-                    tab_color,
-                    show_grid_lines,
-                    show_formulas,
-                    show_row_col_headers,
-                    right_to_left,
-                    zoom_scale,
-                });
+                *count_budget -= stored_cell_count;
+                break (row_count, column_count, true);
             }
             Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"row" =>
+                if element.local_name().as_ref() == "row" =>
             {
-                current_row = attribute_value(&reader, &element, b"r")?
+                current_row = attribute_value(&reader, &element, "r")?
                     .and_then(|value| value.parse::<usize>().ok())
                     .filter(|value| *value > 0)
                     .map(|value| value - 1)
@@ -345,16 +384,56 @@ pub(crate) fn read_sheet_dimensions(
                 next_column = 0;
                 maximum_row = maximum_row.max(current_row);
             }
-            Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"c" =>
-            {
-                let (row, column) = match attribute_value(&reader, &element, b"r")? {
-                    Some(address) => parse_address(&address)?,
+            Event::Start(element) if element.local_name().as_ref() == "c" => {
+                let (row, column) = match attribute_value(&reader, &element, "r")? {
+                    Some(address) => parse_address(&address).unwrap_or((current_row, next_column)),
                     None => (current_row, next_column),
                 };
                 next_column = column + 1;
                 maximum_row = maximum_row.max(row);
                 maximum_column = maximum_column.max(column);
+                open_cell_stored = Some(attribute_value(&reader, &element, "s")?.is_some());
+                open_cell_position = (row, column);
+                open_cell_has_value = false;
+            }
+            Event::Empty(element) if element.local_name().as_ref() == "c" => {
+                let (row, column) = match attribute_value(&reader, &element, "r")? {
+                    Some(address) => parse_address(&address).unwrap_or((current_row, next_column)),
+                    None => (current_row, next_column),
+                };
+                next_column = column + 1;
+                maximum_row = maximum_row.max(row);
+                maximum_column = maximum_column.max(column);
+                if attribute_value(&reader, &element, "s")?.is_some() {
+                    stored_cell_count += 1;
+                }
+                if dimension_trusted && stored_cell_count >= *count_budget {
+                    let (row_count, column_count) = dimensions.unwrap_or((1, 1));
+                    *count_budget = 0;
+                    break (row_count, column_count, false);
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if open_cell_stored.is_some()
+                    && matches!(element.local_name().as_ref(), "v" | "f" | "is") =>
+            {
+                open_cell_stored = Some(true);
+                open_cell_has_value = true;
+            }
+            Event::End(element) if element.local_name().as_ref() == "c" => {
+                if open_cell_stored.take() == Some(true) {
+                    stored_cell_count += 1;
+                }
+                if open_cell_has_value {
+                    value_cell_count += 1;
+                    value_extent.0 = value_extent.0.max(open_cell_position.0 + 1);
+                    value_extent.1 = value_extent.1.max(open_cell_position.1 + 1);
+                }
+                if dimension_trusted && stored_cell_count >= *count_budget {
+                    let (row_count, column_count) = dimensions.unwrap_or((1, 1));
+                    *count_budget = 0;
+                    break (row_count, column_count, false);
+                }
             }
             Event::Eof => {
                 let (dim_rows, dim_columns) = dimensions.unwrap_or((0, 0));
@@ -362,30 +441,44 @@ pub(crate) fn read_sheet_dimensions(
                     declared_extent(dim_rows, SHEET_MAX_ROWS).max(maximum_row + 1),
                     declared_extent(dim_columns, SHEET_MAX_COLUMNS).max(maximum_column + 1),
                 );
-                return Ok(SheetDimensions {
-                    row_count,
-                    column_count,
-                    column_widths,
-                    default_row_height,
-                    default_row_height_fixed,
-                    default_column_width,
-                    base_column_width,
-                    freeze,
-                    tab_color,
-                    show_grid_lines,
-                    show_formulas,
-                    show_row_col_headers,
-                    right_to_left,
-                    zoom_scale,
-                });
+                break (row_count, column_count, true);
             }
             _ => {}
         }
         buffer.clear();
-    }
+    };
+    let (row_count, column_count, counted) = counted;
+    Ok(SheetDimensions {
+        row_count,
+        column_count,
+        stored_cell_count: counted.then_some(stored_cell_count),
+        value_cell_count: counted.then_some(value_cell_count),
+        value_extent: counted.then_some(value_extent),
+        column_widths,
+        default_row_height,
+        default_row_height_fixed,
+        default_column_width,
+        base_column_width,
+        freeze,
+        tab_color,
+        show_grid_lines,
+        show_formulas,
+        show_row_col_headers,
+        right_to_left,
+        zoom_scale,
+        outline_level_row,
+        outline_level_col,
+        outline_summary_below,
+        outline_summary_right,
+    })
 }
 
 pub(crate) const DIMENSION_TRUST_CELLS: usize = 10_000;
+/// Per-workbook budget for counting stored cells on trusted dimensions
+/// (under half a microsecond per cell at open). Every host gate sits below it, so a
+/// workbook that exhausts it is "too large" either way; sheets the budget
+/// never reached report no count and the host falls back to their box.
+pub(crate) const STORED_CELL_COUNT_BUDGET: usize = 2_000_000;
 pub(crate) const SHEET_MAX_ROWS: usize = 1_048_576;
 pub(crate) const SHEET_MAX_COLUMNS: usize = 16_384;
 
@@ -416,7 +509,7 @@ pub(crate) fn read_shared_strings(
     let Ok(entry) = zip_entry(archive, "xl/sharedStrings.xml") else {
         return Ok(Vec::new());
     };
-    let mut reader = Reader::from_reader(BufReader::new(entry));
+    let mut reader = xml_reader(entry)?;
     let mut buffer = Vec::new();
     let mut strings = Vec::new();
     let mut current = String::new();
@@ -428,24 +521,24 @@ pub(crate) fn read_shared_strings(
     let mut in_phonetic = false;
     loop {
         match reader.read_event_into(&mut buffer)? {
-            Event::Start(element) if element.local_name().as_ref() == b"si" => {
+            Event::Start(element) if element.local_name().as_ref() == "si" => {
                 current.clear();
                 runs.clear();
                 current_run = None;
             }
-            Event::Start(element) if element.local_name().as_ref() == b"r" => {
+            Event::Start(element) if element.local_name().as_ref() == "r" => {
                 current_run = Some(RichRun::default());
             }
             // Phonetic guide text (<rPh><t>…</t></rPh>) is ruby annotation,
             // not cell content.
-            Event::Start(element) if element.local_name().as_ref() == b"rPh" => {
+            Event::Start(element) if element.local_name().as_ref() == "rPh" => {
                 in_phonetic = true;
             }
-            Event::End(element) if element.local_name().as_ref() == b"rPh" => {
+            Event::End(element) if element.local_name().as_ref() == "rPh" => {
                 in_phonetic = false;
             }
             Event::Start(element) | Event::Empty(element) if current_run.is_some() => {
-                if element.local_name().as_ref() == b"t" {
+                if element.local_name().as_ref() == "t" {
                     in_text = true;
                     text_preserve = preserves_space(&reader, &element)?;
                     text_node.clear();
@@ -453,7 +546,7 @@ pub(crate) fn read_shared_strings(
                     apply_run_property(run, &reader, &element, colors)?;
                 }
             }
-            Event::Start(element) if element.local_name().as_ref() == b"t" => {
+            Event::Start(element) if element.local_name().as_ref() == "t" => {
                 in_text = !in_phonetic;
                 text_preserve = preserves_space(&reader, &element)?;
                 text_node.clear();
@@ -463,7 +556,7 @@ pub(crate) fn read_shared_strings(
             Event::GeneralRef(reference) if in_text => {
                 text_node.push_str(&general_ref_text(&reference)?);
             }
-            Event::End(element) if element.local_name().as_ref() == b"t" => {
+            Event::End(element) if element.local_name().as_ref() == "t" => {
                 if in_text {
                     let text = text_node_content(std::mem::take(&mut text_node), text_preserve);
                     current.push_str(&text);
@@ -473,12 +566,12 @@ pub(crate) fn read_shared_strings(
                 }
                 in_text = false;
             }
-            Event::End(element) if element.local_name().as_ref() == b"r" => {
+            Event::End(element) if element.local_name().as_ref() == "r" => {
                 if let Some(run) = current_run.take() {
                     runs.push(run);
                 }
             }
-            Event::End(element) if element.local_name().as_ref() == b"si" => {
+            Event::End(element) if element.local_name().as_ref() == "si" => {
                 let mut finished = std::mem::take(&mut runs);
                 for run in &mut finished {
                     normalize_cell_text(&mut run.text);
@@ -524,27 +617,27 @@ pub(crate) fn apply_run_property<R: std::io::BufRead>(
     // POI writes explicit off flags as non-self-closing <strike val="0">.
     let flag_on = |value: Option<String>| !matches!(value.as_deref(), Some("0") | Some("false"));
     match element.local_name().as_ref() {
-        b"b" => run.bold = flag_on(attribute_value(reader, element, b"val")?),
-        b"i" => run.italic = flag_on(attribute_value(reader, element, b"val")?),
-        b"u" => {
-            run.underline = attribute_value(reader, element, b"val")?.as_deref() != Some("none");
+        "b" => run.bold = flag_on(attribute_value(reader, element, "val")?),
+        "i" => run.italic = flag_on(attribute_value(reader, element, "val")?),
+        "u" => {
+            run.underline = attribute_value(reader, element, "val")?.as_deref() != Some("none");
         }
-        b"strike" => run.strikethrough = flag_on(attribute_value(reader, element, b"val")?),
-        b"sz" => {
-            run.size = attribute_value(reader, element, b"val")?
+        "strike" => run.strikethrough = flag_on(attribute_value(reader, element, "val")?),
+        "sz" => {
+            run.size = attribute_value(reader, element, "val")?
                 .and_then(|value| value.parse::<f64>().ok());
         }
-        b"rFont" => run.family = attribute_value(reader, element, b"val")?,
-        b"vertAlign" => {
-            run.vert_align = attribute_value(reader, element, b"val")?
+        "rFont" => run.family = attribute_value(reader, element, "val")?,
+        "vertAlign" => {
+            run.vert_align = attribute_value(reader, element, "val")?
                 .filter(|value| value == "subscript" || value == "superscript");
         }
-        b"color" => {
+        "color" => {
             run.color = visuals::resolve_color(
-                attribute_value(reader, element, b"rgb")?.as_deref(),
-                attribute_value(reader, element, b"indexed")?.as_deref(),
-                attribute_value(reader, element, b"theme")?.as_deref(),
-                attribute_value(reader, element, b"tint")?.as_deref(),
+                attribute_value(reader, element, "rgb")?.as_deref(),
+                attribute_value(reader, element, "indexed")?.as_deref(),
+                attribute_value(reader, element, "theme")?.as_deref(),
+                attribute_value(reader, element, "tint")?.as_deref(),
                 colors,
             );
         }
@@ -588,11 +681,11 @@ pub(crate) fn read_defined_names(
     let mut current: Option<Pending> = None;
     loop {
         match reader.read_event()? {
-            Event::Start(element) if element.local_name().as_ref() == b"definedName" => {
-                let name = attribute_value(&reader, &element, b"name")?.unwrap_or_default();
-                let hidden = attribute_value(&reader, &element, b"hidden")?
+            Event::Start(element) if element.local_name().as_ref() == "definedName" => {
+                let name = attribute_value(&reader, &element, "name")?.unwrap_or_default();
+                let hidden = attribute_value(&reader, &element, "hidden")?
                     .is_some_and(|value| value == "1" || value == "true");
-                let sheet_index = attribute_value(&reader, &element, b"localSheetId")?
+                let sheet_index = attribute_value(&reader, &element, "localSheetId")?
                     .and_then(|value| value.parse::<usize>().ok());
                 current = (!name.is_empty()).then_some(Pending {
                     name,
@@ -616,7 +709,7 @@ pub(crate) fn read_defined_names(
                     defined.formula.push_str(&general_ref_text(&reference)?);
                 }
             }
-            Event::End(element) if element.local_name().as_ref() == b"definedName" => {
+            Event::End(element) if element.local_name().as_ref() == "definedName" => {
                 if let Some(defined) = current.take() {
                     if let Some(sheet_index) = defined.sheet_index {
                         scoped_sheets.insert(sheet_index);

@@ -5,6 +5,7 @@ export const it = {
   aiEmptyBuildTitle: "Lascia che l'IA costruisca questa cartella di lavoro",
   aiEmptyBuildBody: 'Descrivi la tabella, i dati o il grafico che ti servono: l’IA li crea subito.',
   aiGskLoginBtn: 'Accedi a Genspark',
+  aiGskLoginOk: 'Accesso a Genspark effettuato',
   aiUndelivered: 'Non inviato',
   aiRetry: 'Riprova',
   aiOpenAssistant: "Apri l'assistente IA",
@@ -62,6 +63,8 @@ export const it = {
   aiUnknownError: 'Errore sconosciuto',
   aiTimeoutError:
     'Richiesta IA scaduta: nessuna risposta dalla rete, esecuzione interrotta. Controlla la connessione e riprova',
+  aiRegionError:
+    'Il fornitore di questo modello non serve la tua regione attuale — scegli un altro modello o cambia rete',
   aiOverloadedError: 'Il servizio IA è momentaneamente sovraccarico — riprova tra poco',
   aiNetworkError:
     'Problema di rete: impossibile raggiungere il servizio IA. Controlla la connessione e riprova',

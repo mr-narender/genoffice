@@ -1,12 +1,19 @@
 /** Home tab of the slides ribbon. Extracted from Ribbon.tsx. */
 import { useState } from 'react'
 import { platformShortcuts } from '@genoffice/i18n'
-import { ColorPicker, isSymbolFontFamily } from '@genoffice/ui'
+import {
+  ColorPicker,
+  isSymbolFontFamily,
+  partitionFontFamilies,
+  useScrollWindow,
+} from '@genoffice/ui'
 import { saveEditSelection } from '../TextEditOverlay'
 import { armColorInput } from '../color-input'
 import { displayFontFamily } from '../konva-adapter'
 import { useSystemFontFamilies } from '../system-fonts'
 import { useFontCatalog } from '../font-manager'
+import { parseLengthEmu } from '@genoffice/ui/measurement'
+import { unitSuffixes, useMeasurementUnit } from '../measurement-unit'
 import {
   GensparkMark,
   IconAiBeautify,
@@ -68,6 +75,9 @@ import {
   NUMBER_PRESETS,
   bulletRunText,
 } from '../bullet-presets'
+
+/** The New Slide screentip shows the platform's real chord: ⇧⌘N on mac, Ctrl+M elsewhere. */
+const IS_MAC = navigator.platform.toLowerCase().includes('mac')
 
 // Symbol fonts (Wingdings & co.) render their own name as pictographs, so the
 // picker shows those names in the UI font (like Word) instead of the font itself.
@@ -163,7 +173,7 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
   // Typed-ahead font query: only what the user actually typed filters the menu
   // (opening via the caret or focusing shows the full list)
   const [fontFilter, setFontFilter] = useState('')
-  const { families: systemFontFamilies, load: loadSystemFonts } = useSystemFontFamilies()
+  const { families: allSystemFontFamilies, load: loadSystemFonts } = useSystemFontFamilies()
   const {
     catalog: fontCatalog,
     busy: fontBusy,
@@ -172,6 +182,16 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
     download: downloadFont,
     installLocal: installLocalFonts,
   } = useFontCatalog()
+  // Store fonts are invisible to queryLocalFonts, so installed catalog families
+  // count as known even though the enumeration misses them.
+  const installedCatalogFamilies = fontCatalog.filter((c) => c.installed).map((c) => c.family)
+  // Candidates the machine proves absent drop out; when enumeration is
+  // unavailable the full candidate list stays visible.
+  const { builtin: fontFamilies, system: systemFontFamilies } = partitionFontFamilies(
+    FONT_FAMILIES,
+    allSystemFontFamilies,
+    installedCatalogFamilies,
+  )
   // Catalog families stay listed after install (store fonts are invisible to
   // queryLocalFonts). Installed ones dedupe against the built-in/system sections;
   // uninstalled ones always show here so built-in names like Noto Sans JP keep an
@@ -183,11 +203,22 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
   const uninstalledCatalog = new Set(fontCatalog.filter((c) => !c.installed).map((c) => c.family))
   const matchesFontFilter = (f: string) =>
     !fontFilter.trim() || f.toLowerCase().includes(fontFilter.trim().toLowerCase())
-  const EMU_PER_PX = 9525
+  const fontMenuWindow = useScrollWindow(fontOpen)
+  let fontRow = 0
+  const previewAt = (f: string) =>
+    fontMenuWindow.inWindow(fontRow++) ? fontPreviewFamily(f) : undefined
+  // a download row has no preview but still occupies a row of the scroller
+  const skipRow = () => {
+    fontRow++
+    return undefined
+  }
+  // typed in the app-wide unit (Settings ▸ General); any other unit suffix also reads
+  const lengthUnit = useMeasurementUnit()
+  const lengthSuffixes = unitSuffixes(t)
   const commitHangDraft = () => {
-    const px = parseFloat(hangDraft.replace(',', '.'))
-    if (!Number.isFinite(px) || px < 0 || !hasSelection) return
-    onParagraphFormat({ bulletHangEmu: Math.round(px * EMU_PER_PX) })
+    const emu = parseLengthEmu(hangDraft, lengthUnit, lengthSuffixes)
+    if (emu === null || emu < 0 || !hasSelection) return
+    onParagraphFormat({ bulletHangEmu: emu })
   }
   const [symDraft, setSymDraft] = useState('')
   const commitSymDraft = () => {
@@ -420,7 +451,8 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
             className="rb-big rb-split"
             disabled={!hasDoc}
             onClick={onAddSlide}
-            data-tip={t('ribbonNewSlideTip')}
+            data-tip={platformShortcuts(t('ribbonNewSlideTip'))}
+            data-tip-kbd={IS_MAC ? '⇧⌘N' : 'Ctrl+M'}
           >
             <span className="rb-big-icon">
               <span className="rb-split-main">
@@ -591,13 +623,15 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
               {fontOpen && (
                 <div
                   className="rb-drop rb-menu rb-menu-scroll rb-font-menu"
+                  ref={fontMenuWindow.ref}
+                  onScroll={fontMenuWindow.onScroll}
                   onMouseDown={(e) => e.stopPropagation()}
                 >
                   {(curFontFamily &&
-                  !FONT_FAMILIES.includes(curFontFamily) &&
+                  !fontFamilies.includes(curFontFamily) &&
                   !systemFontFamilies.includes(curFontFamily)
-                    ? [curFontFamily, ...FONT_FAMILIES]
-                    : FONT_FAMILIES
+                    ? [curFontFamily, ...fontFamilies]
+                    : fontFamilies
                   )
                     .filter(matchesFontFilter)
                     // Built-in names that are uninstalled catalog fonts render in the
@@ -607,7 +641,7 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
                       <button
                         key={f}
                         className={f === curFontFamily ? 'on' : ''}
-                        style={{ fontFamily: fontPreviewFamily(f) }}
+                        style={{ fontFamily: previewAt(f) }}
                         onMouseDown={(e) => {
                           e.preventDefault()
                           onFontFamily(f)
@@ -624,7 +658,7 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
                         <button
                           key={f}
                           className={f === curFontFamily ? 'on' : ''}
-                          style={{ fontFamily: fontPreviewFamily(f) }}
+                          style={{ fontFamily: previewAt(f) }}
                           onMouseDown={(e) => {
                             e.preventDefault()
                             onFontFamily(f)
@@ -646,7 +680,7 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
                             <button
                               key={c.family}
                               className={c.family === curFontFamily ? 'on' : ''}
-                              style={{ fontFamily: fontPreviewFamily(c.family) }}
+                              style={{ fontFamily: previewAt(c.family) }}
                               onMouseDown={(e) => {
                                 e.preventDefault()
                                 onFontFamily(c.family)
@@ -659,6 +693,7 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
                             <button
                               key={c.family}
                               className="rb-font-download"
+                              style={{ fontFamily: skipRow() }}
                               disabled={fontBusy.has(c.family)}
                               onMouseDown={(e) => {
                                 e.preventDefault()
@@ -1093,8 +1128,10 @@ export function RibbonHomeTab({ rb }: { rb: RibbonTabCtx }) {
                   <input
                     className="rb-bullet-hang rb-bullet-hang-input"
                     disabled={!hasSelection}
-                    data-tip={t('ribbonBulletHangCustomTip')}
-                    placeholder="px"
+                    data-tip={t('ribbonBulletHangCustomTip', {
+                      unit: lengthSuffixes[lengthUnit],
+                    })}
+                    placeholder={lengthSuffixes[lengthUnit]}
                     value={hangDraft}
                     onMouseDown={(e) => e.stopPropagation()}
                     onChange={(e) => setHangDraft(e.target.value)}

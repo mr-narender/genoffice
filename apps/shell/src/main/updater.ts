@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { app, dialog, shell } from 'electron'
 import type { BrowserWindow } from 'electron'
-import { autoUpdater } from 'electron-updater'
+import { autoUpdater, CancellationToken } from 'electron-updater'
+import { installResumeDownload } from './update-resume'
 import type { UpdateInfo } from 'electron-updater'
 import { createI18n, getUiLang, htmlLang } from '@genoffice/i18n'
 import type {
@@ -12,9 +13,11 @@ import type {
   UpdateUiStrings,
 } from '../shared/update-api'
 import {
+  clearUpdateState,
   closeUpdateWindow,
   isUpdateWindowOpen,
   pushUpdateState,
+  setUpdateParentWindow,
   showUpdateWindow,
 } from './update-window'
 
@@ -30,11 +33,13 @@ import {
  *
  * UX is the strong-guidance modal card (update-window.ts), not a native
  * dialog. Windows updates through the NSIS installer (latest.yml); macOS
- * through the zip target (latest-mac.yml); Linux through the AppImage
- * target (latest-linux.yml) — all published by the internal release
- * pipeline. On Linux only AppImage runs self-update (electron-updater
- * replaces the .AppImage file in place, no root needed); deb installs have
- * no updater — users upgrade via `apt install ./<new>.deb`.
+ * through the zip target (latest-mac.yml); Linux through latest-linux.yml,
+ * which carries the AppImage and the deb. On Linux, AppImage runs self-update
+ * in place (electron-updater replaces the .AppImage file, no root needed) and
+ * deb installs self-update through electron-updater's DebUpdater, which reads
+ * the baked resources/package-type file and installs the package behind a
+ * pkexec prompt. That install is offered on the card's explicit "Restart to
+ * install" button only — see `autoInstallOnAppQuit` below.
  *
  * Dev preview: GENOFFICE_FAKE_UPDATE=<version> in an unpacked run opens the
  * window with a simulated download so the UI can be exercised end to end.
@@ -46,7 +51,7 @@ const tUpd = createI18n({
     updHeadline: '发现新版本',
     updDesc: '新版本包含性能改进与问题修复，建议立即更新。',
     updDownload: '立即更新',
-    updLater: '稍后再说',
+    updLater: '最小化',
     updInstall: '立即重启安装',
     updDownloading: '正在下载更新…',
     updFailed: '更新下载失败，请检查网络后重试。',
@@ -62,7 +67,7 @@ const tUpd = createI18n({
     updDesc:
       'This update includes performance improvements and bug fixes. We recommend updating now.',
     updDownload: 'Update Now',
-    updLater: 'Remind me later',
+    updLater: 'Minimize',
     updInstall: 'Restart & Install',
     updDownloading: 'Downloading update…',
     updFailed: 'Update download failed. Check your network and try again.',
@@ -79,7 +84,7 @@ const tUpd = createI18n({
     updDesc:
       'Bản cập nhật này bao gồm các cải tiến hiệu suất và sửa lỗi. Chúng tôi khuyên bạn nên cập nhật ngay bây giờ.',
     updDownload: 'Cập nhật ngay',
-    updLater: 'Nhắc tôi sau',
+    updLater: 'Thu nhỏ',
     updInstall: 'Khởi động lại & Cài đặt',
     updDownloading: 'Đang tải xuống bản cập nhật…',
     updFailed: 'Tải xuống bản cập nhật thất bại. Kiểm tra mạng của bạn và thử lại.',
@@ -90,13 +95,48 @@ const tUpd = createI18n({
     updCheckFailed: 'Không thể kiểm tra bản cập nhật. Kiểm tra mạng của bạn và thử lại.',
     updOpenDownload: 'Mở trang tải xuống',
   },
+  tr: {
+    updTitle: 'Yazılım Güncellemesi',
+    updHeadline: 'Yeni bir sürüm mevcut',
+    updDesc:
+      'Bu güncelleme performans iyileştirmeleri ve hata düzeltmeleri içerir. Şimdi güncellemenizi öneririz.',
+    updDownload: 'Şimdi Güncelle',
+    updLater: 'Simge Durumuna Küçült',
+    updInstall: 'Yeniden Başlat ve Yükle',
+    updDownloading: 'Güncelleme indiriliyor…',
+    updFailed: 'Güncelleme indirilemedi. Ağ bağlantınızı kontrol edip yeniden deneyin.',
+    updRetry: 'Yeniden Dene',
+    updManual:
+      'Otomatik güncelleme başarısız oldu. Lütfen en son sürümü indirme sayfasından alıp elle yükleyin.',
+    updUpToDate: 'Güncel sürümü kullanıyorsunuz (sürüm {version}).',
+    updCheckFailed: 'Güncellemeler denetlenemedi. Ağ bağlantınızı kontrol edip yeniden deneyin.',
+    updOpenDownload: 'İndirme Sayfasını Aç',
+  },
+  hu: {
+    updTitle: 'Szoftverfrissítés',
+    updHeadline: 'Új verzió érhető el',
+    updDesc:
+      'Ez a frissítés teljesítményjavításokat és hibajavításokat tartalmaz. Javasoljuk, hogy most frissíts.',
+    updDownload: 'Frissítés most',
+    updLater: 'Minimalizálás',
+    updInstall: 'Újraindítás és telepítés',
+    updDownloading: 'Frissítés letöltése…',
+    updFailed: 'Nem sikerült letölteni a frissítést. Ellenőrizd a hálózatot, és próbáld újra.',
+    updRetry: 'Újra',
+    updManual:
+      'Az automatikus frissítés nem sikerült. Töltsd le a legújabb verziót a letöltési oldalról, és telepítsd kézzel.',
+    updUpToDate: 'Naprakész vagy (verzió: {version}).',
+    updCheckFailed:
+      'Nem sikerült ellenőrizni a frissítéseket. Ellenőrizd a hálózatot, és próbáld újra.',
+    updOpenDownload: 'Letöltési oldal megnyitása',
+  },
   ja: {
     updTitle: 'ソフトウェアアップデート',
     updHeadline: '新しいバージョンがあります',
     updDesc:
       'このアップデートにはパフォーマンス改善とバグ修正が含まれます。今すぐの更新をおすすめします。',
     updDownload: '今すぐ更新',
-    updLater: '後で通知',
+    updLater: '最小化',
     updInstall: '再起動してインストール',
     updDownloading: 'アップデートをダウンロード中…',
     updFailed: 'ダウンロードに失敗しました。ネットワークを確認して再試行してください。',
@@ -113,7 +153,7 @@ const tUpd = createI18n({
     updDesc:
       '이 업데이트에는 성능 개선과 버그 수정이 포함되어 있습니다. 지금 업데이트하는 것을 권장합니다.',
     updDownload: '지금 업데이트',
-    updLater: '나중에 알림',
+    updLater: '최소화',
     updInstall: '다시 시작 및 설치',
     updDownloading: '업데이트 다운로드 중…',
     updFailed: '업데이트 다운로드에 실패했습니다. 네트워크를 확인한 후 다시 시도하세요.',
@@ -130,7 +170,7 @@ const tUpd = createI18n({
     updDesc:
       'Cette mise à jour apporte des améliorations de performances et des corrections de bogues. Nous vous recommandons de mettre à jour maintenant.',
     updDownload: 'Mettre à jour',
-    updLater: 'Plus tard',
+    updLater: 'Réduire',
     updInstall: 'Redémarrer et installer',
     updDownloading: 'Téléchargement de la mise à jour…',
     updFailed: 'Échec du téléchargement. Vérifiez votre réseau et réessayez.',
@@ -148,7 +188,7 @@ const tUpd = createI18n({
     updDesc:
       'Dieses Update enthält Leistungsverbesserungen und Fehlerbehebungen. Wir empfehlen, jetzt zu aktualisieren.',
     updDownload: 'Jetzt aktualisieren',
-    updLater: 'Später erinnern',
+    updLater: 'Minimieren',
     updInstall: 'Neu starten und installieren',
     updDownloading: 'Update wird heruntergeladen…',
     updFailed:
@@ -167,7 +207,7 @@ const tUpd = createI18n({
     updDesc:
       'Esta actualización incluye mejoras de rendimiento y correcciones de errores. Recomendamos actualizar ahora.',
     updDownload: 'Actualizar ahora',
-    updLater: 'Recordar más tarde',
+    updLater: 'Minimizar',
     updInstall: 'Reiniciar e instalar',
     updDownloading: 'Descargando la actualización…',
     updFailed: 'Error al descargar. Compruebe su red e inténtelo de nuevo.',
@@ -183,7 +223,7 @@ const tUpd = createI18n({
     updHeadline: 'มีเวอร์ชันใหม่พร้อมใช้งาน',
     updDesc: 'การอัปเดตนี้มีการปรับปรุงประสิทธิภาพและแก้ไขข้อบกพร่อง แนะนำให้อัปเดตทันที',
     updDownload: 'อัปเดตเลย',
-    updLater: 'เตือนภายหลัง',
+    updLater: 'ย่อเก็บ',
     updInstall: 'รีสตาร์ทและติดตั้ง',
     updDownloading: 'กำลังดาวน์โหลดอัปเดต…',
     updFailed: 'ดาวน์โหลดไม่สำเร็จ โปรดตรวจสอบเครือข่ายแล้วลองอีกครั้ง',
@@ -200,7 +240,7 @@ const tUpd = createI18n({
     updDesc:
       'Pembaruan ini mencakup peningkatan kinerja dan perbaikan bug. Kami menyarankan untuk memperbarui sekarang.',
     updDownload: 'Perbarui Sekarang',
-    updLater: 'Ingatkan nanti',
+    updLater: 'Minimalkan',
     updInstall: 'Mulai Ulang & Pasang',
     updDownloading: 'Mengunduh pembaruan…',
     updFailed: 'Unduhan gagal. Periksa jaringan Anda dan coba lagi.',
@@ -217,7 +257,7 @@ const tUpd = createI18n({
     updDesc:
       'Это обновление содержит улучшения производительности и исправления ошибок. Рекомендуем обновиться сейчас.',
     updDownload: 'Обновить сейчас',
-    updLater: 'Напомнить позже',
+    updLater: 'Свернуть',
     updInstall: 'Перезапустить и установить',
     updDownloading: 'Загрузка обновления…',
     updFailed: 'Не удалось загрузить обновление. Проверьте сеть и повторите попытку.',
@@ -233,7 +273,7 @@ const tUpd = createI18n({
     updHeadline: 'يتوفر إصدار جديد',
     updDesc: 'يتضمن هذا التحديث تحسينات في الأداء وإصلاحات للأخطاء. نوصي بالتحديث الآن.',
     updDownload: 'التحديث الآن',
-    updLater: 'ذكّرني لاحقًا',
+    updLater: 'تصغير',
     updInstall: 'إعادة التشغيل والتثبيت',
     updDownloading: 'جارٍ تنزيل التحديث…',
     updFailed: 'فشل تنزيل التحديث. تحقق من الشبكة وحاول مرة أخرى.',
@@ -249,7 +289,7 @@ const tUpd = createI18n({
     updDesc:
       'Esta atualização inclui melhorias de desempenho e correções de erros. Recomendamos atualizar agora.',
     updDownload: 'Atualizar agora',
-    updLater: 'Lembrar mais tarde',
+    updLater: 'Minimizar',
     updInstall: 'Reiniciar e instalar',
     updDownloading: 'Baixando a atualização…',
     updFailed: 'Falha no download. Verifique sua rede e tente novamente.',
@@ -266,7 +306,7 @@ const tUpd = createI18n({
     updDesc:
       'Questo aggiornamento include miglioramenti delle prestazioni e correzioni di bug. Consigliamo di aggiornare subito.',
     updDownload: 'Aggiorna ora',
-    updLater: 'Ricordamelo più tardi',
+    updLater: 'Riduci a icona',
     updInstall: 'Riavvia e installa',
     updDownloading: "Download dell'aggiornamento…",
     updFailed: 'Download non riuscito. Controlla la rete e riprova.',
@@ -283,7 +323,7 @@ const tUpd = createI18n({
     updDesc:
       'Ta aktualizacja zawiera ulepszenia wydajności i poprawki błędów. Zalecamy aktualizację teraz.',
     updDownload: 'Aktualizuj teraz',
-    updLater: 'Przypomnij później',
+    updLater: 'Zminimalizuj',
     updInstall: 'Uruchom ponownie i zainstaluj',
     updDownloading: 'Pobieranie aktualizacji…',
     updFailed: 'Pobieranie nie powiodło się. Sprawdź sieć i spróbuj ponownie.',
@@ -300,7 +340,7 @@ const tUpd = createI18n({
     updDesc:
       'Tato aktualizace obsahuje vylepšení výkonu a opravy chyb. Doporučujeme aktualizovat hned.',
     updDownload: 'Aktualizovat nyní',
-    updLater: 'Připomenout později',
+    updLater: 'Minimalizovat',
     updInstall: 'Restartovat a nainstalovat',
     updDownloading: 'Stahování aktualizace…',
     updFailed: 'Stažení aktualizace se nezdařilo. Zkontrolujte síť a zkuste to znovu.',
@@ -317,7 +357,7 @@ const tUpd = createI18n({
     updDesc:
       'Deze update bevat prestatieverbeteringen en foutoplossingen. We raden aan nu bij te werken.',
     updDownload: 'Nu bijwerken',
-    updLater: 'Later herinneren',
+    updLater: 'Minimaliseren',
     updInstall: 'Opnieuw starten en installeren',
     updDownloading: 'Update wordt gedownload…',
     updFailed: 'Download mislukt. Controleer uw netwerk en probeer het opnieuw.',
@@ -335,7 +375,7 @@ const tUpd = createI18n({
     updDesc:
       'Kemas kini ini merangkumi penambahbaikan prestasi dan pembetulan pepijat. Kami syorkan kemas kini sekarang.',
     updDownload: 'Kemas Kini Sekarang',
-    updLater: 'Ingatkan kemudian',
+    updLater: 'Minimumkan',
     updInstall: 'Mula Semula & Pasang',
     updDownloading: 'Memuat turun kemas kini…',
     updFailed: 'Muat turun gagal. Semak rangkaian anda dan cuba lagi.',
@@ -351,7 +391,7 @@ const tUpd = createI18n({
     updHeadline: 'גרסה חדשה זמינה',
     updDesc: 'עדכון זה כולל שיפורי ביצועים ותיקוני באגים. מומלץ לעדכן עכשיו.',
     updDownload: 'עדכן עכשיו',
-    updLater: 'הזכר לי מאוחר יותר',
+    updLater: 'מזער',
     updInstall: 'הפעל מחדש והתקן',
     updDownloading: 'מוריד את העדכון…',
     updFailed: 'ההורדה נכשלה. בדוק את הרשת ונסה שוב.',
@@ -367,7 +407,7 @@ const tUpd = createI18n({
     updDesc:
       'इस अपडेट में प्रदर्शन सुधार और बग फ़िक्स शामिल हैं। हम अभी अपडेट करने की सलाह देते हैं।',
     updDownload: 'अभी अपडेट करें',
-    updLater: 'बाद में याद दिलाएँ',
+    updLater: 'छोटा करें',
     updInstall: 'पुनरारंभ करें और इंस्टॉल करें',
     updDownloading: 'अपडेट डाउनलोड हो रहा है…',
     updFailed: 'डाउनलोड विफल रहा। अपना नेटवर्क जाँचें और पुनः प्रयास करें।',
@@ -383,7 +423,7 @@ const tUpd = createI18n({
     updHeadline: '發現新版本',
     updDesc: '新版本包含效能改進與問題修復，建議立即更新。',
     updDownload: '立即更新',
-    updLater: '稍後再說',
+    updLater: '最小化',
     updInstall: '立即重新啟動安裝',
     updDownloading: '正在下載更新…',
     updFailed: '更新下載失敗，請檢查網路後重試。',
@@ -429,12 +469,36 @@ function updateFeedBaseUrl(): string | null {
   }
 }
 
+/// electron-builder's FpmTarget writes a `package-type` file ("deb") next to
+/// app-update.yml for the deb build, and electron-updater reads that same file
+/// to pick its DebUpdater — the mechanism that lets a deb install self-update
+/// (the install runs dpkg behind a pkexec prompt). AppImage runs carry no
+/// package-type; their updater keys off the APPIMAGE env var instead. Anything
+/// else is not an install this updater can replace, so it answers null.
+///
+/// Only deb is claimed here: rpm keeps `rpm.publish: null` in
+/// electron-builder.cjs, so an rpm bake carries neither app-update.yml nor
+/// package-type and the feed has no .rpm entry, which means RpmUpdater can
+/// never be selected. Widening this to 'rpm' without publishing that target
+/// would advertise an upgrade path that does not exist.
+function linuxPackageType(): 'deb' | null {
+  try {
+    const value = readFileSync(path.join(process.resourcesPath, 'package-type'), 'utf8').trim()
+    return value === 'deb' ? 'deb' : null
+  } catch {
+    return null
+  }
+}
+
 /// Picks the manual-install artifact for this platform/arch from the update
 /// feed's file list: macOS wants the dmg matching process.arch (the zip is
 /// Squirrel-only), Windows the NSIS exe matching process.arch (the arm64 one
-/// carries an -arm64 suffix, the x64 one no arch), Linux the AppImage. Served feeds may
-/// carry either feed-relative names or absolute CDN URLs (mac-release-upload
-/// rewrites every url: entry to absolute), but only their basename is used.
+/// carries an -arm64 suffix, the x64 one no arch), Linux the package the
+/// running install self-updates to — the AppImage for AppImage runs, the deb
+/// for a deb install (the AppImage is a different install lineage and cannot
+/// upgrade a deb). Served feeds may carry either feed-relative names or
+/// absolute CDN URLs (mac-release-upload rewrites every url: entry to
+/// absolute), but only their basename is used.
 /// The final URL is always rebuilt against the trusted baked feed base.
 function manualDownloadUrlFor(info: UpdateInfo): string | null {
   const basenames = (info.files ?? []).flatMap((file) => {
@@ -459,7 +523,9 @@ function manualDownloadUrlFor(info: UpdateInfo): string | null {
     const x64 = pick((name) => name.endsWith('.exe') && !name.endsWith('-arm64.exe'))
     chosen = process.arch === 'arm64' ? (arm ?? x64) : (x64 ?? arm)
   } else {
-    chosen = pick((name) => name.endsWith('.AppImage'))
+    // a deb install must be offered the deb, not the AppImage
+    const extension = !process.env.APPIMAGE && linuxPackageType() === 'deb' ? '.deb' : '.AppImage'
+    chosen = pick((name) => name.endsWith(extension))
   }
   if (chosen === null) return null
   const base = updateFeedBaseUrl()
@@ -473,6 +539,8 @@ let dismissedVersion: string | null = null
 // exercisable in dev runs too
 let fakeShowAgain: (() => void) | null = null
 let manualCheckInFlight = false
+// set by initAutoUpdater; drops the download state of the channel being left
+let resetDownloadFlow: (() => void) | null = null
 
 // electron-updater feed name per user-facing channel. The platform suffix is
 // appended by electron-updater itself: 'beta' resolves to beta.yml on
@@ -482,6 +550,12 @@ const CHANNEL_FEED: Record<UpdateChannel, string> = { stable: 'latest', beta: 'b
 // true once the packaged-run updater is configured; channel switches before
 // that (or in dev runs) must not touch electron-updater
 let updaterActive = false
+
+// The check in flight is quiet when a background timer started it: the package
+// then downloads in the background and the app installs it when it quits
+// (genoffice#2389). A check the user asked for — the Help entry, the About
+// dialog button, a channel switch — opens the update card instead.
+let quietCheck = false
 
 function log(...args: unknown[]): void {
   console.log('[updater]', ...args)
@@ -517,6 +591,9 @@ function initialState(version: string): UpdateUiState {
 
 export function applyUpdateChannel(channel: UpdateChannel): void {
   if (!updaterActive) return
+  resetDownloadFlow?.()
+  // the user asked for this channel: it gets the card, not a quiet download
+  quietCheck = false
   autoUpdater.channel = CHANNEL_FEED[channel]
   // the channel setter unconditionally flips allowDowngrade to true; force it
   // back off since a beta user switching to stable must not downgrade
@@ -530,8 +607,8 @@ export function applyUpdateChannel(channel: UpdateChannel): void {
  * feedback: an available update opens the standard update window (even a
  * version dismissed with "later" this session — the user just asked for it),
  * up-to-date and failure each get a dialog, and installs with no self-update
- * mechanism (dev runs, Linux .deb) are pointed at the download page instead
- * of being told they're current. */
+ * mechanism (dev runs, an unpacked or rpm/flatpak Linux install) are pointed
+ * at the download page instead of being told they're current. */
 export async function checkForUpdatesNow(): Promise<void> {
   if (manualCheckInFlight) return
   manualCheckInFlight = true
@@ -554,6 +631,8 @@ export async function checkForUpdatesNow(): Promise<void> {
       return
     }
     dismissedVersion = null
+    // the user asked for it: the card, not a quiet download
+    quietCheck = false
     let result
     try {
       result = await autoUpdater.checkForUpdates()
@@ -589,9 +668,15 @@ export async function checkForUpdatesNow(): Promise<void> {
 export function initAutoUpdater(
   getWindow: () => BrowserWindow | null,
   initialChannel: UpdateChannel = 'stable',
+  /** Settings › "Check for updates automatically"; read at every background check (genoffice#2127) */
+  autoCheckEnabled: () => boolean = () => true,
+  /** Settings › "Install updates silently" (off by default): a background check
+   *  downloads the package quietly and installs it on quit instead of opening the card */
+  silentInstallEnabled: () => boolean = () => false,
 ): void {
   if (started) return
   started = true
+  setUpdateParentWindow(getWindow)
 
   // dev preview of the update window with a simulated download
   if (!app.isPackaged && process.env.GENOFFICE_FAKE_UPDATE) {
@@ -601,13 +686,24 @@ export function initAutoUpdater(
   // Unpacked runs have no app-update.yml and must not hit the CDN with a
   // dev version. Windows updates via NSIS (latest.yml), macOS via the zip
   // target + latest-mac.yml (Squirrel.Mac requires a signed, notarized app
-  // — dmg is first-install only), Linux via the AppImage target +
-  // latest-linux.yml. On Linux the updater only works for AppImage runs
-  // (electron-updater's AppImageUpdater needs the APPIMAGE env var the
-  // AppImage runtime sets); deb installs update manually via apt.
+  // — dmg is first-install only), Linux via latest-linux.yml. On Linux
+  // self-update is available to AppImage runs (electron-updater's
+  // AppImageUpdater needs the APPIMAGE env var the AppImage runtime sets)
+  // and to deb installs (electron-updater reads the baked
+  // resources/package-type file and installs through DebUpdater). Prompting
+  // those users to update manually — "Automatic update failed…" on a plain
+  // check — because the updater never started is genoffice#2325.
   if (!app.isPackaged) return
   const isLinuxAppImage = process.platform === 'linux' && Boolean(process.env.APPIMAGE)
-  if (process.platform !== 'win32' && process.platform !== 'darwin' && !isLinuxAppImage) return
+  const isLinuxDeb =
+    process.platform === 'linux' && !isLinuxAppImage && linuxPackageType() === 'deb'
+  if (
+    process.platform !== 'win32' &&
+    process.platform !== 'darwin' &&
+    !isLinuxAppImage &&
+    !isLinuxDeb
+  )
+    return
 
   updaterActive = true
   autoUpdater.channel = CHANNEL_FEED[initialChannel]
@@ -615,11 +711,15 @@ export function initAutoUpdater(
   // back off since a beta user switching to stable must not downgrade
   autoUpdater.allowDowngrade = false
   autoUpdater.autoDownload = false
-  // if the user picked "later" after download, install on normal quit
-  autoUpdater.autoInstallOnAppQuit = true
+  // if the user picked "later" after download, install on normal quit. Not for
+  // a deb: DebUpdater installs through `dpkg -i` behind a pkexec prompt, and a
+  // root password dialog standing in front of a quit the user did not relate
+  // to an update is worse than the click the explicit button asks for.
+  autoUpdater.autoInstallOnAppQuit = !isLinuxDeb
   // full-package policy: never attempt blockmap differential downloads
   // (CI does not publish .blockmap files)
   autoUpdater.disableDifferentialDownload = true
+  installResumeDownload(autoUpdater as unknown as Parameters<typeof installResumeDownload>[0])
 
   let latestSeenVersion: string | null = null
   // CDN installer link for latestSeenVersion (channel/track/arch-correct);
@@ -636,6 +736,10 @@ export function initAutoUpdater(
   // "Update Now" over a download that is running or already finished
   let phase: UpdatePhase = 'available'
   let percent = 0
+  // the running download's token plus a generation stamp, so a channel switch
+  // can cancel the request and its late rejection cannot fail the next one
+  let downloadToken: CancellationToken | null = null
+  let downloadGen = 0
 
   const setPhase = (patch: { phase: UpdatePhase; percent?: number }): void => {
     phase = patch.phase
@@ -650,18 +754,46 @@ export function initAutoUpdater(
     setPhase({ phase: failedAttempts >= MANUAL_FALLBACK_AFTER ? 'manual' : 'error' })
   }
 
+  // electron-updater cannot discard a finished download, so a package from
+  // the previous channel is made stale instead: it is never installed (not on
+  // quit, not via the window) and the next channel's update-available starts
+  // the flow over from 'available'
+  resetDownloadFlow = () => {
+    if (latestSeenVersion === null) return
+    log('channel switch: dropping', latestSeenVersion, 'in phase', phase)
+    autoUpdater.autoInstallOnAppQuit = false
+    downloadToken?.cancel()
+    downloadToken = null
+    downloadGen += 1
+    latestSeenVersion = null
+    manualDownloadUrl = null
+    failedAttempts = 0
+    downloadInFlight = false
+    phase = 'available'
+    percent = 0
+    clearUpdateState()
+  }
+
+  /** Download the version on offer. The card's "Update Now" button and the
+   *  quiet background download share this path. */
+  const startDownload = (): void => {
+    if (downloadInFlight || phase === 'downloaded') return
+    downloadInFlight = true
+    setPhase({ phase: 'downloading', percent: 0 })
+    const gen = ++downloadGen
+    downloadToken = new CancellationToken()
+    autoUpdater.downloadUpdate(downloadToken).catch((err) => {
+      if (gen !== downloadGen) return
+      log('download failed:', err?.message ?? err)
+      failDownload()
+    })
+  }
+
   const actions = {
-    onDownload: () => {
-      if (phase === 'downloading' || phase === 'downloaded') return
-      downloadInFlight = true
-      setPhase({ phase: 'downloading', percent: 0 })
-      autoUpdater.downloadUpdate().catch((err) => {
-        log('download failed:', err?.message ?? err)
-        failDownload()
-      })
-    },
+    onDownload: startDownload,
     onInstall: () => {
       closeUpdateWindow()
+      if (latestSeenVersion === null) return
       // let the window fully close before tearing the app down
       setImmediate(() => autoUpdater.quitAndInstall(true, true))
     },
@@ -706,6 +838,15 @@ export function initAutoUpdater(
     latestSeenVersion = info.version
     manualDownloadUrl = manualDownloadUrlFor(info)
     log('update available:', info.version)
+    if (quietCheck && silentInstallEnabled() && !isLinuxDeb) {
+      // quiet path: no card, the package downloads in the background and the
+      // app installs it when it quits (genoffice#2389). Not for a deb: its
+      // install is the pkexec-backed `dpkg -i` that only the explicit
+      // "Restart to install" button may start, so a silent download with no
+      // card would leave the package sitting there uninstalled
+      startDownload()
+      return
+    }
     // a periodic recheck resolving to the version the open dialog already
     // shows must not reset its phase to 'available' — that would wipe an
     // in-progress download or a terminal 'manual' fallback back to the
@@ -715,17 +856,30 @@ export function initAutoUpdater(
   })
 
   autoUpdater.on('download-progress', (progress) => {
+    if (!downloadInFlight) return
     setPhase({ phase: 'downloading', percent: progress.percent })
   })
 
   autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
+    if (info.version !== latestSeenVersion) {
+      log('downloaded:', info.version, 'ignored (stale after channel switch)')
+      return
+    }
     log('downloaded:', info.version)
+    // a deb install stays on the explicit "Restart to install" button (see the
+    // pkexec note above); every other platform installs on quit as before
+    autoUpdater.autoInstallOnAppQuit = !isLinuxDeb
     downloadInFlight = false
     failedAttempts = 0
     setPhase({ phase: 'downloaded', percent: 100 })
   })
 
   const check = (): void => {
+    // turned off: only an explicit check (Help › Check for Updates…, a channel switch) asks the feed
+    if (!autoCheckEnabled()) return
+    // a background check is quiet: the package downloads in the background and
+    // the app installs it when it quits (genoffice#2389)
+    quietCheck = true
     autoUpdater.checkForUpdates().catch((err) => log('check failed:', err?.message ?? err))
   }
   setTimeout(check, FIRST_CHECK_DELAY_MS)

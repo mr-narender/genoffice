@@ -1,8 +1,10 @@
 import type { AgentSkill, ExecutedToolCall } from './skill'
+import { addTokenUsage } from './types'
 import type {
   AgentImage,
   AgentMessage,
   AgentStreamHandle,
+  AgentTokenUsage,
   AgentToolCall,
   AgentToolDef,
   AgentToolResult,
@@ -28,6 +30,8 @@ export interface AgentRunResult {
   turnLimit: boolean
   /** the final turn hit the token limit (stop_reason max_tokens): text is incomplete; set only when true */
   truncated?: boolean
+  /** tokens billed across all turns of the run; absent when the provider never reported usage */
+  usage?: AgentTokenUsage
 }
 
 export interface AgentLoopEvents<TSnapshot> {
@@ -38,6 +42,8 @@ export interface AgentLoopEvents<TSnapshot> {
   onToolExecuted?(event: ToolExecutedEvent<TSnapshot>): void
   /** a turn requested tools and they ran; the loop is going back to the model */
   onTurnEnd?(): void
+  /** tokens the provider billed for the turn that just streamed (per model call, compaction summary turns included) */
+  onUsage?(usage: AgentTokenUsage): void
   onDone?(result: AgentRunResult): void
   onError?(error: string): void
 }
@@ -58,24 +64,37 @@ export interface AgentLoopOptions<TSnapshot = unknown> {
   events?: AgentLoopEvents<TSnapshot>
   /** hard cap on model round-trips per run (default DEFAULT_MAX_TURNS) */
   maxTurns?: number
-  /** history cap in messages, trimmed at user-turn boundaries (default 40) */
+  /** history cap in messages, trimmed at user-turn boundaries (default 200) */
   maxHistory?: number
   /** Context compaction; false disables it (enabled by default with default thresholds) */
   compaction?: CompactionOptions | false
   /** capture rollback state; invoked right before tools run (see snapshotBefore) */
   captureSnapshot?(): TSnapshot
-  /** wrap instruction + skill context into the user message text */
+  /** wrap instruction + skill context into the user message text; called again with
+   * CONTEXT_OMITTED_NOTE as the context when the next run folds the previous run's snapshot */
   formatUserMessage?(instruction: string, context: string): string
+  /** clock seam for tests (ms); defaults to Date.now */
+  now?(): number
   /** appended to the system prompt each turn (e.g. reply-language directive following the UI language) */
   systemSuffix?(): string
 }
 
 const COMPACT_MAX_BYTES = 256 * 1024
+/** Per-turn cap on streamed text / reasoning (UTF-16 units); a stream that never ends must not grow memory without bound */
+const TURN_STREAM_MAX_CHARS = 2 * 1024 * 1024
+function turnBudgetError(kind: 'text' | 'reasoning'): string {
+  const mib = TURN_STREAM_MAX_CHARS / (1024 * 1024)
+  return `The model streamed more than ${mib} MiB of ${kind} in a single turn; the run was stopped. Please send the request again`
+}
 const COMPACT_KEEP_RECENT_BYTES = 96 * 1024
 /** Pre-truncation of each tool output in the summary request (the compaction request itself must not blow up on huge outputs) */
 const SUMMARIZE_TOOL_OUTPUT_MAX = 2_000
 const SUMMARIZE_TIMEOUT_MS = 30_000
 /** When over budget mid-run, keep the last N tool messages verbatim and truncate earlier outputs to this length */
+/** Provider prompt caches expire after about five idle minutes: past that, rewriting history costs nothing */
+const CACHE_WARM_MS = 5 * 60 * 1000
+/** Stale context snapshots tolerated in a warm history before they are folded in one rewrite */
+const STALE_CONTEXT_MAX_BYTES = 48 * 1024
 const STALE_TOOL_KEEP_RECENT = 2
 const STALE_TOOL_OUTPUT_MAX = 1_000
 
@@ -86,11 +105,41 @@ export const DEFAULT_MAX_TURNS = 100
 const MAX_INPUT_PARSE_RETRIES = 3
 
 /**
+ * Whether a property's own JSON Schema declares null as an acceptable value.
+ * A tool that genuinely takes null (e.g. clearing a style value) says so in
+ * the schema, so the required-field check must not reject it. Covers the
+ * spellings in use: `type: ['string','null']`, OpenAPI/Gemini `nullable: true`,
+ * an enum listing null, and an anyOf/oneOf branch typed null.
+ */
+function schemaAcceptsNull(schema: unknown): boolean {
+  if (!schema || typeof schema !== 'object') return false
+  const s = schema as {
+    type?: unknown
+    nullable?: unknown
+    enum?: unknown
+    anyOf?: unknown
+    oneOf?: unknown
+  }
+  if (s.nullable === true) return true
+  // `type` is a bare "null" in an anyOf/oneOf branch, a list in `type: ['string','null']`
+  if (s.type === 'null') return true
+  if (Array.isArray(s.type) && s.type.includes('null')) return true
+  if (Array.isArray(s.enum) && s.enum.includes(null)) return true
+  for (const branch of [s.anyOf, s.oneOf]) {
+    if (Array.isArray(branch) && branch.some((b) => schemaAcceptsNull(b))) return true
+  }
+  return false
+}
+
+/**
  * Required fields the model left out of a tool call, per the tool's JSON
  * Schema. Providers turn an empty argument stream into `{}` without an
  * inputError (the model wrote prose instead of arguments, or a gateway dropped
  * the argument stream), so without this check the empty object reaches the
  * skill and fails with a tool-specific message instead of a targeted retry.
+ * `null` counts as missing too: a garbled field arrives as `"ops": null`, and
+ * downstream coercion (Number(null) === 0) would pass a silently wrong value
+ * to the tool. A field whose schema declares null as valid is exempt.
  */
 export function missingRequiredFields(
   tool: AgentToolDef | undefined,
@@ -98,9 +147,187 @@ export function missingRequiredFields(
 ): string[] {
   const required = tool?.inputSchema.required
   if (!Array.isArray(required)) return []
-  return required.filter(
-    (field): field is string => typeof field === 'string' && input[field] === undefined,
+  const properties = tool?.inputSchema.properties
+  const propSchema = (field: string): unknown =>
+    properties && typeof properties === 'object' && !Array.isArray(properties)
+      ? (properties as Record<string, unknown>)[field]
+      : undefined
+  return required.filter((field): field is string => {
+    if (typeof field !== 'string') return false
+    const value = input[field]
+    if (value === undefined) return true
+    return value === null && !schemaAcceptsNull(propSchema(field))
+  })
+}
+
+/** Plain object (not null, not an array) — the only schema/value shape we walk into */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Nesting cap for `items`; a value deeper than this is passed through unvalidated */
+const MAX_SCHEMA_DEPTH = 4
+
+/**
+ * Why one value contradicts one property schema, or undefined when it is fine.
+ * Deliberately not a JSON Schema implementation: only the keywords this repo's
+ * tools actually declare are honoured, and a schema that declares none of them
+ * always returns undefined so a permissive or schema-less tool keeps working.
+ */
+function schemaViolation(
+  value: unknown,
+  schema: Record<string, unknown>,
+  depth: number,
+): string | undefined {
+  if (depth > MAX_SCHEMA_DEPTH) return undefined
+  // enum: only trusted when every member is a primitive, otherwise comparing
+  // would need a deep-equality walk this does not do
+  const allowed = schema.enum
+  if (
+    Array.isArray(allowed) &&
+    allowed.every((v) => v === null || (!isPlainRecord(v) && typeof v !== 'function'))
+  ) {
+    if (!allowed.some((v) => Object.is(v, value))) {
+      return `expected one of ${allowed.map((v) => JSON.stringify(v)).join(', ')}`
+    }
+  }
+  // type: a string, or an array of strings. Keywords we do not model are dropped
+  // from the list; an all-unknown list means "unconstrained", not "invalid".
+  const declared = (Array.isArray(schema.type) ? schema.type : [schema.type]).filter(
+    (t): t is string => typeof t === 'string',
   )
+  const typeNames = declared.filter((t) => TYPE_CHECKS[t])
+  if (typeNames.length > 0 && !typeNames.some((t) => TYPE_CHECKS[t]!(value))) {
+    return `expected ${typeNames.join(' or ')}`
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    // draft-04 spells exclusivity as a boolean sibling; honour it so the
+    // boundary value is not rejected by an inclusive check
+    if (
+      typeof schema.minimum === 'number' &&
+      schema.exclusiveMinimum !== true &&
+      value < schema.minimum
+    ) {
+      return `must be >= ${schema.minimum}`
+    }
+    if (
+      typeof schema.maximum === 'number' &&
+      schema.exclusiveMaximum !== true &&
+      value > schema.maximum
+    ) {
+      return `must be <= ${schema.maximum}`
+    }
+  }
+  if (typeof value === 'string') {
+    if (typeof schema.minLength === 'number' && value.length < schema.minLength) {
+      return `must be at least ${schema.minLength} characters`
+    }
+    if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) {
+      return `must be at most ${schema.maxLength} characters`
+    }
+  }
+  // items: only the single-schema form; a tuple (array of schemas) is out of scope
+  if (Array.isArray(value) && isPlainRecord(schema.items)) {
+    for (let i = 0; i < value.length; i++) {
+      const bad = schemaViolation(value[i], schema.items, depth + 1)
+      if (bad) return `item ${i} ${bad}`
+    }
+  }
+  return undefined
+}
+
+/** JSON Schema primitive types this repo's tools declare; NaN is not a valid number */
+const TYPE_CHECKS: Record<string, (value: unknown) => boolean> = {
+  string: (v) => typeof v === 'string',
+  number: (v) => typeof v === 'number' && Number.isFinite(v),
+  integer: (v) => typeof v === 'number' && Number.isInteger(v),
+  boolean: (v) => typeof v === 'boolean',
+  array: (v) => Array.isArray(v),
+  object: (v) => isPlainRecord(v),
+  null: (v) => v === null,
+}
+
+/**
+ * Fields the model *sent* but whose value contradicts the tool's own JSON
+ * Schema ({"count": "twelve"}, {"rows": 999999999999} against a bounded
+ * integer). Such a value otherwise reaches the tool, which coerces it
+ * (Number("twelve") -> NaN, a capped range silently clamped) and returns a
+ * confident wrong answer — where missingRequiredFields would have produced a
+ * targeted retry instead.
+ *
+ * Only `properties` are inspected, and a field with no declared constraints is
+ * never reported: a tool with an empty, missing, or non-JSON-Schema inputSchema
+ * (this repo has `{}` and `{ type: 'object' }` tools) validates nothing, exactly
+ * as before. Absent fields are skipped — they belong to missingRequiredFields.
+ */
+export function invalidArgumentFields(
+  tool: AgentToolDef | undefined,
+  input: Record<string, unknown>,
+): string[] {
+  // `?.` on inputSchema as well: a tool can arrive over IPC without one
+  const properties = tool?.inputSchema?.properties
+  if (!isPlainRecord(properties)) return []
+  const violations: string[] = []
+  for (const [field, fieldSchema] of Object.entries(properties)) {
+    if (!isPlainRecord(fieldSchema)) continue
+    const value = input[field]
+    if (value === undefined) continue
+    const violation = schemaViolation(value, fieldSchema, 0)
+    if (violation) violations.push(`"${field}" ${violation}`)
+  }
+  return violations
+}
+
+/**
+ * Repairs the argument shapes weaker models emit that every handler used to
+ * accept silently before invalidArgumentFields existed: a numeric string in a
+ * number/integer field becomes a number, a number is clamped into a declared
+ * minimum/maximum (the handlers clamp too, so this only spares a retry), and a
+ * value that still violates a field whose schema declares a `default` is
+ * replaced by it. Anything else is left for invalidArgumentFields.
+ */
+export function coerceArgumentFields(
+  tool: AgentToolDef | undefined,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const properties = tool?.inputSchema?.properties
+  if (!isPlainRecord(properties)) return input
+  let out = input
+  for (const [field, fieldSchema] of Object.entries(properties)) {
+    if (!isPlainRecord(fieldSchema)) continue
+    const value = input[field]
+    if (value === undefined) continue
+    let next = value
+    const declared = (
+      Array.isArray(fieldSchema.type) ? fieldSchema.type : [fieldSchema.type]
+    ).filter((t): t is string => typeof t === 'string')
+    const numeric = declared.includes('number') || declared.includes('integer')
+    if (numeric && typeof value === 'string' && value.trim() !== '') {
+      const n = Number(value)
+      if (Number.isFinite(n) && (declared.includes('number') || Number.isInteger(n))) next = n
+    }
+    if (typeof next === 'number' && Number.isFinite(next)) {
+      const { minimum, maximum, exclusiveMinimum, exclusiveMaximum } = fieldSchema
+      let clamped: number = next
+      if (typeof minimum === 'number' && exclusiveMinimum !== true)
+        clamped = Math.max(clamped, minimum)
+      if (typeof maximum === 'number' && exclusiveMaximum !== true)
+        clamped = Math.min(clamped, maximum)
+      next = clamped
+    }
+    if (
+      fieldSchema.default !== undefined &&
+      schemaViolation(next, fieldSchema, 0) !== undefined &&
+      schemaViolation(fieldSchema.default, fieldSchema, 0) === undefined
+    ) {
+      next = fieldSchema.default
+    }
+    if (next !== value) {
+      if (out === input) out = { ...input }
+      out[field] = next
+    }
+  }
+  return out
 }
 
 /**
@@ -110,6 +337,27 @@ export function missingRequiredFields(
  */
 const MAX_IDENTICAL_TURNS = 3
 const MAX_ALL_ERROR_TURNS = 8
+/**
+ * Redundant-read guard. The identical-turn guard misses the common weak-model
+ * loop where every call differs slightly yet nothing moves: image_search with a
+ * new keyword each turn and "(no images)" every time, or re-reading an
+ * attachment slice already read. A non-mutating turn is redundant when a call
+ * repeats an earlier (tool, input) with the same output, or an earlier (tool,
+ * output) from a different input. The streak is nudged first, then aborted.
+ */
+const REDUNDANT_READ_NUDGE_TURNS = 4
+const MAX_REDUNDANT_READ_TURNS = 12
+/** identical (tool, input) calls allowed before the next one counts as redundant regardless of its output */
+const REPEATED_INPUT_FREE_CALLS = 2
+const REDUNDANT_READ_NOTE =
+  '[System] Recent tool calls re-read material already read, or returned the same result as an earlier call, without making progress. ' +
+  'Stop gathering: continue the task with what you already have, or tell the user what is missing.'
+
+function hashString(s: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
+  return `${s.length}:${h >>> 0}`
+}
 
 /**
  * Backoff schedule for in-place same-turn retries on empty-stream errors.
@@ -194,6 +442,13 @@ const SUMMARIZE_SYSTEM =
 const COMPACT_SUMMARY_PREFIX = '[Summary of earlier conversation'
 const COMPACT_SUMMARY_HEADER = '[Summary of earlier conversation (auto-compacted)]'
 const COMPACT_SUMMARY_ACK = 'Understood, continuing from the progress so far.'
+/** Replaces an earlier run's document snapshot in its user message once a newer run carries the current one */
+export const CONTEXT_OMITTED_NOTE =
+  '[Document context attached to this earlier request omitted; the latest request carries the current state]'
+
+/** Leads a fresh snapshot while earlier ones are still unfolded in history */
+export const CONTEXT_SUPERSEDES_NOTE =
+  '[Current state. It supersedes the context attached to earlier requests in this conversation]'
 
 /** Approximate UTF-8 byte count (ASCII 1 byte, CJK etc. 3; surrogate pairs count as 6 — slight overestimate is harmless) */
 function utf8Size(s: string): number {
@@ -262,10 +517,17 @@ export class AgentLoop<TSnapshot = unknown> {
   /** signature (text + tool calls) of the previous turn, for the identical-turn guard */
   private lastTurnSig = ''
   private identicalTurns = 0
+  /** non-mutating calls since the last edit: (tool, input) → output hash, and the set of (tool, output) hashes */
+  private readOutputs = new Map<string, string>()
+  /** how often each (tool, input) was called since the last edit */
+  private readInputCounts = new Map<string, number>()
+  private readOutputSigs = new Set<string>()
+  private redundantReadTurns = 0
   private allErrorTurns = 0
   private turnStopReason: string | null = null
   private turnText = ''
   private turnReasoning = ''
+  private retryTimer: ReturnType<typeof setTimeout> | null = null
   private toolCalls: AgentToolCall[] = []
   /** tools actually executed during this run, fed to skill.verifyResponse */
   private executedCalls: ExecutedToolCall[] = []
@@ -273,6 +535,14 @@ export class AgentLoop<TSnapshot = unknown> {
   private verifyRetryUsed = false
   /** user message of the in-flight run; a failed run rolls it (and everything after) back out of history */
   private runUserMsg: AgentMessage | null = null
+  /** earlier runs' user messages that still carry a skill-context snapshot, each with the bare instruction to rebuild it without */
+  private staleContexts: Array<{ msg: AgentMessage; instruction: string }> = []
+  /** when the last model request went out (0 = never): the prompt cache is warm for CACHE_WARM_MS after it */
+  private lastRequestAt = 0
+  /** usage the provider reported for the turn now streaming (null until it reports) */
+  private turnUsage: AgentTokenUsage | null = null
+  /** usage summed across the turns of the in-flight run (null when nothing reported) */
+  private runUsage: AgentTokenUsage | null = null
   /** invalidates stale transport callbacks after cancel/reset */
   private generation = 0
   /** per-run abort: aborted on cancel(); long tools (e.g. generate_deck) use it to break internal loops */
@@ -311,9 +581,31 @@ export class AgentLoop<TSnapshot = unknown> {
     // Unanswered user messages (a failed or interrupted run persisted them without a
     // reply) must not re-enter the model context: trailing ones would pair with the
     // next instruction as one turn, adjacent ones read as a combined instruction
-    this.history = normalized.filter(
+    const answered = normalized.filter(
       (m, i) => m.role !== 'user' || (normalized[i + 1] && normalized[i + 1]!.role !== 'user'),
     )
+    // An assistant message whose tool calls never received results (a run interrupted
+    // between the model's tool call and its execution) would reach the provider as
+    // unpaired tool_calls and 400 the next turn. Pair each orphan call with an
+    // isError result — the same signal the cancel path synthesizes — so the
+    // transcript stays valid and the model can retry the call.
+    const paired: AgentMessage[] = []
+    for (let i = 0; i < answered.length; i++) {
+      const m = answered[i]!
+      paired.push(m)
+      if (m.role === 'assistant' && m.toolCalls?.length && answered[i + 1]?.role !== 'tool') {
+        paired.push({
+          role: 'tool',
+          results: m.toolCalls.map((call) => ({
+            id: call.id,
+            name: call.name,
+            output: TOOL_ABORTED_OUTPUT,
+            isError: true,
+          })),
+        })
+      }
+    }
+    this.history = paired
     if (this.history.length === 0) return
     if (this.compactionEnabled()) {
       const { maxBytes, keepRecentBytes } = this.compactBudget()
@@ -344,24 +636,83 @@ export class AgentLoop<TSnapshot = unknown> {
     this.lastTurnSig = ''
     this.identicalTurns = 0
     this.allErrorTurns = 0
+    this.readOutputs.clear()
+    this.readOutputSigs.clear()
+    this.readInputCounts.clear()
+    this.redundantReadTurns = 0
     this.executedCalls = []
     this.verifyRetryUsed = false
     this.abortController = new AbortController()
-    const context = this.options.skill.buildContext?.() ?? ''
+    // buildContext and formatUserMessage are consumer-supplied and run before any
+    // turn exists, so a throw here would escape run() with `running` still true:
+    // the guard at the top then drops every later message silently, cancel()
+    // no-ops, and only reset() frees the loop. composeSkills fans buildContext out
+    // to every sub-skill, each of which reads the live document, so a document
+    // mid-transition is enough to wedge the panel. The user message was never
+    // pushed, so the rollback in failRun() is a no-op and only the report matters.
+    try {
+      const fresh = this.options.skill.buildContext?.() ?? ''
+      // no fresh snapshot to supersede the old ones: they must not stay in view
+      this.foldStaleContexts(!fresh)
+      // an unfolded earlier snapshot is still in view: the model must not address the document by it
+      const context =
+        fresh && this.staleContexts.length > 0 ? `${CONTEXT_SUPERSEDES_NOTE}\n${fresh}` : fresh
+      const userMsg: AgentMessage = {
+        role: 'user',
+        text: this.formatUser(instruction, context),
+        ...(images?.length ? { images } : {}),
+      }
+      void this.beginRun(userMsg, context ? instruction : null)
+    } catch (err) {
+      this.failRun(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  private formatUser(instruction: string, context: string): string {
     const format =
       this.options.formatUserMessage ??
       ((instr: string, ctx: string) => (ctx ? `${instr}\n\n${ctx}` : instr))
-    const userMsg: AgentMessage = {
-      role: 'user',
-      text: format(instruction, context),
-      ...(images?.length ? { images } : {}),
+    return format(instruction, context)
+  }
+
+  /**
+   * Every run's user message carries a fresh document snapshot (outline +
+   * selection, tens of KB in Docs) and only the newest one is useful to the
+   * model. Replacing a stale one rewrites history from that message on, which
+   * drops the provider's cached prefix for everything after it, so the fold
+   * waits for a moment the rewrite is free or due anyway: the cache has gone
+   * cold, the stale snapshots outgrew their allowance, or the history is over
+   * the compaction budget. Runs inside run()'s guard: formatUserMessage is
+   * consumer code.
+   */
+  private foldStaleContexts(force: boolean): void {
+    const stale = this.staleContexts.filter((c) => this.history.includes(c.msg))
+    this.staleContexts = stale
+    if (stale.length === 0) return
+    const cold = this.clock() - this.lastRequestAt >= CACHE_WARM_MS
+    const bulky = stale.reduce((n, c) => n + messageSize(c.msg), 0) > STALE_CONTEXT_MAX_BYTES
+    const overBudget =
+      this.compactionEnabled() && historySize(this.history) > this.compactBudget().maxBytes
+    if (!force && !cold && !bulky && !overBudget) return
+    for (const { msg, instruction } of stale) {
+      if (msg.role !== 'user') continue
+      this.history[this.history.indexOf(msg)] = {
+        ...msg,
+        text: this.formatUser(sanitizeAgentPayload(instruction), CONTEXT_OMITTED_NOTE),
+      }
     }
-    void this.beginRun(userMsg)
+    this.staleContexts = []
+  }
+
+  private clock(): number {
+    return this.options.now?.() ?? Date.now()
   }
 
   /** Compact (if needed), push the user message, then start the turn. Compaction failure doesn't block the run. */
-  private async beginRun(userMsg: AgentMessage): Promise<void> {
+  private async beginRun(userMsg: AgentMessage, instruction: string | null): Promise<void> {
     const generation = this.generation
+    // reset before compaction so the summary turn's billing folds into this run
+    this.runUsage = null
     try {
       await this.maybeCompact()
     } catch {
@@ -386,6 +737,7 @@ export class AgentLoop<TSnapshot = unknown> {
       userMsg = { ...userMsg, text: sanitizeAgentPayload(userMsg.text) }
     }
     this.runUserMsg = userMsg
+    if (instruction !== null) this.staleContexts.push({ msg: userMsg, instruction })
     this.history.push(userMsg)
     this.startTurn()
   }
@@ -447,10 +799,20 @@ export class AgentLoop<TSnapshot = unknown> {
     const dropped = this.history.slice(0, cut)
     const opt = this.options.compaction === false ? undefined : this.options.compaction
     let summary: string | null = null
-    if (!opt?.disableLlmSummary) summary = await this.summarizeViaLlm(dropped)
+    let summaryUsage: AgentTokenUsage | null = null
+    if (!opt?.disableLlmSummary) {
+      ;({ text: summary, usage: summaryUsage } = await this.summarizeViaLlm(dropped))
+    }
     // A reset may have cleared history or started a new conversation while
     // the summary was pending. Discard its result before touching that history.
     if (generation !== this.generation) return
+    // The summary turn bills like any other model call: fold it into the run
+    // total and surface it, so compaction spend is visible instead of silent.
+    if (summaryUsage) {
+      this.turnUsage = summaryUsage
+      this.mergeRunUsage()
+      this.options.events?.onUsage?.(summaryUsage)
+    }
     if (!summary) summary = mechanicalDigest(dropped)
     this.history = [
       { role: 'user', text: `${COMPACT_SUMMARY_HEADER}\n${summary}` },
@@ -459,8 +821,10 @@ export class AgentLoop<TSnapshot = unknown> {
     ]
   }
 
-  /** Hand the folded conversation to the model for a summary; returns null on failure/timeout (falls back to the mechanical digest). */
-  private summarizeViaLlm(dropped: readonly AgentMessage[]): Promise<string | null> {
+  /** Hand the folded conversation to the model for a summary; text is null on failure/timeout (falls back to the mechanical digest). */
+  private summarizeViaLlm(
+    dropped: readonly AgentMessage[],
+  ): Promise<{ text: string | null; usage: AgentTokenUsage | null }> {
     // Slim down the summary request itself: pre-truncate tool outputs, strip images
     const slim: AgentMessage[] = dropped.map((m) => {
       if (m.role === 'tool') {
@@ -477,13 +841,14 @@ export class AgentLoop<TSnapshot = unknown> {
     })
     return new Promise((resolve) => {
       let text = ''
+      let usage: AgentTokenUsage | null = null
       let settled = false
       let handle: AgentStreamHandle | null = null
       const finish = (v: string | null) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
-        resolve(v)
+        resolve({ text: v, usage })
       }
       const timer = setTimeout(() => {
         finish(null)
@@ -507,6 +872,9 @@ export class AgentLoop<TSnapshot = unknown> {
             },
             onToolCall: () => {
               /* the summary turn gets no tools */
+            },
+            onUsage: (u) => {
+              usage = u
             },
             onDone: () => finish(text.trim() || null),
             onError: () => finish(null),
@@ -548,8 +916,29 @@ export class AgentLoop<TSnapshot = unknown> {
   cancel(): void {
     if (!this.running) return
     this.cancelled = true
+    this.turnUsage = null
     // abort lets long tools mid-execution (internal LLM loops etc.) stop promptly
     this.abortController?.abort()
+    // Waiting out a retry backoff: finalize here. A run that already committed
+    // tool turns (or showed text) ends like a mid-stream cancel; one that
+    // produced nothing is rolled back instead of recording a placeholder reply
+    if (this.retryTimer) {
+      this.clearRetryTimer()
+      this.running = false
+      if (this.history.at(-1) !== this.runUserMsg || this.turnText) {
+        this.dropTurnLimitNote()
+        this.history.push({ role: 'assistant', text: this.turnText || COMPLETED_VIA_TOOLS_TEXT })
+        this.runUserMsg = null
+      } else {
+        this.rollbackFailedRun()
+      }
+      this.options.events?.onDone?.({
+        text: this.turnText,
+        cancelled: true,
+        turnLimit: this.finalizing,
+      })
+      return
+    }
     // the transport emits onDone after aborting, which finalizes the run
     this.handle?.cancel()
   }
@@ -557,6 +946,7 @@ export class AgentLoop<TSnapshot = unknown> {
   /** drop the conversation (e.g. when a different document is opened) */
   reset(): void {
     this.generation++
+    this.clearRetryTimer()
     this.abortController?.abort()
     this.handle?.cancel()
     this.handle = null
@@ -564,11 +954,82 @@ export class AgentLoop<TSnapshot = unknown> {
     this.cancelled = false
     this.history = []
     this.runUserMsg = null
+    this.staleContexts = []
+    this.lastRequestAt = 0
   }
 
-  /** Runs at run boundaries only (restore / before a new user message): a long run's tail is all assistant/tool messages, and cutting mid-run would empty the request. */
+  private dropTurnLimitNote(): void {
+    if (!this.finalizing) return
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const m = this.history[i]!
+      if (m.role === 'user' && m.text === TURN_LIMIT_NOTE) {
+        this.history.splice(i, 1)
+        break
+      }
+    }
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer)
+    this.retryTimer = null
+  }
+
+  /**
+   * Terminal failure path for the callback guard sites: clear `running` (or
+   * every later message is silently dropped, and even cancel() no-ops), roll
+   * the failed instruction back out of history so no orphaned tool_use is left
+   * behind, then report. onError is the consumer's last callback, so a throw
+   * from it must not escape and wedge the loop a second time.
+   */
+  private failRun(message: string): void {
+    // the request that threw may still be streaming: retire its generation and
+    // cancel it so a later run() cannot overlap with it
+    this.generation++
+    this.clearRetryTimer()
+    this.abortController?.abort()
+    this.handle?.cancel()
+    this.handle = null
+    this.running = false
+    this.turnUsage = null
+    this.rollbackFailedRun()
+    try {
+      this.options.events?.onError?.(message)
+    } catch {
+      // nothing left to notify
+    }
+  }
+
+  /**
+   * finishTurn() runs consumer-supplied callbacks (onToolStart, onToolExecuted
+   * with its snapshotBefore, onTurnEnd, onDone) and the captureSnapshot hook.
+   * Its promise is discarded, so a throw from any of them would escape as an
+   * unhandled rejection and leave `running` true forever. Same terminal-state
+   * guarantee as the tools-getter guard in startTurn().
+   */
+  private settleTurn(): void {
+    void this.finishTurn().catch((err: unknown) => {
+      this.failRun(err instanceof Error ? err.message : String(err))
+    })
+  }
+
+  /** Fold the turn's reported usage into the run total: every turn bills its own
+   * prompt and completion afresh, so the run's figures are the per-turn sum
+   * (sides the provider never reported stay absent). Consumes the turn's figure
+   * so a later fold (the next turn's start or the run's onDone) cannot double it. */
+  private mergeRunUsage(): void {
+    if (!this.turnUsage) return
+    this.runUsage = addTokenUsage(this.runUsage, this.turnUsage)
+    this.turnUsage = null
+  }
+
+  /** Runs at run boundaries only (restore / before a new user message): a long run's tail is all assistant/tool messages, and cutting mid-run would empty the request.
+   * The byte budget (compaction) is the real context bound; this count cap is a
+   * backstop against pathological message counts. It must sit well above the
+   * message count a compacted history reaches, because every trim drops the
+   * head of the request — silently losing context AND invalidating the
+   * provider's prompt cache from byte 0. */
   private trimHistory(): void {
-    const max = this.options.maxHistory ?? 40
+    const max = this.options.maxHistory ?? 200
     if (this.history.length <= max) return
     // cut only at a user message so tool_use/tool_result pairs stay intact
     let i = this.history.length - max
@@ -581,12 +1042,16 @@ export class AgentLoop<TSnapshot = unknown> {
 
   private startTurn(retriesUsed = 0): void {
     const generation = this.generation
+    // a tool turn is ending here: fold its usage into the run total before the new turn resets it
+    this.mergeRunUsage()
     this.turnText = ''
     this.turnReasoning = ''
     this.toolCalls = []
     this.turnStopReason = null
+    this.turnUsage = null
     // Some transports emit an extra onDone after cancel — this turn may finalize only once
     let settled = false
+    this.lastRequestAt = this.clock()
     try {
       this.handle = this.options.transport.stream(
         {
@@ -601,11 +1066,28 @@ export class AgentLoop<TSnapshot = unknown> {
           onDelta: (text) => {
             if (generation !== this.generation || settled) return
             this.turnText += text
-            this.options.events?.onText?.(this.turnText)
+            if (this.turnText.length > TURN_STREAM_MAX_CHARS) {
+              settled = true
+              this.failRun(turnBudgetError('text'))
+              return
+            }
+            try {
+              this.options.events?.onText?.(this.turnText)
+            } catch (err) {
+              // A transport drives onDelta from its own async event handler
+              // (see the Electron IPC transport), so this throw never reaches
+              // the try/catch around stream() below.
+              settled = true
+              this.failRun(err instanceof Error ? err.message : String(err))
+            }
           },
           onReasoning: (text) => {
             if (generation !== this.generation || settled) return
             this.turnReasoning += text
+            if (this.turnReasoning.length > TURN_STREAM_MAX_CHARS) {
+              settled = true
+              this.failRun(turnBudgetError('reasoning'))
+            }
           },
           onToolCall: (call) => {
             if (generation !== this.generation || settled) return
@@ -615,10 +1097,20 @@ export class AgentLoop<TSnapshot = unknown> {
             if (generation !== this.generation || settled) return
             this.turnStopReason = reason
           },
+          onUsage: (usage) => {
+            if (generation !== this.generation || settled) return
+            this.turnUsage = usage
+            try {
+              this.options.events?.onUsage?.(usage)
+            } catch (err) {
+              settled = true
+              this.failRun(err instanceof Error ? err.message : String(err))
+            }
+          },
           onDone: () => {
             if (generation !== this.generation || settled) return
             settled = true
-            void this.finishTurn()
+            this.settleTurn()
           },
           onError: (error) => {
             if (generation !== this.generation || settled) return
@@ -639,13 +1131,9 @@ export class AgentLoop<TSnapshot = unknown> {
               this.toolCalls.length === 0
             const delay = retryEmpty ? emptyDelay : EMPTY_STREAM_RETRY_DELAYS_MS[0]
             if ((retryEmpty || retryDrop) && !this.cancelled) {
-              setTimeout(() => {
+              this.retryTimer = setTimeout(() => {
+                this.retryTimer = null
                 if (generation !== this.generation) return
-                // Stopped during the backoff window: finalize like a normal cancel
-                if (this.cancelled) {
-                  void this.finishTurn()
-                  return
-                }
                 this.startTurn(retriesUsed + 1)
               }, delay)
               return
@@ -700,15 +1188,7 @@ export class AgentLoop<TSnapshot = unknown> {
       // ends. Left in history it would tell every later run "no more tools may
       // be called" — a stale directive models obey (or worse, echo verbatim
       // over and over; see public issue about BYOK models repeating it).
-      if (this.finalizing) {
-        for (let i = this.history.length - 1; i >= 0; i--) {
-          const m = this.history[i]!
-          if (m.role === 'user' && m.text === TURN_LIMIT_NOTE) {
-            this.history.splice(i, 1)
-            break
-          }
-        }
-      }
+      this.dropTurnLimitNote()
       // Models often end a tool-using run with an empty text turn ("I'm done").
       // Leaving assistant text empty in history then poisons the next user
       // prompt: Anthropic rejects empty content arrays, Gemini rejects empty
@@ -722,12 +1202,14 @@ export class AgentLoop<TSnapshot = unknown> {
       this.history.push({ role: 'assistant', text: this.turnText || COMPLETED_VIA_TOOLS_TEXT })
       this.running = false
       this.runUserMsg = null
+      this.mergeRunUsage()
       events?.onDone?.({
         text: this.turnText,
         cancelled: this.cancelled,
         turnLimit: this.finalizing,
         // set only when true so exact-shape consumers/tests stay unaffected
         ...(this.turnStopReason === 'max_tokens' && !this.cancelled ? { truncated: true } : {}),
+        ...(this.runUsage ? { usage: this.runUsage } : {}),
       })
       return
     }
@@ -753,11 +1235,17 @@ export class AgentLoop<TSnapshot = unknown> {
     const generation = this.generation
     const results: AgentToolResult[] = []
     let turnMutated = false
+    let redundantRead = false
     // unusable-input streak is counted per turn: a batch of empty calls in one
     // turn is one failed attempt, and any executed call in the turn resets it
     let unusableInTurn = false
     let executedInTurn = false
-    for (const call of toolCalls) {
+    for (const rawCall of toolCalls) {
+      const tool = skill.tools.find((t) => t.name === rawCall.name)
+      const call =
+        rawCall.truncated || rawCall.inputError
+          ? rawCall
+          : { ...rawCall, input: coerceArgumentFields(tool, rawCall.input) }
       // The user hit stop while an earlier tool was running: skip remaining tools,
       // but fill in paired error results to keep tool_use/tool_result pairs valid for the next request
       if (this.cancelled) {
@@ -771,20 +1259,21 @@ export class AgentLoop<TSnapshot = unknown> {
       }
       // Unusable input (truncated by the token limit, or JSON that failed to parse):
       // don't execute; feed a targeted error back so the model retries correctly
-      const missing =
-        call.truncated || call.inputError
-          ? []
-          : missingRequiredFields(
-              skill.tools.find((t) => t.name === call.name),
-              call.input,
-            )
-      if (call.truncated || call.inputError || missing.length > 0) {
+      const unreadable = call.truncated || call.inputError
+      const missing = unreadable ? [] : missingRequiredFields(tool, call.input)
+      // A value that contradicts the schema is as unusable as a missing one, and
+      // is reported last: telling the model which field is absent is what it needs first.
+      const invalid =
+        unreadable || missing.length > 0 ? [] : invalidArgumentFields(tool, call.input)
+      if (unreadable || missing.length > 0 || invalid.length > 0) {
         unusableInTurn = true
         const output = call.truncated
           ? 'Tool arguments were cut off by the output length limit; the tool was not executed. Split this operation into several smaller tool calls (less content per call) and try again.'
           : call.inputError
             ? `Tool input JSON failed to parse; the tool was not executed: ${call.inputError}\nFix the arguments (make sure quotes inside strings are escaped) and call again.`
-            : `Tool call ${call.name} is missing the required argument(s) ${missing.map((f) => `"${f}"`).join(', ')}; the tool was not executed. Put the arguments in the tool call itself (not in your reply text) and call again with every required field.`
+            : missing.length > 0
+              ? `Tool call ${call.name} is missing the required argument(s) ${missing.map((f) => `"${f}"`).join(', ')}; the tool was not executed. Put the arguments in the tool call itself (not in your reply text) and call again with every required field.`
+              : `Tool call ${call.name} got ${invalid.length === 1 ? 'an argument' : 'arguments'} that do not match the tool's input schema — ${invalid.join('; ')}; the tool was not executed. Call again with every value of the declared type and within the declared limits (a number must be a bare JSON number, not a quoted string).`
         results.push({ id: call.id, name: call.name, output, isError: true })
         events?.onToolExecuted?.({
           call,
@@ -826,6 +1315,22 @@ export class AgentLoop<TSnapshot = unknown> {
       if (execution.mutated) {
         this.mutationSeen = true
         turnMutated = true
+      } else {
+        const inSig = `${call.name}\0${JSON.stringify(call.input)}`
+        const outHash = hashString(execution.output)
+        const outSig = `${call.name}\0${outHash}`
+        const seen = this.readInputCounts.get(inSig) ?? 0
+        // the same query a third time is a loop even when the results keep
+        // shuffling (web search churn); one repeat stays free for poll-style tools
+        if (
+          this.readOutputs.get(inSig) === outHash ||
+          this.readOutputSigs.has(outSig) ||
+          seen >= REPEATED_INPUT_FREE_CALLS
+        )
+          redundantRead = true
+        this.readInputCounts.set(inSig, seen + 1)
+        this.readOutputs.set(inSig, outHash)
+        this.readOutputSigs.add(outSig)
       }
       results.push({
         id: call.id,
@@ -838,6 +1343,19 @@ export class AgentLoop<TSnapshot = unknown> {
         execution,
         snapshotBefore: firstMutation ? snapshot : undefined,
       })
+    }
+    if (turnMutated) {
+      this.readOutputs.clear()
+      this.readOutputSigs.clear()
+      this.readInputCounts.clear()
+      this.redundantReadTurns = 0
+    } else if (redundantRead) {
+      if (++this.redundantReadTurns === REDUNDANT_READ_NUDGE_TURNS) {
+        const last = results[results.length - 1]!
+        last.output = `${last.output}\n\n${REDUNDANT_READ_NOTE}`
+      }
+    } else {
+      this.redundantReadTurns = 0
     }
     this.history.push({ role: 'tool', results })
     if (executedInTurn) this.inputParseFails = 0
@@ -870,6 +1388,15 @@ export class AgentLoop<TSnapshot = unknown> {
       this.rollbackFailedRun()
       events?.onError?.(
         `Every tool call failed for ${MAX_ALL_ERROR_TURNS} turns in a row; the run was stopped. Please send the request again`,
+      )
+      return
+    }
+
+    if (this.redundantReadTurns >= MAX_REDUNDANT_READ_TURNS) {
+      this.running = false
+      this.rollbackFailedRun()
+      events?.onError?.(
+        `The model kept re-reading the same material or getting the same result for ${MAX_REDUNDANT_READ_TURNS} turns without making progress; the run was stopped. Please send the request again`,
       )
       return
     }
@@ -935,15 +1462,17 @@ export function sanitizeAgentPayload(payload: string): string {
       .replace(/\b(?:sk-|AIza|ghp_|secret_)[A-Za-z0-9_-]{16,}/g, '[REDACTED_API_KEY]')
       .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED_API_KEY]')
       .replace(/\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g, '[REDACTED_API_KEY]')
-      .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+):[^\s@/]+@/gi, '$1:[REDACTED_CREDENTIALS]@')
+      // Bounded scheme run: an unbounded one backtracks quadratically on a long hex/alnum run.
+      .replace(/([a-z][a-z0-9+.-]{0,30}:\/\/[^\s:@/]+):[^\s@/]+@/gi, '$1:[REDACTED_CREDENTIALS]@')
       .replace(
         /(password|passwd|secret_key|private_key)(\s*[:=]\s*)["'][^"']+["']/gi,
         '$1$2"[REDACTED_SECURE_TOKEN]"',
       )
       // Unquoted `password=abc123`: the value must be 6+ chars with a non-letter,
       // so "password: is in the vault" prose stays untouched.
+      // Bounded prefix for the same reason; 64 chars keeps the match set identical.
       .replace(
-        /(?<!\/)(\w*(?:password|passwd|secret_key|private_key))(\s*[:=]\s*)(?=[^\s"',;]*[^A-Za-z\s"',;])[^\s"',;]{6,}/gi,
+        /(?<!\/)(\w{0,64}(?:password|passwd|secret_key|private_key))(\s*[:=]\s*)(?=[^\s"',;]*[^A-Za-z\s"',;])[^\s"',;]{6,}/gi,
         '$1$2[REDACTED_SECURE_TOKEN]',
       )
   )

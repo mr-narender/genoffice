@@ -1,10 +1,25 @@
 import JSZip from 'jszip'
+import { pictureLinkToken, resolvePictureLinkTokens, withPictureLink } from './link-fields'
+import { bindUnboundPrefixes, ignorePrefix, rootNamespaces } from './xml-namespaces'
+import { maxDrawingId, regroupDrawings, type DrawingGroup } from './group-drawings'
+import {
+  applyRevisionResolutions,
+  cleanMoveRangeMarkers,
+  resolvePropChangeXml,
+} from './revision-xml'
+import { REDACT_EL, REDACT_NS, REDACT_PREFIX } from '@genoffice/agent-core/redact-range'
 import {
   applyImageWrap,
   generateParagraphXml,
   inlineRunsXml,
   mergePPrFormat,
   splitXmlChildren,
+  inlinePictureDrawingXml,
+  NEW_PICTURE_SVG_SUFFIX,
+  NEW_PICTURE_TOKEN_PREFIX,
+  patchTableCellTexts,
+  svgBlipExt,
+  type CellParaPatch,
 } from './generate'
 import {
   NOTE_CONTENT_TYPE,
@@ -21,12 +36,32 @@ import {
   stripInkRuns,
 } from './ink'
 import { resolveRelationshipTargetPath } from './parse-package'
-import { assertZipWithinLimits, resolveMainDocumentPath, type ParseExtras } from './parse'
-import { cleanupDocxOwnedResources } from './resource-cleanup'
+import {
+  applyRemoveParts,
+  planRemoveParts,
+  removePartsRefusalMessageFor,
+  type RemovePartsOptions,
+} from './remove-parts'
+import {
+  HF_DRAWING_RE,
+  assertZipWithinLimits,
+  hfSinglePictureFrag,
+  resolveMainDocumentPath,
+  type ParseExtras,
+} from './parse'
+import { cleanupDocxOwnedResources, referencedRelationshipIds } from './resource-cleanup'
+import {
+  KEY_CUSTOMIZATIONS_CONTENT_TYPE,
+  KEY_CUSTOMIZATIONS_PART_PATH,
+  KEY_CUSTOMIZATIONS_REL_TYPE,
+  keyCustomizationsPath,
+} from './key-customizations'
 import { loadDocxZip } from './zip-load'
 import {
   BLANK_NUMBERING_XML,
   abstractNumXml,
+  listStyleAbstractNumXml,
+  listStyleXml,
   customLevelXml,
   mergeLevelXml,
   numPicBulletXml,
@@ -34,7 +69,10 @@ import {
 } from './blank'
 import {
   applyPageNumType,
+  applySectionNoteProps,
   applySectionSettings,
+  defaultSectPrXml,
+  applySettingsNoteProps,
   applySectionStartType,
   applyTitlePg,
   hfReferenceRId,
@@ -47,38 +85,58 @@ import {
   buildSourcesItemPropsXml,
   buildSourcesXml,
   findSourcesPart,
+  type CitationStyleId,
 } from './sources'
 import {
   THEME_CONTENT_TYPE,
   THEME_PART_PATH,
   THEME_REL_TYPE,
-  applyThemeColors,
-  applyThemeFonts,
-  buildThemeXml,
+  editedThemeXml,
+  type ThemeFormat,
 } from './theme'
-import { buildChartPartXml, buildChartWorkbookXlsxBase64, CHART_WORKBOOK_REL_TYPE } from './chart'
+import {
+  buildChartPartXml,
+  buildChartWorkbookXlsxBase64,
+  CHART_WORKBOOK_REL_TYPE,
+  scatterXValues,
+} from './chart'
 import type {
   CommentInfo,
   DocProtection,
+  KinsokuCustom,
+  MailMergeMainType,
+  DrawingGrid,
   WriteProtection,
   GeneratedBlock,
   HeaderFooter,
+  HfPictureLink,
+  HfParagraph,
+  Run,
   NewChart,
   NewImage,
   NewInkImage,
   NoteInfo,
+  NoteProps,
   ParsedDoc,
+  RevisionInfo,
   SdtShell,
+  PageNumberChapter,
   SectionSettings,
   SourceInfo,
+  StyleInfo,
   ThemeColors,
   ThemeFonts,
 } from './types'
-import { PAGE_MARK, TOTAL_PAGES_MARK } from './types'
+import { PAGE_MARK, SECTION_PAGES_MARK, TOTAL_PAGES_MARK } from './types'
 import { patchParagraphTexts } from './text-patch'
 import { balanceFieldChars } from './field-balance'
 import {
+  builtInHeadingStyleUpsert,
+  builtInHfStyleUpsert,
   mergeDefaultFontsXml,
+  dropStyleRefsXml,
+  hasStyleXml,
+  styleRemovalIds,
   upsertStyleXml,
   type DefaultFonts,
   type StyleUpsert,
@@ -94,13 +152,315 @@ import {
 } from './watermark'
 import { escapeXmlAttr, escapeXmlText } from './xml-utils'
 import {
+  buildContentControlXml,
+  nextContentControlId,
+  type ContentControlSpec,
+} from './content-control'
+import {
   CUSTOM_PROPERTIES_CONTENT_TYPE,
   CUSTOM_PROPERTIES_PATH,
   CUSTOM_PROPERTIES_REL_TYPE,
   patchZoteroDocumentDataXml,
 } from './zotero-doc-props'
+import { applyPropertyChanges, type PropertyChanges } from './doc-properties'
+import { patchHfPicturesXml } from './run-picture'
+import {
+  injectIntoParagraph,
+  paragraphPermMarkers,
+  restoreParagraphPermMarkers,
+} from './perm-ranges'
+import { saveMathPr, type MathPrEdit } from './math-pr'
+
+/**
+ * Relationship attributes are read quote-agnostically and with any spacing
+ * around `=`, because a .rels part may legally spell them either way. An
+ * id read as "absent" is worse than no read at all: the counter that hands out
+ * new rIds restarts below one that is already taken, and the save emits a
+ * duplicate Id into the same part. Same rule as the pptx engine's reader.
+ */
+const RELATIONSHIP_ID_NUMBER = /\bId\s*=\s*(["'])rId(\d+)\1/g
+const RELATIONSHIP_ID = /\bId\s*=\s*(["'])([^"']*)\1/
+const RELATIONSHIP_TYPE = /\bType\s*=\s*(["'])([^"']*)\1/
+const RELATIONSHIP_TARGET = /\bTarget\s*=\s*(["'])([^"']*)\1/
+
+/** One <Relationship .../> empty tag, either quote style. */
+const RELATIONSHIP_TAG = /<Relationship\b[^>]*\/>/g
+
+/**
+ * wp:docPr/@id of a drawing, either quote style. Read to find the ids the
+ * document already owns, for the same reason as RELATIONSHIP_ID_NUMBER above:
+ * an id read as "absent" is worse than no read at all, because a new picture
+ * then mints one that is already in use.
+ */
+const DRAWING_DOCPR_ID = /<wp:docPr\s[^>]*?\bid\s*=\s*(["'])(\d+)\1/g
+
+/** w:id of a bookmark endpoint, either quote style */
+const BOOKMARK_ID = /<w:bookmark(?:Start|End)\s[^>]*?\bid\s*=\s*(["'])(\d+)\1/g
+
+/** wp:docPr/@id of a newly embedded picture is DOCPR_ID_BASE + its sequence */
+const DOCPR_ID_BASE = 9000
+
+/**
+ * CT_Settings child sequence (ECMA-376 17.15.1.78), in schema order. The type is
+ * an xsd:sequence, so a child written at the wrong position makes Word offer to
+ * repair the part. Local names, because a settings part may spell its elements
+ * with the w: prefix or with a default namespace.
+ */
+const SETTINGS_CHILD_ORDER = [
+  'writeProtection',
+  'view',
+  'zoom',
+  'removePersonalInformation',
+  'removeDateAndTime',
+  'doNotDisplayPageBoundaries',
+  'displayBackgroundShape',
+  'printPostScriptOverText',
+  'printFractionalCharacterWidth',
+  'printFormsData',
+  'embedTrueTypeFonts',
+  'embedSystemFonts',
+  'saveSubsetFonts',
+  'saveFormsData',
+  'mirrorMargins',
+  'alignBordersAndEdges',
+  'bordersDoNotSurroundHeader',
+  'bordersDoNotSurroundFooter',
+  'gutterAtTop',
+  'hideSpellingErrors',
+  'hideGrammaticalErrors',
+  'activeWritingStyle',
+  'proofState',
+  'formsDesign',
+  'attachedTemplate',
+  'linkStyles',
+  'stylePaneFormatFilter',
+  'stylePaneSortMethod',
+  'documentType',
+  'mailMerge',
+  'revisionView',
+  'trackRevisions',
+  'doNotTrackMoves',
+  'doNotTrackFormatting',
+  'documentProtection',
+  'autoFormatOverride',
+  'styleLockTheme',
+  'styleLockQFSet',
+  'defaultTabStop',
+  'autoHyphenation',
+  'consecutiveHyphenLimit',
+  'hyphenationZone',
+  'doNotHyphenateCaps',
+  'showEnvelope',
+  'summaryLength',
+  'clickAndTypeStyle',
+  'defaultTableStyle',
+  'evenAndOddHeaders',
+  'bookFoldRevPrinting',
+  'bookFoldPrinting',
+  'bookFoldPrintingSheets',
+  'drawingGridHorizontalSpacing',
+  'drawingGridVerticalSpacing',
+  'displayHorizontalDrawingGridEvery',
+  'displayVerticalDrawingGridEvery',
+  'doNotUseMarginsForDrawingGridOrigin',
+  'drawingGridHorizontalOrigin',
+  'drawingGridVerticalOrigin',
+  'doNotShadeFormData',
+  'noPunctuationKerning',
+  'characterSpacingControl',
+  'printTwoOnOne',
+  'strictFirstAndLastChars',
+  'noLineBreaksAfter',
+  'noLineBreaksBefore',
+  'savePreviewPicture',
+  'doNotValidateAgainstSchema',
+  'saveInvalidXml',
+  'ignoreMixedContent',
+  'alwaysShowPlaceholderText',
+  'doNotDemarcateInvalidXml',
+  'saveXmlDataOnly',
+  'useXSLTWhenSaving',
+  'saveThroughXslt',
+  'showXMLTags',
+  'alwaysMergeEmptyNamespace',
+  'updateFields',
+  'hdrShapeDefaults',
+  'footnotePr',
+  'endnotePr',
+  'compat',
+  'docVars',
+  'rsids',
+  'mathPr',
+  'uiCompat97To2003',
+  'attachedSchema',
+  'themeFontLang',
+  'clrSchemeMapping',
+  'doNotIncludeSubdocsInStats',
+  'doNotAutoCompressPictures',
+  'forceUpgrade',
+  'captions',
+  'readModeInkLockDown',
+  'smartTagType',
+  'schemaLibrary',
+  'shapeDefaults',
+  'doNotEmbedSmartTags',
+  'decimalSymbol',
+  'listSeparator',
+] as const
+
+/** an element start tag anywhere in the part, capturing the local name */
+const ELEMENT_LOCAL_NAME = /<(?:[A-Za-z0-9._-]+:)?([A-Za-z0-9._-]+)[\s/>]/g
+
+/** rank of a CT_Settings child; -1 for a child this list does not model */
+function settingsChildRank(localName: string): number {
+  return (SETTINGS_CHILD_ORDER as readonly string[]).indexOf(localName)
+}
+
+/**
+ * Insert `childXml` as a child of the w:settings root at its CT_Settings
+ * position, leaving every other child byte-identical. Each apply* used to
+ * insert right after the open tag, so whichever ran last took the first slot
+ * and a save touching several settings came out in the reverse of the sequence.
+ */
+function insertSettingsChild(xml: string, localName: string, childXml: string): string {
+  const rank = settingsChildRank(localName)
+  for (const m of xml.matchAll(ELEMENT_LOCAL_NAME)) {
+    // Anchor on a child whose position this list knows: an unmodeled element
+    // (including the w:settings root itself) could sit anywhere in the
+    // sequence, so it is not a safe place to cut.
+    if (settingsChildRank(m[1]) > rank) {
+      const at = m.index
+      return xml.slice(0, at) + childXml + xml.slice(at)
+    }
+  }
+  // nothing modeled to order against: land last, or after the root open tag
+  const close = xml.match(/<\/(?:[A-Za-z0-9._-]+:)?settings>/)
+  if (close?.index !== undefined) {
+    return xml.slice(0, close.index) + childXml + xml.slice(close.index)
+  }
+  return xml.replace(/(<([A-Za-z0-9._-]+:)?settings\b[^>]*>)/, `$1${childXml}`)
+}
+
+/**
+ * The <Relationship> tag carrying a given Id, either quote style and with any
+ * spacing around `=`. Used both to reclaim the relationship a superseded
+ * watermark owned and to tell which ids the part already hands out, so the two
+ * stay consistent: an id the reclaim failed to free is never the one reissued.
+ */
+const relTagWithId = (id: string): RegExp =>
+  new RegExp(`<Relationship\\s[^>]*\\bId\\s*=\\s*(["'])${id}\\1[^>]*/>`)
+
+/** The `<Relationship ` half of relTagWithId's shape, which anchors a candidate tag. */
+const RELATIONSHIP_TAG_MARKER = /<Relationship\s/
+
+/**
+ * An exact `Id="rIdN"` inside a candidate tag. The id text is captured
+ * verbatim, so a zero-padded `rId02` is kept distinct from `rId2` exactly as
+ * relTagWithId's literal comparison keeps them distinct.
+ */
+const RELATIONSHIP_TAG_ID = /\bId\s*=\s*(["'])(rId\d+)\1/g
+
+/**
+ * Every relationship id a .rels part already hands out. One pass over the part,
+ * answering the same question as relTagWithId for every id at once: a tag only
+ * counts when it opens with `<Relationship `, self-closes, and spells that id
+ * inside itself, so the ids the allocator treats as taken stay exactly the ids
+ * the reclaim can free. Testing one candidate id at a time instead costs a full
+ * scan of the part per candidate, which is quadratic in the relationship count -
+ * a few MB of relationships then takes minutes to allocate a single id.
+ */
+const occupiedRelIds = (relsXml: string): Set<string> => {
+  const taken = new Set<string>()
+  let pos = 0
+  while (pos < relsXml.length) {
+    const gt = relsXml.indexOf('>', pos)
+    if (gt === -1) break
+    // relTagWithId's `[^>]*` cannot cross a `>`, so one candidate tag is one
+    // `>`-delimited run, and it only matches when that run self-closes
+    if (relsXml[gt - 1] === '/') {
+      const chunk = relsXml.slice(pos, gt)
+      const marker = chunk.search(RELATIONSHIP_TAG_MARKER)
+      if (marker !== -1) {
+        RELATIONSHIP_TAG_ID.lastIndex = marker
+        let m: RegExpExecArray | null
+        while ((m = RELATIONSHIP_TAG_ID.exec(chunk)) !== null) taken.add(m[2])
+      }
+    }
+    pos = gt + 1
+  }
+  return taken
+}
+
+/**
+ * Lowest id from rId1 this part does not already hand out, so a gap is reused
+ * rather than skipped. Deliberately not maxRelId + 1: that never fills a gap and
+ * starts at rId1001 for an absent part, so it would hand out a different id
+ * than the part's own numbering implies.
+ */
+export const nextFreeRelId = (relsXml: string): string => {
+  const taken = occupiedRelIds(relsXml)
+  let n = 1
+  while (taken.has(`rId${n}`)) n++
+  return `rId${n}`
+}
 
 export type ParsedDocFull = ParsedDoc & { extras: ParseExtras }
+
+/** the original body block a save block came from, when it has one */
+function saveBlockDocxIndex(fb: SaveBlock): number | undefined {
+  if (fb.kind === 'original') return fb.docxIndex
+  if (fb.kind === 'generated' || fb.kind === 'xml') return fb.docxIndex
+  return undefined
+}
+
+/**
+ * Editing-permission markers of top-level paragraphs that are gone (joined
+ * into the paragraph above, or deleted) go to the nearest paragraph still
+ * there. An end moves back to the paragraph before the one that was removed,
+ * so a range whose last paragraph was merged into the one above still closes
+ * after the merged paragraph. Without it the start stayed, the end vanished,
+ * and on reopen the range ran to the end of the document, unlocking it all. A
+ * start moves forward to the next paragraph. Markers still in the body stay
+ * where they are; each one is written once.
+ */
+function rehomeLostPermMarkers(
+  parts: string[],
+  placed: ReadonlyArray<{ part: number; docxIndex: number | undefined }>,
+  elements: ReadonlyArray<{ name: string; start: number; end: number }>,
+  documentXml: string,
+): void {
+  const kept = new Set(placed.map((p) => p.docxIndex).filter((i) => i !== undefined))
+  const isParagraph = (part: number) =>
+    /^<w:p[\s>]/.test(parts[part]!) && parts[part]!.endsWith('</w:p>')
+  let body = parts.join('')
+  elements.forEach((el, index) => {
+    if (el.name !== 'w:p' || kept.has(index)) return
+    const { starts, ends } = paragraphPermMarkers(documentXml.slice(el.start, el.end))
+    const lostStarts = starts.filter((m) => !body.includes(m))
+    const lostEnds = ends.filter((m) => !body.includes(m))
+    if (lostStarts.length === 0 && lostEnds.length === 0) return
+    // the first block that came after the removed paragraph in the original
+    const next = placed.findIndex((p) => p.docxIndex !== undefined && p.docxIndex > index)
+    const before = (next === -1 ? placed : placed.slice(0, next)).filter((p) => isParagraph(p.part))
+    const after = (next === -1 ? [] : placed.slice(next)).filter((p) => isParagraph(p.part))
+    const endHome = before[before.length - 1] ?? after[0]
+    const startHome = after[0] ?? before[before.length - 1]
+    if (lostEnds.length > 0 && endHome) {
+      // a paragraph after the removed one takes the end at its start: nothing of it is covered
+      parts[endHome.part] =
+        endHome === before[before.length - 1]
+          ? injectIntoParagraph(parts[endHome.part]!, '', lostEnds.join(''))
+          : injectIntoParagraph(parts[endHome.part]!, lostEnds.join(''), '')
+    }
+    if (lostStarts.length > 0 && startHome) {
+      parts[startHome.part] =
+        startHome === after[0]
+          ? injectIntoParagraph(parts[startHome.part]!, lostStarts.join(''), '')
+          : injectIntoParagraph(parts[startHome.part]!, '', lostStarts.join(''))
+    }
+    body = parts.join('')
+  })
+}
 
 /** Body content in final editor order (hidden trailing elements are appended automatically). */
 export type SaveBlock = (
@@ -115,7 +475,10 @@ export type SaveBlock = (
       kind: 'xml'
       xml: string
       docxIndex?: number
-      replaceImage?: { base64: string; mime: NewImage['mime'] }
+      /** svgBase64: the new bytes as an SVG, written beside the bitmap */
+      replaceImage?: { base64: string; mime: NewImage['mime']; svgBase64?: string }
+      /** the outside file the fragment's picture is linked to from now on; null breaks the link */
+      imageLink?: string | null
     }
   /** a new inline image; bytes become word/media/... + relationship */
   | { kind: 'image'; image: NewImage }
@@ -126,22 +489,45 @@ export type SaveBlock = (
   | { kind: 'chart'; chart: NewChart; extentPx?: { w: number; h: number } }
 ) & {
   /** Top-level tracked insertion/deletion wrapper. */
-  revision?: { kind: 'ins' | 'del'; author: string; date?: string; id?: string }
+  revision?: { kind: 'ins' | 'del' } & RevisionInfo
 }
 
 export interface SaveOptions {
   /** save timestamp (ISO), written to docProps/core.xml dcterms:modified; default = now */
   savedAt?: string
+  /**
+   * Block-level content controls (w:sdt) for the saved body. `wrap` puts the
+   * listed body blocks into one new control (the blocks stay individually
+   * editable). `unwrap` removes the wrapper of every control with that tag and
+   * leaves its blocks as plain body children; nested controls are unwrapped
+   * level by level (unwrapping an inner tag keeps the outer shell, unwrapping
+   * the outer tag keeps inner controls as their blocks' own shells) and a tag
+   * that appears more than once is unwrapped everywhere. Inline (run-level)
+   * controls are reported read-only and are not unwrapped by this option.
+   */
+  contentControls?: {
+    wrap?: Array<{ docxIndexes: number[]; spec: ContentControlSpec }>
+    unwrap?: Array<{ tag: string }>
+  }
+  /** first revision id the save may mint; a caller that assigned ids itself passes the one after its last */
+  revisionIdFloor?: number
+  /** total page count at save time: the cached result written into NUMPAGES fields (viewers that do not recompute fields show it); default 1 */
+  pageCount?: number
+  /** bytes of pictures the editor placed inside existing paragraphs (table cells),
+   *  keyed by the placeholder token their drawing XML carries (NEW_PICTURE_TOKEN_PREFIX) */
+  newPictures?: Record<string, { base64: string; mime: NewImage['mime']; svgBase64?: string }>
   /** Zotero document preferences; written as Word-compatible 255-character custom-property chunks */
   zoteroDocumentData?: string
   /** replace the trailing w:sectPr with this XML before the field-level options below apply (headless editors that keep the sectPr itself) */
   trailingSectPr?: string
+  /** resolve the trailing sectPr's tracked w:sectPrChange: accept drops the record, reject restores the previous sectPr */
+  trailingSectPrChange?: 'accept' | 'reject'
   /** rewrite page size / margins in the trailing w:sectPr */
   section?: SectionSettings
   /** last-section start type (w:type); rewrites the trailing sectPr when inserting a continuous section break; undefined = keep */
   sectionStartType?: 'nextPage' | 'continuous' | 'evenPage' | 'oddPage' | 'nextColumn'
   /** last-section page numbering (w:pgNumType): both fmt/start unset = remove the tag; undefined = keep */
-  pgNumType?: { fmt?: string; start?: number }
+  pgNumType?: { fmt?: string; start?: number; chapter?: PageNumberChapter | null }
   /** page color: hex without '#' to set, null to remove, undefined to keep as-is */
   pageColor?: string | null
   /** replace/create the default page header (single centered line); undefined = keep */
@@ -186,6 +572,41 @@ export interface SaveOptions {
   evenAndOddHeaders?: boolean
   /** mirrored facing pages: set/remove settings.xml w:mirrorMargins */
   mirrorMargins?: boolean
+  /** Hide Grammar Errors: set/remove settings.xml w:hideGrammaticalErrors */
+  hideGrammaticalErrors?: boolean
+  /** Track Changes left on at save time: set/remove settings.xml w:trackRevisions */
+  trackRevisions?: boolean
+  /** Track moves: remove/set settings.xml w:doNotTrackMoves */
+  trackMoves?: boolean
+  /** automatic hyphenation of the whole document: set/remove settings.xml w:autoHyphenation */
+  autoHyphenation?: boolean
+  /** the finer hyphenation rules of settings.xml; only the fields given are written */
+  hyphenation?: {
+    /** false writes w:doNotHyphenateCaps */
+    caps?: boolean
+    /** w:consecutiveHyphenLimit; 0 = no limit (the element is removed) */
+    consecutiveLimit?: number
+    /** w:hyphenationZone, twips */
+    zoneTwips?: number
+  }
+  /** the gap between default tab stops, twips: settings.xml w:defaultTabStop */
+  defaultTabStopTwips?: number
+  /** section gutters sit at the top of the page instead of the binding side: set/remove settings.xml w:gutterAtTop */
+  gutterAtTop?: boolean
+  /** the document is a mail-merge main document of that kind (settings.xml w:mailMerge w:mainDocumentType); null: it is none */
+  mailMergeMainType?: MailMergeMainType | null
+  /** justified East Asian lines compress punctuation: settings.xml w:characterSpacingControl */
+  compressPunctuation?: boolean
+  /** with compressPunctuation: the value written is compressPunctuationAndJapaneseKana */
+  compressKana?: boolean
+  /** Word's Strict kinsoku level: set/remove settings.xml w:strictFirstAndLastChars */
+  strictFirstAndLastChars?: boolean
+  /** Word's Custom kinsoku level: set settings.xml w:noLineBreaksBefore / After, null removes them */
+  kinsokuCustom?: KinsokuCustom | null
+  /** the drawing grid: every settings.xml grid element is set from it, a field left out is removed */
+  drawingGrid?: DrawingGrid
+  /** the document's equation defaults: settings.xml m:mathPr (only the fields that changed are written) */
+  mathPr?: MathPrEdit
   /**
    * Inject the newly created header/footer references into EVERY body sectPr
    * that has none (not just the trailing one). Generated multi-section
@@ -213,6 +634,29 @@ export interface SaveOptions {
     levelEdits?: Array<{ abstractNumId: string; ilvl: number; level: CustomNumberingLevel }>
     /** new w:numPicBullet images referenced by levels' picBulletId */
     picBullets?: Array<{ id: number; base64: string; mime: NewImage['mime'] }>
+    /**
+     * Lists that follow a named list style: a w:num over a new abstractNum carrying only
+     * w:numStyleLink. `define` also writes the style (type "numbering"), its abstractNum
+     * (w:styleLink + levels) and the style's own w:num, when styles.xml has no such style.
+     */
+    styleNums?: Array<{
+      numId: string
+      styleId: string
+      define?: { name: string; numId: string; levels: CustomNumberingLevel[]; custom?: boolean }
+    }>
+    /** list styles defined before any list follows them: style, abstractNum and the style's w:num; user-made unless `builtIn` */
+    styleDefs?: Array<{
+      styleId: string
+      name: string
+      numId: string
+      levels: CustomNumberingLevel[]
+      builtIn?: boolean
+    }>
+    /**
+     * List styles deleted from the document: the w:style goes; the abstractNum that defined it
+     * and the ones that followed it stay as ordinary definitions with the levels written out.
+     */
+    removedStyles?: string[]
   }
   /** create/modify styles: surgical upsert of word/styles.xml by styleId (replace when present, else append) */
   styleUpserts?: StyleUpsert[]
@@ -252,8 +696,18 @@ export interface SaveOptions {
   footnotes?: NoteInfo[]
   endnotes?: NoteInfo[]
   /**
-   * Watermark in the default page header: a string / text spec / picture spec
-   * sets it, null removes it, undefined keeps whatever the header already has.
+   * Note placement and numbering for the whole document (w:footnotePr / w:endnotePr):
+   * the fields given are set in settings.xml and in every section of the body.
+   */
+  noteProps?: { footnote?: NoteProps; endnote?: NoteProps }
+  /**
+   * The same, for settings.xml alone: the caller writes each section's own
+   * properties through its section settings.
+   */
+  settingsNoteProps?: { footnote?: NoteProps; endnote?: NoteProps }
+  /**
+   * Watermark in every active section header: a string / text spec / picture spec
+   * sets it, null removes it, undefined keeps each header's existing watermark.
    */
   watermark?: Watermark | null
   /**
@@ -262,12 +716,40 @@ export interface SaveOptions {
    * passing [] removes all our ink. undefined = keep whatever is in the file.
    */
   inks?: NewInkImage[]
+  /**
+   * Drawings to save as one group each. A member's `block` indexes the body
+   * blocks passed in; a group whose members cannot be merged is left as
+   * separate drawings.
+   */
+  groups?: DrawingGroup[]
+  /** blocks that stand for drawings of the paragraph before them: saved inside that paragraph */
+  carried?: number[]
+  /** the whole Customizations part (keyboard assignments), replacing or creating it */
+  keyCustomizations?: string
   /** full bibliography source list; regenerates the b:Sources customXml part */
   sources?: SourceInfo[]
+  /** the citation style picked for the sources part (its SelectedStyle); needs `sources` */
+  sourcesStyle?: CitationStyleId
   /** theme font pair; patches (or creates) word/theme/theme1.xml */
   themeFonts?: ThemeFonts
   /** theme color scheme; patches (or creates) word/theme/theme1.xml */
   themeColors?: ThemeColors
+  /** theme name and format scheme of a whole-theme pick */
+  themeFormat?: ThemeFormat
+  /**
+   * Document properties to write into the docProps parts: a string sets a
+   * property, null removes it, clear: "all" empties all three parts. undefined
+   * keeps every property as it is.
+   */
+  properties?: PropertyChanges
+  /**
+   * Remove metadata-carrying package parts (customXml stores, web-extension
+   * parts, explicit paths) in the final package pass, together with their
+   * relationships, content-type entries and empty folders. Content controls
+   * bound to a removed customXml store refuse the save by default; pass
+   * dataBinding: 'strip' to unbind them and keep their text.
+   */
+  removeParts?: RemovePartsOptions
 }
 
 const HYPERLINK_REL_TYPE =
@@ -281,12 +763,27 @@ export type { StyleUpsert } from './style-upsert'
 
 const NUMBERING_REL_TYPE =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering'
+const STYLES_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles'
 const COMMENTS_EXT_REL_TYPE =
   'http://schemas.microsoft.com/office/2011/relationships/commentsExtended'
 const COMMENTS_REL_TYPE =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
 const SETTINGS_REL_TYPE =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings'
+import {
+  CHARTEX_CONTENT_TYPE,
+  CHARTEX_GRAPHIC_URI,
+  CHARTEX_MC_NS,
+  CHARTEX_REL_TYPE,
+  CHART_COLOR_STYLE_CONTENT_TYPE,
+  CHART_COLOR_STYLE_REL_TYPE,
+  CHART_STYLE_CONTENT_TYPE,
+  CHART_STYLE_REL_TYPE,
+  buildChartColorStylePartXml,
+  buildChartStylePartXml,
+  buildChartexPartXml,
+} from './chartex-build'
+
 const CHART_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart'
 const CHART_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml'
 const XLSX_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -308,7 +805,7 @@ function replaceAbstractNumLevel(
   )
   let body = abs[0]
   const existing = lvlRe.exec(body)?.[0]
-  if (existing) body = body.replace(existing, mergeLevelXml(existing, level, ilvl))
+  if (existing) body = body.replace(existing, () => mergeLevelXml(existing, level, ilvl))
   else {
     const lvlXml = customLevelXml(level, ilvl)
     const later = new RegExp(`<w:lvl [^>]*w:ilvl="(\\d)"`, 'g')
@@ -321,7 +818,38 @@ function replaceAbstractNumLevel(
     }
     body = body.slice(0, insertAt) + lvlXml + body.slice(insertAt)
   }
-  return xml.replace(abs[0], body)
+  return xml.replace(abs[0], () => body)
+}
+
+/**
+ * numbering.xml once a list style is deleted: its defining abstractNum drops
+ * w:styleLink, and each abstractNum that only pointed at the style
+ * (w:numStyleLink) takes a copy of the levels, so every w:num still resolves.
+ */
+export function unlinkListStyleXml(xml: string, styleId: string): string {
+  const id = escapeXmlAttr(styleId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const styleLink = new RegExp(`<w:styleLink\\s+w:val=(["'])${id}\\1\\s*/>`)
+  const numStyleLink = new RegExp(`<w:numStyleLink\\s+w:val=(["'])${id}\\1\\s*/>`)
+  const abstracts = /<w:abstractNum\b[^>]*>[\s\S]*?<\/w:abstractNum>/g
+  const defining = [...xml.matchAll(abstracts)].find((m) => styleLink.test(m[0]))?.[0]
+  const levels = defining?.match(/<w:lvl\b[^>]*(?:\/>|>[\s\S]*?<\/w:lvl>)/g)?.join('') ?? ''
+  return xml.replace(abstracts, (abs) => {
+    if (styleLink.test(abs)) return abs.replace(styleLink, '')
+    if (!numStyleLink.test(abs)) return abs
+    const own = /<w:lvl\b/.test(abs)
+    return (
+      abs
+        .replace(numStyleLink, '')
+        // a function: level text and style names may hold `$&`, which a replacement string expands
+        .replace('</w:abstractNum>', () => `${own ? '' : levels}</w:abstractNum>`)
+    )
+  })
+}
+
+const MEDIA_CONTENT_TYPE: Record<string, string> = {
+  png: 'image/png',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
 }
 
 const IMAGE_EXT: Record<NewImage['mime'], string> = {
@@ -329,8 +857,6 @@ const IMAGE_EXT: Record<NewImage['mime'], string> = {
   'image/jpeg': 'jpg',
   'image/gif': 'gif',
 }
-
-const EMU_PER_PX = 9525
 
 /**
  * Given the original docx bytes and a chart part path (e.g.
@@ -351,11 +877,15 @@ export async function findChartWorkbookPath(
     const relsFile = zip.file(relsPath)
     if (!relsFile) return null
     const relsXml = await relsFile.async('text')
-    // find Relationship with Type ending in /package
-    const m = relsXml.match(/Type="[^"]*\/package"[^/]*Target="([^"]+)"/)
-    if (!m) return null
-    const target = m[1]
-    return resolveRelationshipTargetPath(chartPath, target)
+    // find Relationship with Type ending in /package; attribute order is the
+    // producer's choice, so Type and Target are read off the tag separately
+    for (const tag of relsXml.match(RELATIONSHIP_TAG) ?? []) {
+      const type = RELATIONSHIP_TYPE.exec(tag)?.[2]
+      if (!type?.endsWith('/package')) continue
+      const target = RELATIONSHIP_TARGET.exec(tag)?.[2]
+      if (target) return resolveRelationshipTargetPath(chartPath, target)
+    }
+    return null
   } catch {
     return null
   }
@@ -399,13 +929,68 @@ function patchCoreProps(xml: string, savedAt?: string): string | null {
   return out === xml ? null : out
 }
 
+/** the paragraph style unstyled paragraphs resolve to (w:default), by id */
+function defaultParagraphStyleId(styles: ReadonlyMap<string, StyleInfo>): string | undefined {
+  for (const info of styles.values())
+    if (info.type === 'paragraph' && info.isDefault) return info.styleId
+  return undefined
+}
+
+/**
+ * Word's built-in Header / Footer styles a saved header or footer paragraph
+ * names while the document defines neither them nor a pending upsert of them.
+ */
+export function missingHfStyles(
+  options: SaveOptions,
+  styles: ReadonlyMap<string, StyleInfo>,
+  pending: readonly StyleUpsert[] = [],
+): Array<'header' | 'footer'> {
+  const parts = [
+    options.header,
+    options.footer,
+    options.headerFirst,
+    options.footerFirst,
+    options.headerEven,
+    options.footerEven,
+    ...(options.sectionHf ?? []).map((e) => e.hf),
+  ]
+  const named = new Set<string>()
+  for (const hf of parts) for (const p of hf?.paras ?? []) if (p.styleId) named.add(p.styleId)
+  const defined = (id: string) => styles.has(id) || pending.some((u) => u.styleId === id)
+  return (['header', 'footer'] as const).filter((kind) => {
+    const id = kind === 'header' ? 'Header' : 'Footer'
+    return named.has(id) && !defined(id)
+  })
+}
+
+/**
+ * Heading levels the generated body uses that the document has no heading
+ * style for. An explicit styleId (a custom heading style) and an outline-only
+ * heading (written as w:outlineLvl) carry themselves.
+ */
+export function missingHeadingLevels(
+  blocks: readonly SaveBlock[],
+  headingStyleIds: ReadonlyMap<number, string>,
+): number[] {
+  const missing = new Set<number>()
+  for (const fb of blocks) {
+    if (fb.kind !== 'generated') continue
+    const { block } = fb
+    if (block.type !== 'heading' || block.outlineOnly || block.styleId) continue
+    const level = Math.min(Math.max(block.level ?? 1, 1), 9)
+    if (!headingStyleIds.has(level)) missing.add(level)
+  }
+  return [...missing].sort((a, b) => a - b)
+}
+
 /**
  * Paragraph-patch save.
  *
  * - Blocks marked 'original' are copied as the exact substring of the original
  *   word/document.xml (byte-for-byte after UTF-8 re-encode).
  * - Blocks marked 'generated' become fresh OOXML fragments referencing only
- *   styles that already exist in the document.
+ *   styles that exist in the document — a heading level the document has no
+ *   style for gets Word's built-in definition added to word/styles.xml.
  * - 'xml' blocks are self-contained fragments inserted verbatim; 'image' blocks
  *   additionally add media entries and relationships.
  * - Every other zip entry is copied without modification.
@@ -431,6 +1016,7 @@ export async function saveDocx(
     ) &&
     options.section === undefined &&
     options.trailingSectPr === undefined &&
+    options.trailingSectPrChange === undefined &&
     options.zoteroDocumentData === undefined &&
     options.sectionStartType === undefined &&
     options.pgNumType === undefined &&
@@ -445,24 +1031,62 @@ export async function saveDocx(
     (options.sectionHf === undefined || options.sectionHf.length === 0) &&
     (options.sectionHfUnlink === undefined || options.sectionHfUnlink.length === 0) &&
     options.numbering === undefined &&
+    (options.groups === undefined || options.groups.length === 0) &&
+    (options.carried === undefined || options.carried.length === 0) &&
     options.defaultFonts === undefined &&
     (options.styleUpserts === undefined || options.styleUpserts.length === 0) &&
     options.evenAndOddHeaders === undefined &&
     options.mirrorMargins === undefined &&
+    options.hideGrammaticalErrors === undefined &&
+    options.trackRevisions === undefined &&
+    options.trackMoves === undefined &&
+    options.autoHyphenation === undefined &&
+    options.hyphenation === undefined &&
+    options.defaultTabStopTwips === undefined &&
+    options.gutterAtTop === undefined &&
+    options.mailMergeMainType === undefined &&
+    options.compressPunctuation === undefined &&
+    options.strictFirstAndLastChars === undefined &&
+    options.kinsokuCustom === undefined &&
+    options.drawingGrid === undefined &&
+    options.mathPr === undefined &&
     options.comments === undefined &&
     options.protection === undefined &&
     options.writeProtection === undefined &&
     options.removePersonalInfo === undefined &&
     options.footnotes === undefined &&
     options.endnotes === undefined &&
+    options.noteProps === undefined &&
+    options.settingsNoteProps === undefined &&
     options.watermark === undefined &&
     options.inks === undefined &&
     options.sources === undefined &&
+    options.keyCustomizations === undefined &&
     options.themeFonts === undefined &&
     options.themeColors === undefined &&
+    options.themeFormat === undefined &&
+    options.properties === undefined &&
+    options.contentControls === undefined &&
     (options.partXml === undefined || Object.keys(options.partXml).length === 0) &&
     (options.partBinary === undefined || Object.keys(options.partBinary).length === 0)
-  if (isUnchanged && !scrubPersonalInfo) return originalBytes
+  if (isUnchanged && !scrubPersonalInfo) {
+    // remove_parts may be the only requested change: when nothing matches, the
+    // package is already scrubbed and the original bytes are the right answer
+    if (options.removeParts === undefined) {
+      // the final save drops orphan move-range markers (cleanStoryMoveRanges);
+      // a document that only carries them must not take the no-op shortcut, or
+      // an accept / reject would report success yet save the junk back
+      // (genoffice#2554: the markers ride in the body, so the body is the check)
+      if (cleanMoveRangeMarkers(documentXml).removed === 0) return originalBytes
+    } else {
+      const plan = await planRemoveParts(originalBytes, options.removeParts)
+      // an op-level check already refuses these; this is the engine invariant:
+      // a save never applies a remove_parts set that names a structural part
+      if (plan.refusedPaths.length > 0)
+        throw new Error(removePartsRefusalMessageFor(plan.refusedPaths))
+      if (plan.removedPaths.length === 0) return originalBytes
+    }
+  }
 
   const zip = await loadDocxZip(originalBytes)
   assertZipWithinLimits(zip)
@@ -513,10 +1137,42 @@ export async function saveDocx(
     return rId
   }
 
+  // A heading the editor made in a document whose styles.xml has no heading
+  // style for that level (converter output, lean generators) would otherwise
+  // save as a bare paragraph and reopen as body text: the generator writes a
+  // heading as its level's style reference, and the gallery/AI leave styleId
+  // empty for a level the document does not define. Create Word's built-in
+  // definition for each such level so the paragraph carries it.
+  const headingStyleIds = new Map(parsed.headingStyleIds)
+  const headingUpserts: StyleUpsert[] = []
+  for (const level of missingHeadingLevels(finalBlocks, headingStyleIds)) {
+    const up = builtInHeadingStyleUpsert(level, defaultParagraphStyleId(parsed.styles))
+    headingUpserts.push(up)
+    headingStyleIds.set(level, up.styleId)
+  }
+  // a new header/footer paragraph names Word's built-in Header / Footer style:
+  // a document without it gets Word's definition, as Word adds it on first use
+  const hfUpserts = missingHfStyles(options, parsed.styles, options.styleUpserts).map((kind) =>
+    builtInHfStyleUpsert(kind, defaultParagraphStyleId(parsed.styles)),
+  )
+  const styleUpserts = [...(options.styleUpserts ?? []), ...headingUpserts, ...hfUpserts]
+
+  // Pre-rendered xml blocks (a rebuilt table's model xml) carry bookmark ids an
+  // editor-side allocator minted above the original document's: seed past those
+  // too, or a generated paragraph's bookmark would collide with one of them.
+  const preRenderedXml = finalBlocks
+    .filter((b) => b.kind === 'xml')
+    .map((b) => b.xml)
+    .join('')
   const genCtx = {
-    headingStyleIds: parsed.headingStyleIds,
+    headingStyleIds,
     listParagraphStyleId: parsed.listParagraphStyleId,
     allocateHyperlinkRel,
+    allocateBookmarkId: nextBookmarkIdAllocator(documentXml + preRenderedXml),
+    allocateRevisionId: nextRevisionIdAllocator(
+      [documentXml, ...(await storyPartsXml(zip))],
+      options.revisionIdFloor,
+    ),
   }
 
   const newMedia: Array<{ path: string; base64: string }> = []
@@ -525,7 +1181,9 @@ export async function saveDocx(
   const mediaRelByContent = new Map<string, string>()
   const mediaPathByContent = new Map<string, string>()
   let imageSeq = nextImageSeq(zip)
-  let docPrSeq = imageSeq
+  // docPr ids are minted from their own counter, so it has to start clear of
+  // both the media sequence and the ids already in the document
+  let docPrSeq = nextDocPrSeq(zip, documentXml)
   /** Land image bytes as a media part (no relationship); identical bytes share one part. */
   const landMedia = (image: {
     base64: string
@@ -568,21 +1226,43 @@ export async function saveDocx(
     }
     return rId
   }
+  const linkImageFile = (target: string): string => {
+    const rId = `rId${nextRelNum++}`
+    newRels.push({ rId, type: IMAGE_REL_TYPE, target, external: true })
+    return rId
+  }
+  const svgPathByContent = new Map<string, string>()
+  const landSvg = (svgBase64: string): string => {
+    let mediaPath = svgPathByContent.get(svgBase64)
+    if (mediaPath === undefined) {
+      mediaPath = `word/media/aidocs${imageSeq++}.svg`
+      newMedia.push({ path: mediaPath, base64: svgBase64 })
+      usedExtensions.add('svg')
+      svgPathByContent.set(svgBase64, mediaPath)
+    }
+    return mediaPath
+  }
+  const svgRelByContent = new Map<string, string>()
+  const embedSvg = (svgBase64: string): string => {
+    let rId = svgRelByContent.get(svgBase64)
+    if (rId === undefined) {
+      const mediaPath = landSvg(svgBase64)
+      rId = `rId${nextRelNum++}`
+      newRels.push({
+        rId,
+        type: IMAGE_REL_TYPE,
+        target: mediaPath.replace(/^word\//, ''),
+        external: false,
+      })
+      svgRelByContent.set(svgBase64, rId)
+    }
+    return rId
+  }
   const embedImage = (image: NewImage): string => {
     const rId = embedImageMedia(image)
-    const cx = Math.max(1, Math.round(image.widthPx * EMU_PER_PX))
-    const cy = Math.max(1, Math.round(image.heightPx * EMU_PER_PX))
-    // Word lays the drawing out against the unrotated wp:extent plus
-    // wp:effectExtent: a rotated non-square picture needs the bounding-box
-    // overflow recorded there (same math as patchImageParagraphXml)
-    const rot = image.rotDeg ? ((Math.round(image.rotDeg) % 360) + 360) % 360 : 0
-    const rad = (rot * Math.PI) / 180
-    const bw = Math.abs(cx * Math.cos(rad)) + Math.abs(cy * Math.sin(rad))
-    const bh = Math.abs(cx * Math.sin(rad)) + Math.abs(cy * Math.cos(rad))
-    const eeX = Math.max(0, Math.round((bw - cx) / 2))
-    const eeY = Math.max(0, Math.round((bh - cy) / 2))
+    const svgRId = image.svgBase64 ? embedSvg(image.svgBase64) : undefined
     // dedup means imageSeq does not advance for repeated bytes — docPr ids need their own counter
-    const docPrId = 9000 + ++docPrSeq
+    const docPrId = DOCPR_ID_BASE + ++docPrSeq
     const ps = image.paraSpacing
     const spacingAttrs: string[] = []
     if (ps?.beforeTwips && ps.beforeTwips > 0)
@@ -595,23 +1275,53 @@ export async function saveDocx(
     const spacing = spacingAttrs.length > 0 ? `<w:spacing ${spacingAttrs.join(' ')}/>` : ''
     const jc = image.align && image.align !== 'left' ? `<w:jc w:val="${image.align}"/>` : ''
     const pPr = spacing || jc ? `<w:pPr>${spacing}${jc}</w:pPr>` : ''
-    const xml =
-      `<w:p>${pPr}<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
-      `<wp:extent cx="${cx}" cy="${cy}"/>` +
-      `<wp:effectExtent l="${eeX}" t="${eeY}" r="${eeX}" b="${eeY}"/>` +
-      `<wp:docPr id="${docPrId}" name="Picture ${docPrId}"${image.altText ? ` descr="${escapeXmlAttr(image.altText)}"` : ''}/>` +
-      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
-      '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
-      '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
-      `<pic:nvPicPr><pic:cNvPr id="${docPrId}" name="Picture ${docPrId}"/><pic:cNvPicPr/></pic:nvPicPr>` +
-      `<pic:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
-      `<pic:spPr><a:xfrm${rot ? ` rot="${rot * 60000}"` : ''}${image.flipH ? ' flipH="1"' : ''}${image.flipV ? ' flipV="1"' : ''}><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
-      '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>' +
-      '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>'
+    const drawing = inlinePictureDrawingXml({ ...image, rId, svgRId, docPrId })
+    const xml = `<w:p>${pPr}<w:r>${drawing}</w:r></w:p>`
+    // posH/posV are the margin-relative align pair (Word position presets);
+    // applyImageWrap itself prefers posOffset when both are set, mirroring the
+    // original-image patch path (imagePatchOf)
+    const marginAlign =
+      image.posOffsetEmu === undefined && image.posH && image.posV
+        ? { h: image.posH, v: image.posV }
+        : undefined
     return image.wrap
-      ? applyImageWrap(xml, image.wrap, image.posOffsetEmu, undefined, image.zOrder)
+      ? applyImageWrap(xml, image.wrap, image.posOffsetEmu, marginAlign, image.zOrder)
       : xml
   }
+  /** Pictures the editor inserted into existing paragraphs (table cells) carry
+   *  a placeholder token for r:embed and the docPr id; land their bytes and
+   *  swap in the real ids. Two drawings never share a token, so the docPr id
+   *  minted per token stays unique. */
+  const resolveNewPictures = (xml: string): string => {
+    const pictures = options.newPictures
+    if (!pictures || !xml.includes(NEW_PICTURE_TOKEN_PREFIX)) return xml
+    const docPrIdOf = (token: string): number => {
+      let id = newPictureDocPrIds.get(token)
+      if (id === undefined) {
+        id = DOCPR_ID_BASE + ++docPrSeq
+        newPictureDocPrIds.set(token, id)
+      }
+      return id
+    }
+    return xml
+      .replace(
+        new RegExp(`r:embed="(${NEW_PICTURE_TOKEN_PREFIX}[0-9]+)${NEW_PICTURE_SVG_SUFFIX}"`, 'g'),
+        (whole, token: string) => {
+          const svg = pictures[token]?.svgBase64
+          return svg ? `r:embed="${embedSvg(svg)}"` : whole
+        },
+      )
+      .replace(
+        new RegExp(`(r:embed|id|name)="(Picture )?(${NEW_PICTURE_TOKEN_PREFIX}[0-9]+)"`, 'g'),
+        (whole, attr: string, prefix: string | undefined, token: string) => {
+          const picture = pictures[token]
+          if (!picture) return whole
+          if (attr === 'r:embed') return `r:embed="${embedImageMedia(picture)}"`
+          return `${attr}="${prefix ?? ''}${docPrIdOf(token)}"`
+        },
+      )
+  }
+  const newPictureDocPrIds = new Map<string, number>()
   /** the pictures' runs collected into the first picture's holder paragraph */
   const embedImages = (images: NewImage[]): string => {
     const paras = images.map(embedImage)
@@ -624,49 +1334,101 @@ export async function saveDocx(
   }
 
   // ---- new embedded charts: chart part + workbook + relationship + drawing paragraph ----
-  const newChartParts: Array<{ path: string; xml: string }> = []
+  const newChartParts: Array<{ path: string; xml: string; contentType: string }> = []
   const newChartWorkbooks: Array<{
     xlsxPath: string
     relsPath: string
     relsXml: string
     base64: string
   }> = []
-  let chartDocPrId = 8000
   const embedChart = async (
     chart: NewChart,
     extentPx?: { w: number; h: number },
   ): Promise<string> => {
+    // a chart of the 2014 extension is a part of its own kind, with its own names
+    const ex = chart.layout
+    const stem = ex ? 'chartEx' : 'chart'
     let n = 1
     while (
-      zip.file(`word/charts/chart${n}.xml`) ||
-      newChartParts.some((p) => p.path === `word/charts/chart${n}.xml`)
+      zip.file(`word/charts/${stem}${n}.xml`) ||
+      newChartParts.some((p) => p.path === `word/charts/${stem}${n}.xml`)
     ) {
       n++
     }
-    const path = `word/charts/chart${n}.xml`
+    const path = `word/charts/${stem}${n}.xml`
     const rId = `rId${nextRelNum++}`
-    newRels.push({ rId, type: CHART_REL_TYPE, target: `charts/chart${n}.xml`, external: false })
+    newRels.push({
+      rId,
+      type: ex ? CHARTEX_REL_TYPE : CHART_REL_TYPE,
+      target: `charts/${stem}${n}.xml`,
+      external: false,
+    })
 
     // Build embedded workbook and create chart rels part
-    const wbBase64 = await buildChartWorkbookXlsxBase64(chart.categories, chart.series)
-    const xlsxPath = `word/charts/embeddings/workbook${n}.xlsx`
+    // a scatter chart's x column is numbers: the chart part's c:xVal cache points at it
+    const wbBase64 = await buildChartWorkbookXlsxBase64(
+      chart.categories,
+      chart.series,
+      chart.kind === 'scatter' ? scatterXValues(chart.categories) : undefined,
+    )
+    const xlsxPath = `word/charts/embeddings/${ex ? 'workbookEx' : 'workbook'}${n}.xlsx`
     const wbRId = 'rId1'
+    // Word refuses a chartEx part that has no chart style and colour style beside it
+    const styleRels = ex
+      ? `<Relationship Id="rId2" Type="${CHART_STYLE_REL_TYPE}" Target="styleEx${n}.xml"/>` +
+        `<Relationship Id="rId3" Type="${CHART_COLOR_STYLE_REL_TYPE}" Target="colorsEx${n}.xml"/>`
+      : ''
     const chartRelsXml =
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
-      `<Relationship Id="${wbRId}" Type="${CHART_WORKBOOK_REL_TYPE}" Target="embeddings/workbook${n}.xlsx"/>` +
+      `<Relationship Id="${wbRId}" Type="${CHART_WORKBOOK_REL_TYPE}" Target="embeddings/${ex ? 'workbookEx' : 'workbook'}${n}.xlsx"/>` +
+      styleRels +
       '</Relationships>'
-    newChartParts.push({ path, xml: buildChartPartXml(chart, wbRId) })
+    if (ex)
+      newChartParts.push(
+        {
+          path: `word/charts/styleEx${n}.xml`,
+          xml: buildChartStylePartXml(),
+          contentType: CHART_STYLE_CONTENT_TYPE,
+        },
+        {
+          path: `word/charts/colorsEx${n}.xml`,
+          xml: buildChartColorStylePartXml(),
+          contentType: CHART_COLOR_STYLE_CONTENT_TYPE,
+        },
+      )
+    newChartParts.push(
+      ex
+        ? { path, xml: buildChartexPartXml(chart, ex, wbRId), contentType: CHARTEX_CONTENT_TYPE }
+        : { path, xml: buildChartPartXml(chart, wbRId), contentType: CHART_CONTENT_TYPE },
+    )
     newChartWorkbooks.push({
       xlsxPath,
-      relsPath: `word/charts/_rels/chart${n}.xml.rels`,
+      relsPath: `word/charts/_rels/${stem}${n}.xml.rels`,
       relsXml: chartRelsXml,
       base64: wbBase64,
     })
 
-    const docPrId = chartDocPrId++
+    const docPrId = DOCPR_ID_BASE + ++docPrSeq
     const cx = extentPx ? Math.max(1, Math.round(extentPx.w * 9525)) : 5486400
     const cy = extentPx ? Math.max(1, Math.round(extentPx.h * 9525)) : 3200400
+    if (ex) {
+      // only a reader that knows the extension takes the drawing; the namespaces are declared
+      // here because the document's root may not carry them
+      return (
+        '<w:p><w:r><mc:AlternateContent ' +
+        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">' +
+        `<mc:Choice xmlns:cx1="${CHARTEX_MC_NS}" Requires="cx1">` +
+        '<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">' +
+        `<wp:extent cx="${cx}" cy="${cy}"/>` +
+        `<wp:docPr id="${docPrId}" name="Chart ${docPrId}"/>` +
+        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+        `<a:graphicData uri="${CHARTEX_GRAPHIC_URI}">` +
+        `<cx:chart xmlns:cx="${CHARTEX_GRAPHIC_URI}" r:id="${rId}"/>` +
+        '</a:graphicData></a:graphic></wp:inline></w:drawing>' +
+        '</mc:Choice><mc:Fallback/></mc:AlternateContent></w:r></w:p>'
+      )
+    }
     return (
       '<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">' +
       `<wp:extent cx="${cx}" cy="${cy}"/>` +
@@ -709,9 +1471,9 @@ export async function saveDocx(
   const trailingSectPr = sectBlock?.originalXml ?? ''
   const relTargets = new Map<string, string>()
   if (relsXml) {
-    for (const tag of relsXml.match(/<Relationship [^>]*\/>/g) ?? []) {
-      const id = /Id="([^"]+)"/.exec(tag)?.[1]
-      const target = /Target="([^"]+)"/.exec(tag)?.[1]
+    for (const tag of relsXml.match(RELATIONSHIP_TAG) ?? []) {
+      const id = RELATIONSHIP_ID.exec(tag)?.[2]
+      const target = RELATIONSHIP_TARGET.exec(tag)?.[2]
       if (id && target) relTargets.set(id, target)
     }
   }
@@ -766,9 +1528,12 @@ export async function saveDocx(
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
     let relsChanged = false
     const old = originalXml ? readPictureWatermark(originalXml) : null
-    if (old && (originalXml!.match(new RegExp(`r:id="${old.rId}"`, 'g')) ?? []).length === 1) {
+    if (
+      old &&
+      (originalXml!.match(new RegExp(`r:id\\s*=\\s*(["'])${old.rId}\\1`, 'g')) ?? []).length === 1
+    ) {
       const before = relsXml
-      relsXml = relsXml.replace(new RegExp(`<Relationship\\s[^>]*\\bId="${old.rId}"[^>]*/>`), '')
+      relsXml = relsXml.replace(relTagWithId(old.rId), '')
       relsChanged = relsXml !== before
     }
     let xml: string
@@ -776,9 +1541,7 @@ export async function saveDocx(
     else if (!isPictureWatermark(watermark)) xml = watermarkParagraphXml(watermark)
     else {
       const mediaPath = landMedia(watermark.image)
-      let n = 1
-      while (relsXml.includes(`Id="rId${n}"`)) n++
-      const rId = `rId${n}`
+      const rId = nextFreeRelId(relsXml)
       relsXml = relsXml.replace(
         '</Relationships>',
         `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${mediaPath.replace(/^word\//, '')}"/></Relationships>`,
@@ -789,12 +1552,91 @@ export async function saveDocx(
     if (relsChanged) hfRelsOut.set(relsPath, relsXml)
     return xml
   }
+  /** pictures the editor inserted into a header/footer part: land the bytes, add
+   *  the image relationship to the part's own rels and swap in the real ids */
+  const resolveHfNewPictures = async (partPath: string, xml: string, hf: HeaderFooter) => {
+    const pictures: NonNullable<HeaderFooter['newPictures']> = {
+      ...hf.newPictures,
+      ...hfPictureLinkBytes(hf),
+    }
+    const linked = resolvePictureLinkTokens(xml, () => '') !== xml
+    if (!linked && !xml.includes(NEW_PICTURE_TOKEN_PREFIX)) return xml
+    const relsPath = partPath.replace(/([^/]+)$/, '_rels/$1.rels')
+    let relsXml =
+      hfRelsOut.get(relsPath) ??
+      (await zip.file(relsPath)?.async('string')) ??
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+    relsXml = relsXml.replace(/<Relationships\b([^>]*)\/>/, '<Relationships$1></Relationships>')
+    const rIds = new Map<string, string>()
+    const docPrIds = new Map<string, number>()
+    const relate = (key: string, mediaPath: string): string => {
+      let rId = rIds.get(key)
+      if (rId === undefined) {
+        rId = nextFreeRelId(relsXml)
+        relsXml = relsXml.replace(
+          '</Relationships>',
+          `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${mediaPath.replace(/^word\//, '')}"/></Relationships>`,
+        )
+        rIds.set(key, rId)
+      }
+      return rId
+    }
+    // a picture linked to a file names it through a relationship of this part
+    const withLinks = resolvePictureLinkTokens(xml, (target) => {
+      const key = `link:${target}`
+      let rId = rIds.get(key)
+      if (rId === undefined) {
+        rId = nextFreeRelId(relsXml)
+        const rel = `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${escapeXmlAttr(target)}" TargetMode="External"/></Relationships>`
+        relsXml = relsXml.replace('</Relationships>', () => rel)
+        rIds.set(key, rId)
+      }
+      return rId
+    })
+    const withSvg = withLinks.replace(
+      new RegExp(`r:embed="(${NEW_PICTURE_TOKEN_PREFIX}[0-9]+)${NEW_PICTURE_SVG_SUFFIX}"`, 'g'),
+      (whole, token: string) => {
+        const svg = pictures[token]?.svgBase64
+        return svg ? `r:embed="${relate(token + NEW_PICTURE_SVG_SUFFIX, landSvg(svg))}"` : whole
+      },
+    )
+    const out = withSvg.replace(
+      new RegExp(`(r:embed|id|name)="(Picture )?(${NEW_PICTURE_TOKEN_PREFIX}[0-9]+)"`, 'g'),
+      (whole, attr: string, prefix: string | undefined, token: string) => {
+        const picture = pictures[token]
+        if (!picture) return whole
+        if (attr === 'r:embed') return `r:embed="${relate(token, landMedia(picture))}"`
+        let id = docPrIds.get(token)
+        if (id === undefined) {
+          id = DOCPR_ID_BASE + ++docPrSeq
+          docPrIds.set(token, id)
+        }
+        return `${attr}="${prefix ?? ''}${id}"`
+      },
+    )
+    if (rIds.size > 0) hfRelsOut.set(relsPath, relsXml)
+    return out
+  }
+  /** an existing part after a strip edit: moved / resized floating pictures are
+   *  patched into their drawings, and a picture-only edit keeps the text bytes */
+  const editedHfPartXml = (
+    kind: 'header' | 'footer',
+    hf: HeaderFooter,
+    originalXml: string | null,
+  ): string => {
+    const moved =
+      originalXml && hf.pictureEdits
+        ? patchHfPicturesXml(originalXml, hf.pictureEdits)
+        : originalXml
+    const base = moved && hf.pictureLinks ? patchHfPictureLinksXml(moved, hf.pictureLinks) : moved
+    if (base && (hf.pictureOnly || hf.keepContent)) return base
+    return headerFooterPartXml(kind, hf, undefined, base, options.pageCount)
+  }
   const planHeaderFooter = async (
     kind: 'header' | 'footer',
     hf: HeaderFooter | undefined,
-    watermark: Watermark | null | undefined = undefined,
     hfType: 'default' | 'first' | 'even' = 'default',
-    watermarkOnly = false,
   ) => {
     if (hf === undefined) return
     const refs = hfReferenceTags(trailingSectPr, kind)
@@ -811,17 +1653,8 @@ export async function saveDocx(
       const path = resolveRelationshipTargetPath(docPath, target)
       if (!path) return
       const file = zip.file(path)
-      const originalXml = file ? await file.async('string') : null
-      const wmXml =
-        kind === 'header' ? await watermarkXmlFor(watermark, path, originalXml) : undefined
-      // A watermark-only change patches the original part in place (tables/logos/fields
-      // all preserved); header text edits use paragraph replace-merge (non-paragraph
-      // children preserved).
-      let partXml: string | null = null
-      if (watermarkOnly && kind === 'header' && originalXml && wmXml !== undefined) {
-        partXml = patchWatermarkInPart(originalXml, wmXml)
-      }
-      if (partXml === null) partXml = headerFooterPartXml(kind, hf, wmXml, originalXml)
+      const originalXml = hfOriginalXml(hf, file ? await file.async('string') : null)
+      const partXml = await resolveHfNewPictures(path, editedHfPartXml(kind, hf, originalXml), hf)
       hfParts.push({ path, xml: partXml })
     } else {
       let n = 1
@@ -831,9 +1664,11 @@ export async function saveDocx(
       )
         n++
       const filename = `${kind}${n}.xml`
-      const wmXml =
-        kind === 'header' ? await watermarkXmlFor(watermark, `word/${filename}`, null) : undefined
-      const partXml = headerFooterPartXml(kind, hf, wmXml)
+      const partXml = await resolveHfNewPictures(
+        `word/${filename}`,
+        headerFooterPartXml(kind, hf, undefined, null, options.pageCount),
+        hf,
+      )
       const newRId = `rId${nextRelNum++}`
       newRels.push({ rId: newRId, type: HF_REL_TYPE[kind], target: filename, external: false })
       hfParts.push({ path: `word/${filename}`, xml: partXml })
@@ -843,24 +1678,14 @@ export async function saveDocx(
       )
     }
   }
-  // A watermark change forces a header-part rewrite even when the header text
-  // itself is untouched; a header rewrite without a watermark change keeps the
-  // part's own watermark bytes.
-  const effectiveHeader =
-    options.header ??
-    (options.watermark !== undefined ? { text: parsed.headerText ?? '' } : undefined)
-  await planHeaderFooter(
-    'header',
-    effectiveHeader,
-    options.watermark,
-    'default',
-    options.header === undefined,
-  )
+  // Header text edits keep each part's own watermark. Apply a pending watermark
+  // separately, after all section references and text edits have landed.
+  await planHeaderFooter('header', options.header)
   await planHeaderFooter('footer', options.footer)
-  await planHeaderFooter('header', options.headerFirst, undefined, 'first')
-  await planHeaderFooter('footer', options.footerFirst, undefined, 'first')
-  await planHeaderFooter('header', options.headerEven, undefined, 'even')
-  await planHeaderFooter('footer', options.footerEven, undefined, 'even')
+  await planHeaderFooter('header', options.headerFirst, 'first')
+  await planHeaderFooter('footer', options.footerFirst, 'first')
+  await planHeaderFooter('header', options.headerEven, 'even')
+  await planHeaderFooter('footer', options.footerEven, 'even')
 
   // ---- Per-section header/footer (non-last sections): with a reference, rewrite the
   // part; without one, create a part + inject the reference ----
@@ -892,10 +1717,16 @@ export async function saveDocx(
       const path = resolveRelationshipTargetPath(docPath, target)
       if (!path) continue
       const file = zip.file(path)
-      const originalXml = file ? await file.async('string') : null
-      hfParts.push({ path, xml: headerFooterPartXml(edit.kind, edit.hf, undefined, originalXml) })
+      const originalXml = hfOriginalXml(edit.hf, file ? await file.async('string') : null)
+      hfParts.push({
+        path,
+        xml: await resolveHfNewPictures(
+          path,
+          editedHfPartXml(edit.kind, edit.hf, originalXml),
+          edit.hf,
+        ),
+      })
     } else {
-      const partXml = headerFooterPartXml(edit.kind, edit.hf)
       let n = 1
       while (
         zip.file(`word/${edit.kind}${n}.xml`) ||
@@ -903,6 +1734,11 @@ export async function saveDocx(
       )
         n++
       const filename = `${edit.kind}${n}.xml`
+      const partXml = await resolveHfNewPictures(
+        `word/${filename}`,
+        headerFooterPartXml(edit.kind, edit.hf, undefined, null, options.pageCount),
+        edit.hf,
+      )
       const newRId = `rId${nextRelNum++}`
       newRels.push({ rId: newRId, type: HF_REL_TYPE[edit.kind], target: filename, external: false })
       hfParts.push({ path: `word/${filename}`, xml: partXml })
@@ -918,6 +1754,10 @@ export async function saveDocx(
   // ---- numbering: append numbering definitions (create the part from the blank
   // template when missing) ----
   const numberingPath = 'word/numbering.xml'
+  const styleNums = options.numbering?.styleNums ?? []
+  const styleDefs = options.numbering?.styleDefs ?? []
+  const removedListStyles = options.numbering?.removedStyles ?? []
+  const listStyleXmls: string[] = []
   let numberingXmlOut: string | null = null
   let numberingIsNew = false
   let numberingRelsOut: { path: string; xml: string; isNew: boolean } | null = null
@@ -925,7 +1765,9 @@ export async function saveDocx(
     (options.numbering?.newDefs?.length ?? 0) > 0 ||
     (options.numbering?.restartNums?.length ?? 0) > 0 ||
     (options.numbering?.levelEdits?.length ?? 0) > 0 ||
-    (options.numbering?.picBullets?.length ?? 0) > 0
+    (options.numbering?.picBullets?.length ?? 0) > 0 ||
+    styleNums.length > 0 ||
+    styleDefs.length > 0
   ) {
     const file = zip.file(numberingPath)
     let xml = file ? await file.async('string') : null
@@ -955,6 +1797,30 @@ export async function saveDocx(
       absXmls.push(abstractNumXml(absId, def.kind, def.levels))
       numXmls.push(`<w:num w:numId="${def.numId}"><w:abstractNumId w:val="${absId}"/></w:num>`)
     }
+    if (styleNums.length > 0 || styleDefs.length > 0) {
+      const stylesXml = (await zip.file('word/styles.xml')?.async('string')) ?? ''
+      const defined = new Set<string>()
+      const defineStyle = (
+        styleId: string,
+        define: { name: string; numId: string; levels: CustomNumberingLevel[]; custom?: boolean },
+      ) => {
+        if (defined.has(styleId) || hasStyleXml(stylesXml, styleId)) return
+        defined.add(styleId)
+        const absId = String(++maxAbs)
+        absXmls.push(listStyleAbstractNumXml(absId, { styleLink: styleId }, define.levels))
+        numXmls.push(`<w:num w:numId="${define.numId}"><w:abstractNumId w:val="${absId}"/></w:num>`)
+        listStyleXmls.push(listStyleXml(styleId, define))
+      }
+      for (const def of styleDefs) defineStyle(def.styleId, { ...def, custom: !def.builtIn })
+      for (const link of styleNums) {
+        const { styleId, define } = link
+        if (define) defineStyle(styleId, define)
+        const absId = String(++maxAbs)
+        pendingAbs.set(`pending-${link.numId}`, absId)
+        absXmls.push(listStyleAbstractNumXml(absId, { numStyleLink: styleId }))
+        numXmls.push(`<w:num w:numId="${link.numId}"><w:abstractNumId w:val="${absId}"/></w:num>`)
+      }
+    }
     for (const r of options.numbering?.restartNums ?? []) {
       const absId = pendingAbs.get(r.abstractNumId) ?? r.abstractNumId
       if (absId.startsWith('pending-')) continue
@@ -979,8 +1845,8 @@ export async function saveDocx(
         ? await relsFile.async('string')
         : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
       let relNum = 1
-      for (const m of relsXml.matchAll(/Id="rId(\d+)"/g))
-        relNum = Math.max(relNum, parseInt(m[1], 10) + 1)
+      for (const m of relsXml.matchAll(RELATIONSHIP_ID_NUMBER))
+        relNum = Math.max(relNum, parseInt(m[2], 10) + 1)
       const picXmls: string[] = []
       for (const pic of options.numbering?.picBullets ?? []) {
         const mediaPath = landMedia(pic)
@@ -1001,22 +1867,51 @@ export async function saveDocx(
     if (absXmls.length > 0) {
       xml = /<w:num[\s>]/.test(xml)
         ? xml.replace(/<w:num[\s>]/, (m) => absXmls.join('') + m)
-        : xml.replace('</w:numbering>', `${absXmls.join('')}</w:numbering>`)
+        : xml.replace('</w:numbering>', () => `${absXmls.join('')}</w:numbering>`)
     }
     xml = xml.replace('</w:numbering>', `${numXmls.join('')}</w:numbering>`)
     numberingXmlOut = xml
+  }
+  if (removedListStyles.length > 0) {
+    let xml = numberingXmlOut ?? (await zip.file(numberingPath)?.async('string')) ?? null
+    if (xml !== null) {
+      for (const styleId of removedListStyles) xml = unlinkListStyleXml(xml, styleId)
+      numberingXmlOut = xml
+    }
   }
 
   // ---- styles: surgical upsert of word/styles.xml (create/modify styles) ----
   const stylesPath = 'word/styles.xml'
   let stylesXmlOut: string | null = null
-  if ((options.styleUpserts?.length ?? 0) > 0 || options.defaultFonts !== undefined) {
+  let stylesIsNew = false
+  const removedStyleIds: string[] = []
+  if (
+    styleUpserts.length > 0 ||
+    options.defaultFonts !== undefined ||
+    listStyleXmls.length > 0 ||
+    (removedListStyles.length > 0 && zip.file(stylesPath))
+  ) {
     const file = zip.file(stylesPath)
+    if (!file) {
+      stylesIsNew = true
+      newRels.push({
+        rId: `rId${nextRelNum++}`,
+        type: STYLES_REL_TYPE,
+        target: 'styles.xml',
+        external: false,
+      })
+    }
     let xml = file
       ? await file.async('string')
       : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' +
         '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>'
-    for (const up of options.styleUpserts ?? []) xml = upsertStyleXml(xml, up)
+    for (const up of styleUpserts) {
+      if (up.remove) removedStyleIds.push(...styleRemovalIds(xml, up.styleId))
+      xml = upsertStyleXml(xml, up)
+    }
+    for (const styleId of removedListStyles) xml = upsertStyleXml(xml, { styleId, remove: true })
+    if (listStyleXmls.length > 0)
+      xml = xml.replace('</w:styles>', () => `${listStyleXmls.join('')}</w:styles>`)
     stylesXmlOut = options.defaultFonts ? mergeDefaultFontsXml(xml, options.defaultFonts) : xml
   }
 
@@ -1025,6 +1920,8 @@ export async function saveDocx(
   const commentsExtPath = 'word/commentsExtended.xml'
   let commentsXml: string | null = null
   let commentsIsNew = false
+  let commentsRelsXml: string | null = null
+  let commentsRelsIsNew = false
   let commentsExtXml: string | null = null
   let commentsExtIsNew = false
   if (options.comments) {
@@ -1042,10 +1939,72 @@ export async function saveDocx(
               .padStart(8, '0'),
           },
     )
+    // comment pictures: the bytes land as media parts and their relationships
+    // live in the comments part's own rels file, not the document's (genoffice#2040)
     const commentsFile = zip.file(commentsPath)
+    const imageRuns = new Map<string, string>()
+    const imageComments = withParaIds.filter((c) => c.image)
+    // a comment whose text AND picture bytes are both unchanged keeps its
+    // original XML verbatim — resolve what the original carried so the loop
+    // below can tell a kept picture from a new one
+    const originalImageBytesOf = new Map<string, string | null>()
+    const keptImageRuns = new Map<string, string>()
+    const originalCommentsXml = commentsFile ? await commentsFile.async('string') : null
+    if (originalCommentsXml) {
+      const origRelsFile = zip.file('word/_rels/comments.xml.rels')
+      const origRels = origRelsFile ? await origRelsFile.async('string') : null
+      for (const m of originalCommentsXml.match(/<w:comment\s[^>]*>[\s\S]*?<\/w:comment>/g) ?? []) {
+        const id = /w:id="([^"]+)"/.exec(m)?.[1]
+        if (!id) continue
+        const blipRel = /r:embed="([^"]+)"/.exec(m)?.[1]
+        const rel =
+          blipRel && origRels
+            ? new RegExp(`<Relationship\\b[^>]*Id="${blipRel}"[^>]*/>`).exec(origRels)?.[0]
+            : undefined
+        const target = rel ? /Target="([^"]+)"/.exec(rel)?.[1] : undefined
+        const mediaFile = target ? zip.file(`word/${target.replace(/^\/?(?:word\/)?/, '')}`) : null
+        originalImageBytesOf.set(id, mediaFile ? await mediaFile.async('base64') : null)
+        const drawing = /<w:drawing>[\s\S]*?<\/w:drawing>/.exec(m)?.[0]
+        if (drawing) keptImageRuns.set(id, `<w:r>${drawing}</w:r>`)
+      }
+    }
+    if (imageComments.length > 0) {
+      const commentsRelsPath = 'word/_rels/comments.xml.rels'
+      const relsFile = zip.file(commentsRelsPath)
+      const relsXml: string | null = relsFile ? await relsFile.async('string') : null
+      if (!relsXml) commentsRelsIsNew = true
+      let relSeq = 0
+      for (const m of (relsXml ?? '').matchAll(/Id="rId(\d+)"/g)) {
+        relSeq = Math.max(relSeq, parseInt(m[1]!, 10))
+      }
+      const added: string[] = []
+      for (const c of imageComments) {
+        const image = c.image!
+        if (originalImageBytesOf.get(c.id) === image.base64) continue
+        const mediaPath = landMedia({ base64: image.base64, mime: image.mime })
+        usedExtensions.add(IMAGE_EXT[image.mime])
+        const rId = `rId${++relSeq}`
+        added.push(
+          `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${mediaPath.replace(/^word\//, '')}"/>`,
+        )
+        const drawing = inlinePictureDrawingXml({
+          rId,
+          docPrId: DOCPR_ID_BASE + ++docPrSeq,
+          widthPx: image.widthPx,
+          heightPx: image.heightPx,
+        })
+        imageRuns.set(c.id, `<w:r>${drawing}</w:r>`)
+      }
+      commentsRelsXml = (
+        relsXml ??
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+      ).replace('</Relationships>', `${added.join('')}</Relationships>`)
+    }
     commentsXml = buildCommentsXml(
       withParaIds,
       commentsFile ? await commentsFile.async('string') : null,
+      imageRuns,
+      keptImageRuns,
     )
     if (!zip.file(commentsPath)) {
       commentsIsNew = true
@@ -1082,7 +2041,19 @@ export async function saveDocx(
     const path = NOTE_PART_PATH[kind]
     const file = zip.file(path)
     const originalXml = file ? await file.async('string') : null
-    notesParts.push({ path, xml: buildNotesXml(kind, notes, originalXml), isNew: !file, kind })
+    const otherXml = notes.some((n) => n.origin && n.origin.kind !== kind)
+      ? ((await zip
+          .file(NOTE_PART_PATH[kind === 'footnote' ? 'endnote' : 'footnote'])
+          ?.async('string')) ?? null)
+      : null
+    const stylesXml = otherXml ? ((await zip.file('word/styles.xml')?.async('string')) ?? '') : ''
+    const styleIds = new Set([...stylesXml.matchAll(/w:styleId="([^"]+)"/g)].map((m) => m[1]))
+    notesParts.push({
+      path,
+      xml: buildNotesXml(kind, notes, originalXml, { xml: otherXml, styleIds }),
+      isNew: !file,
+      kind,
+    })
     if (!file) {
       newRels.push({
         rId: `rId${nextRelNum++}`,
@@ -1102,6 +2073,7 @@ export async function saveDocx(
     const xml = buildSourcesXml(
       options.sources,
       existing ? await zip.file(existing)!.async('string') : null,
+      options.sourcesStyle,
     )
     if (existing) {
       const n = /item(\d+)\.xml$/.exec(existing)?.[1] ?? '1'
@@ -1126,25 +2098,39 @@ export async function saveDocx(
 
   // ---- theme fonts / colors: patch or create word/theme/theme1.xml ----
   let themePart: { xml: string; isNew: boolean } | null = null
-  if (options.themeFonts || options.themeColors) {
+  if (options.themeFonts || options.themeColors || options.themeFormat) {
     const themeFile = zip.file(THEME_PART_PATH)
-    if (themeFile) {
-      let xml = await themeFile.async('string')
-      if (options.themeFonts) xml = applyThemeFonts(xml, options.themeFonts)
-      if (options.themeColors) xml = applyThemeColors(xml, options.themeColors)
-      themePart = { xml, isNew: false }
-    } else {
-      themePart = {
-        xml: buildThemeXml(
-          options.themeFonts ?? { major: 'Calibri Light', minor: 'Calibri', eastAsia: '' },
-          options.themeColors ?? {},
-        ),
-        isNew: true,
-      }
+    themePart = {
+      xml: editedThemeXml(await themeFile?.async('string'), {
+        fonts: options.themeFonts,
+        colors: options.themeColors,
+        format: options.themeFormat,
+      }),
+      isNew: !themeFile,
+    }
+    if (!themeFile) {
       newRels.push({
         rId: `rId${nextRelNum++}`,
         type: THEME_REL_TYPE,
         target: 'theme/theme1.xml',
+        external: false,
+      })
+    }
+  }
+
+  let keysPart: { path: string; xml: string; isNew: boolean } | null = null
+  if (options.keyCustomizations !== undefined) {
+    const existing = await keyCustomizationsPath(zip)
+    keysPart = {
+      path: existing ?? KEY_CUSTOMIZATIONS_PART_PATH,
+      xml: options.keyCustomizations,
+      isNew: !existing,
+    }
+    if (!existing) {
+      newRels.push({
+        rId: `rId${nextRelNum++}`,
+        type: KEY_CUSTOMIZATIONS_REL_TYPE,
+        target: 'customizations.xml',
         external: false,
       })
     }
@@ -1222,7 +2208,110 @@ export async function saveDocx(
     }
   }
 
+  // Block-level content controls: a new control wraps the blocks of one range,
+  // an unwrap drops the wrapper of every control carrying that tag. Both work
+  // on the emitted bytes, so the blocks inside stay individually editable.
+  // Nested controls unwrap level by level (matching an inner tag keeps the
+  // outer shell; matching the outermost keeps inner controls as the blocks'
+  // own shells) and a tag that appears more than once is unwrapped everywhere.
+  const unwrapTags = new Set((options.contentControls?.unwrap ?? []).map((u) => u.tag))
+  // A split control keeps its open bytes on one block and its close bytes on
+  // another, so strip by the owning block + offset: the closing bytes of
+  // nested controls are identical strings and content matching would remove
+  // the wrong level.
+  interface UnwrapSlice {
+    offset: number
+    length: number
+    xml: string
+  }
+  const unwrapSlicesByIndex = new Map<number, UnwrapSlice[]>()
+  // fragments saved without a docxIndex (self-contained editor xml) are
+  // stripped by content: prefix first, then suffix, like the shell contract
+  const unwrapShellBytes: string[] = []
+  const addUnwrapSlice = (
+    docxIndex: number | undefined,
+    offset: number | undefined,
+    xml: string,
+  ): void => {
+    if (!xml) return
+    if (!unwrapShellBytes.includes(xml)) unwrapShellBytes.push(xml)
+    if (docxIndex === undefined || offset === undefined) return
+    const slices = unwrapSlicesByIndex.get(docxIndex) ?? []
+    if (slices.some((slice) => slice.offset === offset && slice.length === xml.length)) return
+    slices.push({ offset, length: xml.length, xml })
+    unwrapSlicesByIndex.set(docxIndex, slices)
+  }
+  for (const block of parsed.blocks) {
+    const chain = block.sdtShells ?? (block.sdtShell ? [block.sdtShell] : [])
+    for (const shell of chain) {
+      if (!unwrapTags.has(shell.tag)) continue
+      addUnwrapSlice(shell.openBlock, shell.openOffset, shell.openXml)
+      addUnwrapSlice(shell.closeBlock, shell.closeOffset, shell.closeXml)
+    }
+  }
+  const stripUnwrappedBytes = (xml: string): string => {
+    for (const bytes of unwrapShellBytes) {
+      if (xml.startsWith(bytes)) xml = xml.slice(bytes.length)
+      else if (xml.endsWith(bytes)) xml = xml.slice(0, xml.length - bytes.length)
+    }
+    return xml
+  }
+  // an edited block saves as its original xml (shell bytes included), so the
+  // shell is stripped from whichever block kind carries it
+  const stripUnwrappedShell = (xml: string, docxIndex: number | undefined): string => {
+    // a fragment without a docxIndex carries its own shell bytes: strip by
+    // content. A known block only owns the slices recorded for it (a block
+    // outside the unwrapped control must stay byte-identical).
+    if (docxIndex === undefined) return stripUnwrappedBytes(xml)
+    const slices = unwrapSlicesByIndex.get(docxIndex)
+    if (!slices || slices.length === 0) return xml
+    for (const slice of [...slices].sort((a, b) => b.offset - a.offset)) {
+      if (xml.slice(slice.offset, slice.offset + slice.length) === slice.xml) {
+        xml = xml.slice(0, slice.offset) + xml.slice(slice.offset + slice.length)
+        continue
+      }
+      // the emitted xml no longer matches the original slice (edited block):
+      // fall back to the first exact occurrence
+      const at = xml.indexOf(slice.xml)
+      if (at !== -1) xml = xml.slice(0, at) + xml.slice(at + slice.xml.length)
+    }
+    return xml
+  }
+  let nextControlId = nextContentControlId(documentXml)
+  const controlWraps = (options.contentControls?.wrap ?? []).map((w) => {
+    const shell = buildContentControlXml({
+      ...w.spec,
+      id: w.spec.id ?? String(nextControlId++),
+    })
+    const indexes = new Set(w.docxIndexes)
+    // the first and the last emitted block of the range carry the wrapper
+    let first = -1
+    let last = -1
+    for (let i = 0; i < finalBlocks.length; i++) {
+      const docxIndex = saveBlockDocxIndex(finalBlocks[i]!)
+      if (docxIndex === undefined || !indexes.has(docxIndex)) continue
+      if (first === -1) first = i
+      last = i
+    }
+    return { indexes, shell, first, last }
+  })
+
+  // A rebuilt paragraph keeps its editing-permission markers. When one original
+  // paragraph became several blocks (a split), starts go to the first of them
+  // and ends to the last, so every marker id stays unique.
+  const permSpan = new Map<number, { first: number; last: number }>()
+  if (documentXml.includes('<w:perm')) {
+    finalBlocks.forEach((fb, i) => {
+      if (fb.kind !== 'generated' || fb.docxIndex === undefined) return
+      const span = permSpan.get(fb.docxIndex)
+      if (span) span.last = i
+      else permSpan.set(fb.docxIndex, { first: i, last: i })
+    })
+  }
+
   const parts: string[] = [...detachedOpaque]
+  /** where each final block landed in `parts` (lost permission markers are re-homed by it) */
+  const placed: Array<{ part: number; docxIndex: number | undefined }> = []
   for (let i = 0; i < finalBlocks.length; i++) {
     const fb = finalBlocks[i]
     let xml: string
@@ -1232,24 +2321,48 @@ export async function saveDocx(
       if (!el) throw new Error(`invalid docxIndex ${fb.docxIndex}`)
       xml = documentXml.slice(el.start, el.end)
       fbDocxIndex = fb.docxIndex
+      if (unwrapSlicesByIndex.size > 0) xml = stripUnwrappedShell(xml, fb.docxIndex)
     } else if (fb.kind === 'generated') {
       if (fb.docxIndex !== undefined) fbDocxIndex = fb.docxIndex
       xml = generateParagraphXml(fb.block, genCtx)
-      // If the original paragraph was inside a w:sdt shell, re-wrap it
-      if (fb.block.sdtShell) {
-        xml = fb.block.sdtShell.openXml + xml + fb.block.sdtShell.closeXml
+      const span = fb.docxIndex !== undefined ? permSpan.get(fb.docxIndex) : undefined
+      const sourceEl = span ? elements[fb.docxIndex!] : undefined
+      if (span && sourceEl?.name === 'w:p') {
+        xml = restoreParagraphPermMarkers(documentXml.slice(sourceEl.start, sourceEl.end), xml, {
+          starts: span.first === i,
+          ends: span.last === i,
+        })
+      }
+      // If the original paragraph was inside a w:sdt shell, re-wrap it. The
+      // chain is flattened here to the outermost shell (nested regenerated
+      // paragraphs inside several controls are not re-wrapped; an untouched
+      // block keeps its chain byte-identically through the original path).
+      const shell = fb.block.sdtShell
+      if (shell && !unwrapTags.has(shell.tag)) {
+        xml = shell.openXml + xml + shell.closeXml
       }
     } else if (fb.kind === 'xml') {
-      xml = fb.xml
+      xml = unwrapSlicesByIndex.size > 0 ? stripUnwrappedShell(fb.xml, fb.docxIndex) : fb.xml
       fbDocxIndex = fb.docxIndex
-      if (fb.replaceImage) xml = retargetImageBlip(xml, embedImageMedia(fb.replaceImage))
+      if (fb.replaceImage) {
+        const { svgBase64, ...bitmap } = fb.replaceImage
+        xml = retargetImageBlip(
+          xml,
+          embedImageMedia(bitmap),
+          svgBase64 ? embedSvg(svgBase64) : undefined,
+        )
+      }
+      if (fb.imageLink !== undefined)
+        xml = withPictureLink(xml, fb.imageLink === null ? null : linkImageFile(fb.imageLink))
     } else if (fb.kind === 'chart') {
       xml = await embedChart(fb.chart, fb.extentPx)
     } else if (fb.kind === 'images') {
       xml = embedImages(fb.images)
     } else {
       xml = embedImage(fb.image)
+      if (fb.image.linkTarget) xml = withPictureLink(xml, linkImageFile(fb.image.linkTarget))
     }
+    xml = resolvePictureLinkTokens(resolveNewPictures(xml), linkImageFile)
     // Inject newly created per-section header/footer references into the section's sectPr
     // (the reference must be the first sectPr child)
     const refTags = fbDocxIndex !== undefined ? sectionRefTags.get(fbDocxIndex) : undefined
@@ -1272,8 +2385,19 @@ export async function saveDocx(
       const attrs =
         ` w:id="${escapeXmlAttr(revision.id ?? '0')}"` +
         ` w:author="${escapeXmlAttr(revision.author)}"` +
-        (revision.date ? ` w:date="${escapeXmlAttr(revision.date)}"` : '')
-      xml = `<w:${revision.kind}${attrs}>${xml}</w:${revision.kind}>`
+        (revision.date ? ` w:date="${escapeXmlAttr(revision.date)}"` : '') +
+        (revision.dateUtc ? ` w16du:dateUtc="${escapeXmlAttr(revision.dateUtc)}"` : '')
+      // Word's shape for a whole text paragraph is the run marks plus the
+      // record on the paragraph mark (w:pPr/w:rPr) — a w:ins wrapper around
+      // w:p is the shape for tables, and neither Word nor LibreOffice
+      // resolves it as a tracked change on a paragraph. A paragraph without
+      // run marks of its own (a deleted image paragraph has none to carry
+      // the strikethrough) stays on the wrapper.
+      if (/^<w:p[\s/>]/.test(xml) && new RegExp(`<w:${revision.kind}[\\s>]`).test(xml)) {
+        xml = markParagraphRevision(xml, revision.kind, attrs)
+      } else {
+        xml = `<w:${revision.kind}${attrs}>${xml}</w:${revision.kind}>`
+      }
     }
     if (fbDocxIndex !== undefined && fb.kind !== 'original') {
       const nested = (nestedOpaque.get(fbDocxIndex) ?? []).join('')
@@ -1284,26 +2408,56 @@ export async function saveDocx(
       const trailingOpaque = (opaqueAfter.get(fbDocxIndex) ?? []).join('')
       if (leadingOpaque || trailingOpaque) xml = leadingOpaque + xml + trailingOpaque
     }
+    // a new block-level content control opens before the first block of its
+    // range and closes after the last one
+    for (const wrap of controlWraps) {
+      if (wrap.first === i) xml = wrap.shell.openXml + xml
+      if (wrap.last === i) xml = xml + wrap.shell.closeXml
+    }
+    placed.push({ part: parts.length, docxIndex: fbDocxIndex })
     parts.push(xml)
+  }
+  // before regrouping: `placed` indexes `parts` as built above
+  if (documentXml.includes('<w:perm')) rehomeLostPermMarkers(parts, placed, elements, documentXml)
+  if (options.groups?.length || options.carried?.length) {
+    const lead = detachedOpaque.length
+    const at = <T extends { block: number }>(item: T): T => ({ ...item, block: item.block + lead })
+    const regrouped = regroupDrawings(
+      parts,
+      (options.groups ?? []).map((group) => ({ members: group.members.map(at) })),
+      (options.carried ?? []).map((block) => block + lead),
+      Math.max(maxDrawingId(documentXml), maxDrawingId(parts.join(''))) + 1,
+    )
+    parts.splice(0, parts.length, ...regrouped)
+  }
+  const withSectionEdits = (sectPr: string, docxIndex: number): string => {
+    let xml = options.trailingSectPr || sectPr
+    if (options.trailingSectPrChange)
+      xml = resolvePropChangeXml(xml, 'w:sectPrChange', options.trailingSectPrChange)
+    if (options.section) xml = applySectionSettings(xml, options.section)
+    if (options.sectionStartType) xml = applySectionStartType(xml, options.sectionStartType)
+    if (options.pgNumType)
+      xml = applyPageNumType(
+        xml,
+        options.pgNumType.fmt,
+        options.pgNumType.start,
+        options.pgNumType.chapter,
+      )
+    if (options.titlePg !== undefined) xml = applyTitlePg(xml, options.titlePg)
+    // headerReference/footerReference must be the first sectPr children
+    if (hfRefTags.length > 0) xml = injectIntoSectPr(xml, hfRefTags.join(''))
+    return unlinkSectionHf(xml, docxIndex)
   }
   // Trailing hidden elements (w:sectPr) always keep their original bytes and position,
   // unless the editor changed the page setup.
+  let closed = false
   for (const block of parsed.blocks) {
     if (block.hidden && block.docxIndex !== null) {
       const el = elements[block.docxIndex]
       let xml = documentXml.slice(el.start, el.end)
       if (xml.includes('<w:sectPr')) {
-        if (options.trailingSectPr) xml = options.trailingSectPr
-        if (options.section) xml = applySectionSettings(xml, options.section)
-        if (options.sectionStartType) xml = applySectionStartType(xml, options.sectionStartType)
-        if (options.pgNumType)
-          xml = applyPageNumType(xml, options.pgNumType.fmt, options.pgNumType.start)
-        if (options.titlePg !== undefined) xml = applyTitlePg(xml, options.titlePg)
-        // headerReference/footerReference must be the first sectPr children
-        if (hfRefTags.length > 0) {
-          xml = injectIntoSectPr(xml, hfRefTags.join(''))
-        }
-        xml = unlinkSectionHf(xml, block.docxIndex)
+        closed = true
+        xml = withSectionEdits(xml, block.docxIndex)
       }
       const index = block.docxIndex
       if (index !== null) {
@@ -1314,6 +2468,15 @@ export async function saveDocx(
       parts.push(xml)
     }
   }
+  // a body with no w:sectPr has nowhere to keep the last section's page setup: it gets one
+  const lastSectionEdited =
+    options.trailingSectPr ||
+    options.section ||
+    options.sectionStartType ||
+    options.pgNumType ||
+    options.titlePg ||
+    hfRefTags.length > 0
+  if (!closed && lastSectionEdited) parts.push(withSectionEdits(defaultSectPrXml(), -1))
 
   let newDocumentXml =
     documentXml.slice(0, bodyContentStart) +
@@ -1330,6 +2493,77 @@ export async function saveDocx(
     )
   }
 
+  if (options.watermark !== undefined) {
+    // Missing references inherit the previous section's same variant, including
+    // first/even headers while that variant is disabled in an intermediate section.
+    const inherited = new Map<string, string>()
+    const touched = new Set<string>()
+    const sections = [
+      ...newDocumentXml.matchAll(/<w:sectPr\b[^>]*\/>|<w:sectPr\b[^>]*>[\s\S]*?<\/w:sectPr>/g),
+    ]
+    const replacements: string[] = []
+    const even = options.evenAndOddHeaders ?? parsed.evenAndOddHeaders ?? false
+    for (const match of sections) {
+      let sectionXml = match[0]
+      for (const ref of hfReferenceTags(sectionXml, 'header')) {
+        const type = hfReferenceType(ref)
+        const id = hfReferenceRId(ref)
+        if (id) inherited.set(type === 'odd' || type === undefined ? 'default' : type, id)
+      }
+      const titleTag = /<w:titlePg\b[^>]*\/?\s*>/.exec(sectionXml)?.[0]
+      const first = titleTag && !/\bw:val\s*=\s*["'](?:0|false|off)["']/.test(titleTag)
+      const variants = ['default', ...(first ? ['first'] : []), ...(even ? ['even'] : [])]
+      for (const variant of variants) {
+        const id = inherited.get(variant)
+        const target = id
+          ? (relTargets.get(id) ?? newRels.find((r) => r.rId === id)?.target)
+          : undefined
+        let path = target ? resolveRelationshipTargetPath(docPath, target) : null
+        if (!path) {
+          // Removing a watermark must not materialize otherwise blank headers.
+          if (options.watermark === null || id) continue
+          let n = 1
+          while (
+            zip.file(`word/header${n}.xml`) ||
+            hfParts.some((p) => p.path === `word/header${n}.xml`)
+          )
+            n++
+          const filename = `header${n}.xml`
+          path = `word/${filename}`
+          const rId = `rId${nextRelNum++}`
+          newRels.push({ rId, type: HF_REL_TYPE.header, target: filename, external: false })
+          hfOverrides.push(
+            `<Override PartName="/${path}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>`,
+          )
+          sectionXml = injectIntoSectPr(
+            sectionXml,
+            `<w:headerReference w:type="${variant}" r:id="${rId}"/>`,
+          )
+          inherited.set(variant, rId)
+        }
+        if (touched.has(path)) continue
+        touched.add(path)
+        // Apply after header text edits, so a batch can edit both without losing
+        // either change. Shared/inherited parts are rewritten exactly once.
+        const pending = hfParts.find((p) => p.path === path)
+        const originalXml = pending?.xml ?? (await zip.file(path)?.async('string')) ?? null
+        const wmXml = await watermarkXmlFor(options.watermark, path, originalXml)
+        const xml = originalXml
+          ? patchWatermarkInPart(originalXml, wmXml!)
+          : headerFooterPartXml('header', { text: '' }, wmXml)
+        if (xml === null) continue
+        if (pending) pending.xml = xml
+        else hfParts.push({ path, xml })
+      }
+      replacements.push(sectionXml)
+    }
+    let sectionIndex = 0
+    newDocumentXml = newDocumentXml.replace(
+      /<w:sectPr\b[^>]*\/>|<w:sectPr\b[^>]*>[\s\S]*?<\/w:sectPr>/g,
+      () => replacements[sectionIndex++]!,
+    )
+  }
+
   if (options.comments !== undefined) {
     newDocumentXml = removeDeletedCommentMarkers(
       newDocumentXml,
@@ -1339,6 +2573,13 @@ export async function saveDocx(
 
   // editor-generated formulas need the math namespace on the document root;
   // docx produced by non-Word generators may not declare it
+  // text effects set in the editor are Word 2010 markup: the root has to declare it
+  if (newDocumentXml.includes('<w14:') && !/<w:document[^>]*xmlns:w14=/.test(newDocumentXml)) {
+    newDocumentXml = newDocumentXml.replace(
+      /<w:document /,
+      '<w:document xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" ',
+    )
+  }
   if (newDocumentXml.includes('<m:') && !/<w:document[^>]*xmlns:m=/.test(newDocumentXml)) {
     newDocumentXml = newDocumentXml.replace(
       /<w:document /,
@@ -1346,9 +2587,85 @@ export async function saveDocx(
     )
   }
 
+  // The same for the "withheld from the model" marker. An undeclared prefix is
+  // not a warning, it is a parse error: Word and LibreOffice both offer to
+  // repair the file and drop the run that carried it, which loses the reader's
+  // mark and hands the span back to the model on the next open.
+  //
+  // `mc:Ignorable` is the mechanism OOXML provides for exactly this — an
+  // element in a namespace the consumer does not know is skipped rather than
+  // treated as a schema violation, so the label rides along without the
+  // border's run failing a strict validator.
+  //
+  // A root that already declares `xmlns:mc` (every Word-saved file does) must
+  // not get a second one: a duplicate attribute is the same parse error this
+  // block exists to prevent. Its existing Ignorable list is extended instead.
+  if (
+    newDocumentXml.includes(`<${REDACT_EL}`) &&
+    !new RegExp(`<w:document[^>]*xmlns:${REDACT_PREFIX}=`).test(newDocumentXml)
+  ) {
+    const root = /<w:document\b[^>]*>/.exec(newDocumentXml)?.[0]
+    if (root) {
+      let next = root
+      if (!/xmlns:mc=/.test(next)) {
+        next = next.replace(
+          '<w:document',
+          '<w:document xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"',
+        )
+      }
+      next = next.replace('<w:document', `<w:document xmlns:${REDACT_PREFIX}="${REDACT_NS}"`)
+      const ignorable = /mc:Ignorable="([^"]*)"/.exec(next)
+      if (ignorable) {
+        if (!new RegExp(`\\b${REDACT_PREFIX}\\b`).test(ignorable[1] ?? '')) {
+          const existing = (ignorable[1] ?? '').trim()
+          next = next.replace(
+            /mc:Ignorable="[^"]*"/,
+            `mc:Ignorable="${existing ? `${existing} ${REDACT_PREFIX}` : REDACT_PREFIX}"`,
+          )
+        }
+      } else {
+        next = next.replace('<w:document', `<w:document mc:Ignorable="${REDACT_PREFIX}"`)
+      }
+      // a Word re-save drops every element whose namespace it does not process
+      // unless the root asks for it to be preserved verbatim — and a root that
+      // already preserves other elements needs ours added to that list, the
+      // same way the Ignorable list above is extended
+      const preserve = /mc:PreserveElements="([^"]*)"/.exec(next)
+      if (preserve) {
+        if (!new RegExp(`\\b${REDACT_EL}\\b`).test(preserve[1] ?? '')) {
+          const existing = (preserve[1] ?? '').trim()
+          next = next.replace(
+            /mc:PreserveElements="[^"]*"/,
+            `mc:PreserveElements="${existing ? `${existing} ${REDACT_EL}` : REDACT_EL}"`,
+          )
+        }
+      } else {
+        next = next.replace('<w:document', `<w:document mc:PreserveElements="${REDACT_EL}"`)
+      }
+      newDocumentXml = newDocumentXml.replace(root, next)
+    }
+  }
+
+  if (
+    newDocumentXml.includes(' w16du:dateUtc=') &&
+    !/<w:document[^>]*xmlns:w16du=/.test(newDocumentXml)
+  ) {
+    newDocumentXml = newDocumentXml.replace(
+      /<w:document /,
+      '<w:document xmlns:w16du="http://schemas.microsoft.com/office/word/2023/wordml/word16du" ',
+    )
+  }
+
   if (options.pageColor !== undefined) {
     newDocumentXml = applyPageColor(newDocumentXml, options.pageColor)
   }
+  if (options.noteProps) newDocumentXml = applySectionNoteProps(newDocumentXml, options.noteProps)
+  newDocumentXml = fillRevisionIds(newDocumentXml, genCtx.allocateRevisionId)
+  newDocumentXml = pairRangeBookmarks(newDocumentXml)
+  // Word 2010 and older do not know the element: they skip it only when told they may
+  if (newDocumentXml.includes('<w15:footnoteColumns'))
+    newDocumentXml = ignorePrefix(newDocumentXml, 'w15')
+  newDocumentXml = bindUnboundPrefixes(newDocumentXml)
 
   const settingsPath = 'word/settings.xml'
   let settingsXml: string | null = null
@@ -1359,7 +2676,22 @@ export async function saveDocx(
     options.writeProtection !== undefined ||
     options.removePersonalInfo !== undefined ||
     options.evenAndOddHeaders !== undefined ||
-    options.mirrorMargins !== undefined
+    options.mirrorMargins !== undefined ||
+    options.hideGrammaticalErrors !== undefined ||
+    options.trackRevisions !== undefined ||
+    options.trackMoves !== undefined ||
+    options.autoHyphenation !== undefined ||
+    options.hyphenation !== undefined ||
+    options.defaultTabStopTwips !== undefined ||
+    options.gutterAtTop !== undefined ||
+    options.mailMergeMainType !== undefined ||
+    options.compressPunctuation !== undefined ||
+    options.strictFirstAndLastChars !== undefined ||
+    options.kinsokuCustom !== undefined ||
+    options.drawingGrid !== undefined ||
+    options.mathPr !== undefined ||
+    options.noteProps !== undefined ||
+    options.settingsNoteProps !== undefined
   ) {
     const file = zip.file(settingsPath)
     let xml: string
@@ -1381,12 +2713,12 @@ export async function saveDocx(
     }
     // Word only renders w:background when settings.xml opts in.
     if (options.pageColor && !xml.includes('<w:displayBackgroundShape')) {
-      xml = xml.replace(/(<w:settings[^>]*>)/, '$1<w:displayBackgroundShape/>')
+      xml = insertSettingsChild(xml, 'displayBackgroundShape', '<w:displayBackgroundShape/>')
       touched = true
     }
-    // Each apply* inserts right after the settings root, so run them in reverse
-    // schema order — the final order becomes writeProtection, removePersonalInformation,
-    // documentProtection (CT_Settings sequence).
+    // Each apply* places its element at its CT_Settings position, so the order
+    // these run in does not matter: the part comes out in schema sequence
+    // whatever combination of options the save carried.
     if (options.protection !== undefined) {
       xml = applyProtection(xml, options.protection)
       touched = true
@@ -1407,6 +2739,119 @@ export async function saveDocx(
       xml = applySettingsFlag(xml, 'w:mirrorMargins', options.mirrorMargins)
       touched = true
     }
+    if (options.hideGrammaticalErrors !== undefined) {
+      xml = applySettingsFlag(xml, 'w:hideGrammaticalErrors', options.hideGrammaticalErrors)
+      touched = true
+    }
+    if (options.trackRevisions !== undefined) {
+      xml = applySettingsFlag(xml, 'w:trackRevisions', options.trackRevisions)
+      touched = true
+    }
+    if (options.trackMoves !== undefined) {
+      xml = applySettingsFlag(xml, 'w:doNotTrackMoves', !options.trackMoves)
+      touched = true
+    }
+    if (options.autoHyphenation !== undefined) {
+      xml = applySettingsFlag(xml, 'w:autoHyphenation', options.autoHyphenation)
+      touched = true
+    }
+    if (options.hyphenation) {
+      const { caps, consecutiveLimit, zoneTwips } = options.hyphenation
+      if (caps !== undefined) xml = applySettingsFlag(xml, 'w:doNotHyphenateCaps', !caps)
+      if (consecutiveLimit !== undefined) {
+        const limit = Math.max(0, Math.round(consecutiveLimit))
+        xml = applySettingsVal(xml, 'consecutiveHyphenLimit', limit > 0 ? limit : null)
+      }
+      if (zoneTwips !== undefined) {
+        xml = applySettingsVal(xml, 'hyphenationZone', Math.max(0, Math.round(zoneTwips)))
+      }
+      touched = true
+    }
+    if (options.gutterAtTop !== undefined) {
+      xml = applySettingsFlag(xml, 'w:gutterAtTop', options.gutterAtTop)
+      touched = true
+    }
+    if (options.mailMergeMainType !== undefined) {
+      xml = applyMailMergeMainType(xml, options.mailMergeMainType)
+      touched = true
+    }
+    if (options.defaultTabStopTwips !== undefined) {
+      const stop = Math.max(0, Math.round(options.defaultTabStopTwips))
+      xml = insertSettingsChild(
+        xml.replace(/<w:defaultTabStop(?=[\s/>])[^>]*>(?:<\/w:defaultTabStop>)?/, ''),
+        'defaultTabStop',
+        `<w:defaultTabStop w:val="${stop}"/>`,
+      )
+      touched = true
+    }
+    if (options.strictFirstAndLastChars !== undefined) {
+      xml = applySettingsFlag(xml, 'w:strictFirstAndLastChars', options.strictFirstAndLastChars)
+      touched = true
+    }
+    if (options.kinsokuCustom !== undefined) {
+      const custom = options.kinsokuCustom
+      for (const [name, chars] of [
+        ['noLineBreaksAfter', custom?.after],
+        ['noLineBreaksBefore', custom?.before],
+      ] as const) {
+        xml = xml.replace(new RegExp(`<w:${name}(?=[\\s/>])[^>]*>(?:<\\/w:${name}>)?`), '')
+        if (custom)
+          xml = insertSettingsChild(
+            xml,
+            name,
+            `<w:${name} w:lang="${escapeXmlAttr(custom.lang)}" w:val="${escapeXmlAttr(chars ?? '')}"/>`,
+          )
+      }
+      touched = true
+    }
+    if (options.drawingGrid !== undefined) {
+      const grid = options.drawingGrid
+      for (const [name, val] of [
+        ['drawingGridHorizontalSpacing', grid.horizontalSpacing],
+        ['drawingGridVerticalSpacing', grid.verticalSpacing],
+        ['displayHorizontalDrawingGridEvery', grid.displayHorizontalEvery],
+        ['displayVerticalDrawingGridEvery', grid.displayVerticalEvery],
+        ['drawingGridHorizontalOrigin', grid.horizontalOrigin],
+        ['drawingGridVerticalOrigin', grid.verticalOrigin],
+      ] as const)
+        xml = applySettingsVal(xml, name, val === undefined ? null : Math.round(val))
+      xml = applySettingsFlag(xml, 'w:doNotUseMarginsForDrawingGridOrigin', grid.ownOrigin === true)
+      touched = true
+    }
+    if (options.compressPunctuation !== undefined) {
+      const val = !options.compressPunctuation
+        ? 'doNotCompress'
+        : options.compressKana
+          ? 'compressPunctuationAndJapaneseKana'
+          : 'compressPunctuation'
+      xml = insertSettingsChild(
+        xml.replace(
+          /<w:characterSpacingControl(?=[\s/>])[^>]*>(?:<\/w:characterSpacingControl>)?/,
+          '',
+        ),
+        'characterSpacingControl',
+        `<w:characterSpacingControl w:val="${val}"/>`,
+      )
+      touched = true
+    }
+    for (const [tag, own] of [
+      ['footnotePr', { ...options.noteProps?.footnote, ...options.settingsNoteProps?.footnote }],
+      ['endnotePr', { ...options.noteProps?.endnote, ...options.settingsNoteProps?.endnote }],
+    ] as const) {
+      // a kind the save sets nothing for must not gain an empty element
+      if (Object.keys(own).length === 0) continue
+      xml = applySettingsNoteProps(xml, `w:${tag}`, own, (x, child) =>
+        insertSettingsChild(x, tag, child),
+      )
+      touched = true
+    }
+    if (options.mathPr !== undefined) {
+      const next = saveMathPr(xml, options.mathPr, insertSettingsChild)
+      if (next !== xml) {
+        xml = next
+        touched = true
+      }
+    }
     if (touched) settingsXml = xml
   }
 
@@ -1418,7 +2863,7 @@ export async function saveDocx(
           `<Relationship Id="${escapeXmlAttr(r.rId)}" Type="${r.type}" Target="${escapeXmlAttr(r.target)}"${r.external ? ' TargetMode="External"' : ''}/>`,
       )
       .join('')
-    relsXml = relsXml.replace('</Relationships>', `${inserts}</Relationships>`)
+    relsXml = relsXml.replace('</Relationships>', () => `${inserts}</Relationships>`)
     relsChanged = true
   }
 
@@ -1433,9 +2878,11 @@ export async function saveDocx(
     commentsIsNew ||
     commentsExtIsNew ||
     numberingIsNew ||
+    stylesIsNew ||
     notesParts.some((p) => p.isNew) ||
     sourcesPart?.isNew ||
     themePart?.isNew ||
+    keysPart?.isNew ||
     customPropertiesIsNew
   if (hasNewParts) {
     const file = zip.file(contentTypesPath)
@@ -1451,7 +2898,7 @@ export async function saveDocx(
       }
       for (const ext of usedExtensions) {
         if (!new RegExp(`Extension="${ext}"`).test(contentTypesXml)) {
-          const mime = ext === 'png' ? 'image/png' : ext === 'gif' ? 'image/gif' : 'image/jpeg'
+          const mime = MEDIA_CONTENT_TYPE[ext] ?? 'image/jpeg'
           contentTypesXml = contentTypesXml.replace(
             '</Types>',
             `<Default Extension="${ext}" ContentType="${mime}"/></Types>`,
@@ -1488,7 +2935,13 @@ export async function saveDocx(
           'application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml',
         )
       }
-      for (const part of newChartParts) addOverride(`/${part.path}`, CHART_CONTENT_TYPE)
+      if (stylesIsNew) {
+        addOverride(
+          '/word/styles.xml',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml',
+        )
+      }
+      for (const part of newChartParts) addOverride(`/${part.path}`, part.contentType)
       for (const wb of newChartWorkbooks) addOverride(`/${wb.xlsxPath}`, XLSX_CONTENT_TYPE)
       for (const part of notesParts) {
         if (part.isNew) addOverride(`/${part.path}`, NOTE_CONTENT_TYPE[part.kind])
@@ -1500,6 +2953,7 @@ export async function saveDocx(
         )
       }
       if (themePart?.isNew) addOverride(`/${THEME_PART_PATH}`, THEME_CONTENT_TYPE)
+      if (keysPart?.isNew) addOverride(`/${keysPart.path}`, KEY_CUSTOMIZATIONS_CONTENT_TYPE)
       if (customPropertiesIsNew) {
         addOverride(`/${CUSTOM_PROPERTIES_PATH}`, CUSTOM_PROPERTIES_CONTENT_TYPE)
       }
@@ -1511,12 +2965,23 @@ export async function saveDocx(
     ? patchCoreProps(await coreEntry.async('string'), options.savedAt)
     : null
 
+  // a part made here starts from a short root of its own, and content that came
+  // from the body relies on what the body's root declares
+  const bodyNamespaces = rootNamespaces(documentXml)
+  const bind = (xml: string) => bindUnboundPrefixes(xml, bodyNamespaces)
+  for (const part of hfParts) part.xml = bind(part.xml)
+  for (const part of notesParts) part.xml = bind(part.xml)
+  if (commentsXml !== null) commentsXml = bind(commentsXml)
+  if (numberingXmlOut !== null) numberingXmlOut = bind(numberingXmlOut)
+  if (stylesXmlOut !== null) stylesXmlOut = bind(stylesXmlOut)
+
   const out = new JSZip()
   for (const [name, entry] of Object.entries(zip.files)) {
-    if (entry.dir) {
-      out.folder(name)
-      continue
-    }
+    // source folder entries are not copied over: Word does not write them and
+    // they carry no content (genoffice#2554). JSZip still auto-creates folder
+    // entries for every nested out.file() below — those are stripped right
+    // before the generate at the end.
+    if (entry.dir) continue
     const hfPart = hfParts.find((p) => p.path === name)
     if (name === docPath) {
       out.file(name, newDocumentXml, { date: entry.date })
@@ -1536,6 +3001,8 @@ export async function saveDocx(
       out.file(name, commentsXml, { date: entry.date })
     } else if (name === commentsExtPath && commentsExtXml !== null) {
       out.file(name, commentsExtXml, { date: entry.date })
+    } else if (name === 'word/_rels/comments.xml.rels' && commentsRelsXml !== null) {
+      out.file(name, commentsRelsXml, { date: entry.date })
     } else if (name === numberingPath && numberingXmlOut !== null) {
       out.file(name, numberingXmlOut, { date: entry.date })
     } else if (numberingRelsOut && name === numberingRelsOut.path) {
@@ -1548,12 +3015,14 @@ export async function saveDocx(
       out.file(name, sourcesPart.xml, { date: entry.date })
     } else if (themePart && name === THEME_PART_PATH) {
       out.file(name, themePart.xml, { date: entry.date })
+    } else if (keysPart && name === keysPart.path) {
+      out.file(name, keysPart.xml, { date: entry.date })
     } else if (name === CUSTOM_PROPERTIES_PATH && customPropertiesXml !== null) {
       out.file(name, customPropertiesXml, { date: entry.date })
     } else if (name === CORE_PROPS_PATH && coreXmlOut !== null) {
       out.file(name, coreXmlOut, { date: entry.date })
     } else if (options.partXml && options.partXml[name] !== undefined) {
-      out.file(name, options.partXml[name], { date: entry.date })
+      out.file(name, bind(options.partXml[name]), { date: entry.date })
     } else if (options.partBinary && options.partBinary[name] !== undefined) {
       out.file(name, options.partBinary[name], { base64: true, date: entry.date })
     } else {
@@ -1578,13 +3047,16 @@ export async function saveDocx(
   if (commentsExtIsNew && commentsExtXml !== null) {
     out.file(commentsExtPath, commentsExtXml)
   }
+  if (commentsRelsIsNew && commentsRelsXml !== null) {
+    out.file('word/_rels/comments.xml.rels', commentsRelsXml)
+  }
   if (numberingIsNew && numberingXmlOut !== null) {
     out.file(numberingPath, numberingXmlOut)
   }
   if (numberingRelsOut?.isNew) {
     out.file(numberingRelsOut.path, numberingRelsOut.xml)
   }
-  if (stylesXmlOut !== null && !zip.file(stylesPath)) {
+  if (stylesXmlOut !== null && stylesIsNew) {
     out.file(stylesPath, stylesXmlOut)
   }
   if (settingsIsNew && settingsXml !== null) {
@@ -1617,11 +3089,40 @@ export async function saveDocx(
   if (themePart?.isNew) {
     out.file(THEME_PART_PATH, themePart.xml)
   }
+  if (keysPart?.isNew) out.file(keysPart.path, keysPart.xml)
   if (customPropertiesIsNew && customPropertiesXml !== null) {
     out.file(CUSTOM_PROPERTIES_PATH, customPropertiesXml)
   }
-  await cleanupDocxOwnedResources(out, docPath)
+  // The resource sweep prunes only what this save broke: a relationship the
+  // source document already did not reference is a pre-existing orphan, and
+  // Word keeps those (so do the byte-identity round trips).
+  const sourceDocumentFile = zip.file(docPath)
+  await cleanupDocxOwnedResources(
+    out,
+    docPath,
+    sourceDocumentFile
+      ? referencedRelationshipIds(await sourceDocumentFile.async('string'))
+      : undefined,
+  )
+  await cleanStoryMoveRanges(out, docPath)
+  if (removedStyleIds.length > 0) {
+    for (const [name, entry] of Object.entries(out.files)) {
+      if (entry.dir || (name !== docPath && !STORY_PART_RE.test(name))) continue
+      const xml = await entry.async('string')
+      const next = dropStyleRefsXml(xml, removedStyleIds)
+      if (next !== xml) out.file(name, next, { date: entry.date })
+    }
+  }
   if (scrubPersonalInfo) await scrubPersonalMetadata(out)
+  // metadata scrubs come after every generated/copied part is in place, so a
+  // customXml store the save itself created (bibliography sources) is covered too
+  if (options.removeParts) await applyRemoveParts(out, options.removeParts)
+  // the property write comes last: what the caller asked for wins over the scrub
+  if (options.properties) await applyPropertyChanges(out, options.properties)
+  // Word does not write folder entries and they carry no content: JSZip
+  // auto-creates one per nested part, so drop them from the flat files map
+  // before the single generate pass (genoffice#2554)
+  for (const [name, entry] of Object.entries(out.files)) if (entry.dir) delete out.files[name]
   return out.generateAsync({
     type: 'uint8array',
     compression: 'DEFLATE',
@@ -1760,12 +3261,62 @@ function patchWatermarkInPart(originalXml: string, watermarkXml: string): string
   return `${prefix}${rootOpen}${watermarkXml}${kept.map((c) => c.xml).join('')}</w:hdr>`
 }
 
+// its own range: the placeholders of pictures put into cells and of ones held on a node start lower
+const HF_LINK_BYTES_BASE = 2_000_000
+const hfLinkBytesToken = (drawing: number): string =>
+  `${NEW_PICTURE_TOKEN_PREFIX}${HF_LINK_BYTES_BASE + drawing}`
+
+/** the bytes Update Now read for the part's linked pictures, by the placeholder their drawing takes */
+function hfPictureLinkBytes(
+  hf: HeaderFooter,
+): Record<string, { base64: string; mime: NewImage['mime'] }> {
+  const out: Record<string, { base64: string; mime: NewImage['mime'] }> = {}
+  for (const [drawing, link] of Object.entries(hf.pictureLinks ?? {}))
+    if (link.bytes) out[hfLinkBytesToken(Number(drawing))] = link.bytes
+  return out
+}
+
+/**
+ * What Edit > Links did to the linked pictures of a header/footer part, written into
+ * the part: each <w:drawing> (by its ordinal) names the new file through a placeholder the
+ * save turns into a relationship of the part, loses its link, or takes new bytes the same
+ * way. Every other byte of the part is kept.
+ */
+export function patchHfPictureLinksXml(
+  partXml: string,
+  links: Record<number, HfPictureLink>,
+): string {
+  let ordinal = -1
+  return partXml.replace(HF_DRAWING_RE, (frag) => {
+    ordinal++
+    const link = links[ordinal]
+    if (!link || !hfSinglePictureFrag(frag)) return frag
+    // new bytes drop the old link with the old relationship; the file named now is put back
+    const out = link.bytes ? retargetImageBlip(frag, hfLinkBytesToken(ordinal)) : frag
+    return withPictureLink(out, link.target === null ? null : pictureLinkToken(link.target))
+  })
+}
+
+/** the part's bytes with the editor's accept / reject decisions replayed (the regeneration basis) */
+function hfOriginalXml(hf: HeaderFooter, originalXml: string | null): string | null {
+  if (!originalXml || !hf.revisionsResolved?.length) return originalXml
+  return applyRevisionResolutions(originalXml, hf.revisionsResolved)
+}
+
+/** a rebuilt pPr with the paragraph's style reference first (CT_PPr order) */
+function withPStyle(pPr: string, styleId: string | undefined): string {
+  if (!styleId) return pPr
+  const ref = `<w:pStyle w:val="${escapeXmlAttr(styleId)}"/>`
+  return pPr ? pPr.replace(/^<w:pPr>/, `<w:pPr>${ref}`) : `<w:pPr>${ref}</w:pPr>`
+}
+
 /** `watermarkXml`: undefined keeps the part's own watermark child, '' drops it, otherwise replaces it */
 function headerFooterPartXml(
   kind: 'header' | 'footer',
   hf: HeaderFooter,
   watermarkXml: string | undefined = undefined,
   originalXml: string | null = null,
+  pageCount = 1,
 ): string {
   const root = kind === 'header' ? 'w:hdr' : 'w:ftr'
   const textRun = (t: string) =>
@@ -1774,15 +3325,25 @@ function headerFooterPartXml(
     '<w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
     '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>' +
     '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' +
-    '<w:r><w:t>1</w:t></w:r>' +
+    `<w:r><w:t>${escapeXmlText(hf.fieldResults?.page || '1')}</w:t></w:r>` +
     '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
   const numPagesField =
     '<w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
     '<w:r><w:instrText xml:space="preserve"> NUMPAGES </w:instrText></w:r>' +
     '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' +
-    '<w:r><w:t>1</w:t></w:r>' +
+    `<w:r><w:t>${Math.max(1, Math.round(pageCount))}</w:t></w:r>` +
     '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+  const sectionPagesField =
+    '<w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
+    '<w:r><w:instrText xml:space="preserve"> SECTIONPAGES </w:instrText></w:r>' +
+    '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' +
+    `<w:r><w:t>${Math.max(1, Math.round(hf.fieldResults?.sectionPages ?? 1))}</w:t></w:r>` +
+    '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+  const totalMarksRe = new RegExp(`([${TOTAL_PAGES_MARK}${SECTION_PAGES_MARK}])`)
   let content: string
+  /** edited layout-table cells of the n-th top-level w:tbl (in part order), to patch into its bytes */
+  let cellPatches: (tblIndex: number) => Array<Array<CellParaPatch[] | null> | null> | null = () =>
+    null
   if (hf.paras) {
     // rich paragraphs; every PAGE_MARK becomes a PAGE field and every
     // TOTAL_PAGES_MARK a NUMPAGES field. Only when no PAGE_MARK exists does a
@@ -1794,51 +3355,90 @@ function headerFooterPartXml(
       ),
     )
     let pageEmitted = !hf.pageNumber || hasPageMark
+    const hfRunsXml = (paraRuns: Run[]): string => {
+      let runs = ''
+      for (const run of paraRuns) {
+        if (
+          run.text.includes(TOTAL_PAGES_MARK) ||
+          run.text.includes(SECTION_PAGES_MARK) ||
+          run.text.includes(PAGE_MARK) ||
+          (!pageEmitted && run.text.includes('#'))
+        ) {
+          // SECTIONPAGES and NUMPAGES split alike: a mark between two segments is its field
+          run.text.split(totalMarksRe).forEach((seg, k) => {
+            if (k % 2 === 1) {
+              runs += seg === SECTION_PAGES_MARK ? sectionPagesField : numPagesField
+              return
+            }
+            if (seg.includes(PAGE_MARK)) {
+              seg.split(PAGE_MARK).forEach((piece, j) => {
+                if (j > 0) runs += pageField
+                if (piece) runs += inlineRunsXml([{ ...run, text: piece }])
+              })
+            } else if (!pageEmitted && seg.includes('#')) {
+              const [before, ...rest] = seg.split('#')
+              runs +=
+                inlineRunsXml(before ? [{ ...run, text: before }] : []) +
+                pageField +
+                inlineRunsXml(rest.join('#') ? [{ ...run, text: rest.join('#') }] : [])
+              pageEmitted = true
+            } else if (seg) {
+              runs += inlineRunsXml([{ ...run, text: seg }])
+            }
+          })
+        } else {
+          runs += inlineRunsXml([run])
+        }
+      }
+      return runs
+    }
+    // rows live in the original w:tbl bytes (edited cells are patched into them
+    // below); a rebuild without the original part flattens them to paragraphs
+    const rowParas = (para: HfParagraph): string =>
+      (para.cells ?? [])
+        .flatMap((cell) => (cell.paras.length > 0 ? cell.paras : [[]]))
+        .map((runs) => `<w:p>${hfRunsXml(runs)}</w:p>`)
+        .join('')
     content = hf.paras
-      // table rows and still-empty drawing-only lines are display-only: the
-      // part's original w:tbl / drawing paragraph bytes are kept below. Text
-      // typed into such a line, or a rebuild without the original part, is
-      // written out like any paragraph.
-      .filter((para) => !para.cells && !(para.lineOnly && originalXml && para.runs.length === 0))
+      // still-empty drawing-only lines are display-only: the part's original
+      // drawing paragraph bytes are kept below. Text typed into such a line, or
+      // a rebuild without the original part, is written out like any paragraph.
+      .filter((para) => !(para.lineOnly && originalXml && para.runs.length === 0))
       .map((para) => {
+        if (para.cells) return originalXml ? '' : rowParas(para)
         // the parsed format, not just w:jc: hand-building it here dropped w:bidi and wrote
         // the visual align back as the logical one, flipping RTL headers to LTR
-        const pPr = mergePPrFormat('<w:pPr/>', para)
-        let runs = ''
-        for (const run of para.runs) {
-          if (
-            run.text.includes(TOTAL_PAGES_MARK) ||
-            run.text.includes(PAGE_MARK) ||
-            (!pageEmitted && run.text.includes('#'))
-          ) {
-            run.text.split(TOTAL_PAGES_MARK).forEach((seg, k) => {
-              if (k > 0) runs += numPagesField
-              if (seg.includes(PAGE_MARK)) {
-                seg.split(PAGE_MARK).forEach((piece, j) => {
-                  if (j > 0) runs += pageField
-                  if (piece) runs += inlineRunsXml([{ ...run, text: piece }])
-                })
-              } else if (!pageEmitted && seg.includes('#')) {
-                const [before, ...rest] = seg.split('#')
-                runs +=
-                  inlineRunsXml(before ? [{ ...run, text: before }] : []) +
-                  pageField +
-                  inlineRunsXml(rest.join('#') ? [{ ...run, text: rest.join('#') }] : [])
-                pageEmitted = true
-              } else if (seg) {
-                runs += inlineRunsXml([{ ...run, text: seg }])
-              }
-            })
-          } else {
-            runs += inlineRunsXml([run])
-          }
-        }
-        return `<w:p>${pPr}${runs}</w:p>`
+        const pPr = withPStyle(mergePPrFormat('<w:pPr/>', para), para.styleId)
+        return `<w:p>${pPr}${hfRunsXml(para.runs)}</w:p>`
       })
       .join('')
     if (!pageEmitted) content += `<w:p><w:pPr><w:jc w:val="center"/></w:pPr>${pageField}</w:p>`
+    const paras = hf.paras
+    cellPatches = (tblIndex) => {
+      const grid: Array<Array<CellParaPatch[] | null> | null> = []
+      for (const para of paras) {
+        const tr = para.row?.source?.tbl === tblIndex ? para.row.source.tr : undefined
+        if (tr === undefined || !para.cells?.some((c) => c.rewrite)) continue
+        grid[tr] = para.cells.map((cell) =>
+          cell.rewrite
+            ? (cell.paras.length > 0 ? cell.paras : [[]]).map((runs, k) => ({
+                runs,
+                xml: hfRunsXml(runs),
+                ...(cell.rewriteFormat?.includes(k)
+                  ? { format: cell.paraProps?.[k] ?? {}, original: cell.priorParaProps?.[k] }
+                  : {}),
+              }))
+            : null,
+        )
+      }
+      return grid.length > 0 ? grid : null
+    }
   } else {
-    const textWithTotal = (t: string) => t.split(TOTAL_PAGES_MARK).map(textRun).join(numPagesField)
+    const textWithTotal = (t: string) =>
+      t
+        .split(SECTION_PAGES_MARK)
+        .map((s) => s.split(TOTAL_PAGES_MARK).map(textRun).join(numPagesField))
+        .join(sectionPagesField)
     const runs: string[] = []
     if (hf.text.includes(PAGE_MARK)) {
       runs.push(hf.text.split(PAGE_MARK).map(textWithTotal).join(pageField))
@@ -1863,13 +3463,51 @@ function headerFooterPartXml(
     if (open && closeIdx >= 0) {
       const openIdx = originalXml.indexOf(open)
       const children = splitXmlChildren(originalXml.slice(openIdx + open.length, closeIdx))
+      // a text paragraph whose pictures are all inline blips is fully modelled
+      // (the parser keeps them on its runs), so it is regenerated like any text
+      const isModelledPictures = (xml: string) =>
+        /<w:t[\s>]/.test(xml) &&
+        !/<w:pict[\s>]|<w:object[\s>]|<wp:anchor[\s>]/.test(xml) &&
+        (xml.match(/<w:drawing[\s>][\s\S]*?<\/w:drawing>/g) ?? []).every(
+          (d) => d.includes('<wp:inline') && d.includes('<a:blip'),
+        )
       const isProtectedPara = (xml: string) =>
-        /<w:drawing[\s>]|<w:pict[\s>]|<w:object[\s>]/.test(xml)
+        /<w:drawing[\s>]|<w:pict[\s>]|<w:object[\s>]/.test(xml) && !isModelledPictures(xml)
       const isTextPara = (c: { name: string; xml: string }) =>
         c.name === 'w:p' && !isWatermarkChild(c) && !isProtectedPara(c.xml)
       if (children.some((c) => !isTextPara(c))) {
         const parts: string[] = []
         let injected = false
+        // tables are numbered the way the parser walks them (through w:sdt wrappers)
+        let tblIndex = 0
+        const patchTable = (xml: string): string => {
+          const grid = cellPatches(tblIndex++)
+          return grid ? patchTableCellTexts(xml, grid) : xml
+        }
+        const openOf = (xml: string) => /^<[^>]*>/.exec(xml)?.[0] ?? ''
+        const closeOf = (xml: string) => /<\/[^>]*>$/.exec(xml)?.[0] ?? ''
+        const rewrap = (xml: string, children: string[]) =>
+          `${openOf(xml)}${children.join('')}${closeOf(xml)}`
+        const innerXml = (xml: string) =>
+          xml.slice(openOf(xml).length, xml.length - closeOf(xml).length)
+        const patchSdt = (sdtXml: string): string =>
+          rewrap(
+            sdtXml,
+            splitXmlChildren(innerXml(sdtXml)).map((inner) =>
+              inner.name !== 'w:sdtContent'
+                ? inner.xml
+                : rewrap(
+                    inner.xml,
+                    splitXmlChildren(innerXml(inner.xml)).map((c) =>
+                      c.name === 'w:tbl'
+                        ? patchTable(c.xml)
+                        : c.name === 'w:sdt'
+                          ? patchSdt(c.xml)
+                          : c.xml,
+                    ),
+                  ),
+            ),
+          )
         for (const c of children) {
           if (isTextPara(c)) {
             if (!injected) {
@@ -1878,6 +3516,10 @@ function headerFooterPartXml(
             }
           } else if (isWatermarkChild(c) && watermarkXml !== undefined) {
             // superseded by the watermark in body (or removed)
+          } else if (c.name === 'w:tbl') {
+            parts.push(patchTable(c.xml))
+          } else if (c.name === 'w:sdt') {
+            parts.push(patchSdt(c.xml))
           } else {
             parts.push(c.xml)
           }
@@ -1907,7 +3549,15 @@ const COMMENTS_NS =
   'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' +
   'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
 
-function buildCommentsXml(comments: CommentInfo[], originalXml: string | null): string {
+function buildCommentsXml(
+  comments: CommentInfo[],
+  originalXml: string | null,
+  /** a comment id -> the picture's run XML; its drawing rides the comment's last paragraph */
+  imageRuns?: ReadonlyMap<string, string>,
+  /** a comment id -> the run of the picture it already carries, for when the
+   * text edit cannot be patched in place and the comment regenerates */
+  keptImageRuns?: ReadonlyMap<string, string>,
+): string {
   const originals = new Map<string, { text: string; xml: string }>()
   if (originalXml) {
     for (const m of originalXml.match(/<w:comment\s[^>]*>[\s\S]*?<\/w:comment>/g) ?? []) {
@@ -1918,8 +3568,10 @@ function buildCommentsXml(comments: CommentInfo[], originalXml: string | null): 
   const body = comments
     .map((c) => {
       const orig = originals.get(c.id)
-      if (orig && orig.text === c.text) return orig.xml
-      if (orig) {
+      // a picture-bearing comment always regenerates: the byte-preserved and
+      // w:t-patch paths carry no drawing, so the picture would drop
+      if (orig && orig.text === c.text && !imageRuns?.has(c.id)) return orig.xml
+      if (orig && !imageRuns?.has(c.id)) {
         // In-paragraph w:t-level patch: text edits keep the comment's rich formatting,
         // multiple paragraphs, and inline links
         const patched = patchParagraphTexts(orig.xml, c.text)
@@ -1930,21 +3582,32 @@ function buildCommentsXml(comments: CommentInfo[], originalXml: string | null): 
         (c.initials ? ` w:initials="${escapeXmlAttr(c.initials)}"` : '') +
         (c.date ? ` w:date="${escapeXmlAttr(c.date)}"` : '')
       const lines = c.text.split('\n')
-      const paras = lines
-        .map((line, i) => {
-          // The last paragraph carries w14:paraId (the commentsExtended link key)
-          const pid =
-            i === lines.length - 1 && c.paraId ? ` w14:paraId="${escapeXmlAttr(c.paraId)}"` : ''
-          return `<w:p${pid}><w:r><w:t xml:space="preserve">${escapeXmlText(line)}</w:t></w:r></w:p>`
-        })
-        .join('')
-      return `<w:comment ${attrs}>${paras}</w:comment>`
+      const paras = lines.map((line, i) => {
+        // The last paragraph carries w14:paraId (the commentsExtended link key)
+        const pid =
+          i === lines.length - 1 && c.paraId ? ` w14:paraId="${escapeXmlAttr(c.paraId)}"` : ''
+        return `<w:p${pid}><w:r><w:t xml:space="preserve">${escapeXmlText(line)}</w:t></w:r></w:p>`
+      })
+      // the picture rides inline at the end of the last paragraph, keeping the
+      // commentsExtended link key on the final w:p
+      const run = imageRuns?.get(c.id) ?? keptImageRuns?.get(c.id)
+      if (run && paras.length > 0) {
+        paras[paras.length - 1] = paras[paras.length - 1]!.replace(/<\/w:p>$/, `${run}</w:p>`)
+      }
+      return `<w:comment ${attrs}>${paras.join('')}</w:comment>`
     })
     .join('')
   // Rebuilt comments always emit w14:paraId (ensured above), so w14 must be bound even
-  // when the original root — e.g. from a non-Word producer — never declared it.
+  // when the original root — e.g. from a non-Word producer — never declared it. A
+  // picture-bearing rebuild draws with wp:/r: prefixed elements, so those bind too.
   const ns = rootAttributes(originalXml, 'w:comments', COMMENTS_NS, {
     w14: 'http://schemas.microsoft.com/office/word/2010/wordml',
+    ...((imageRuns && imageRuns.size > 0) || (keptImageRuns && keptImageRuns.size > 0)
+      ? {
+          wp: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+          r: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        }
+      : {}),
   })
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments ${ns}>${body}</w:comments>`
 }
@@ -1995,9 +3658,16 @@ function commentPlainText(commentXml: string): string {
   return paras.join('\n')
 }
 
-/** set or remove <w:documentProtection> right after the settings root opens */
+/** set or remove <w:documentProtection> at its CT_Settings position */
 function applyProtection(xml: string, protection: DocProtection | null): string {
-  let out = xml.replace(/<w:documentProtection[^>]*\/>/, '')
+  // CT_DocumentProtection is empty-content, so a producer may write either
+  // spelling. Removing only the self-closing form left a paired element in
+  // place: clearing protection did nothing, and setting it appended a second
+  // zero-or-one element, which is schema-invalid. Same idiom as applySettingsFlag.
+  let out = xml.replace(
+    /<w:documentProtection(?=[\s/>])[^>]*?(?:\/\s*>|>\s*<\/w:documentProtection\s*>)/,
+    '',
+  )
   if (protection) {
     const crypt = protection.hash
       ? ' w:cryptProviderType="rsaAES" w:cryptAlgorithmClass="hash" w:cryptAlgorithmType="typeAny"' +
@@ -2011,14 +3681,20 @@ function applyProtection(xml: string, protection: DocProtection | null): string 
       (protection.enforced ? ' w:enforcement="1"' : '') +
       crypt +
       '/>'
-    out = out.replace(/(<w:settings[^>]*>)/, `$1${tag}`)
+    out = insertSettingsChild(out, 'documentProtection', tag)
   }
   return out
 }
 
-/** set or remove <w:writeProtection> (password to modify) right after the settings root opens */
+/** set or remove <w:writeProtection> (password to modify) at its CT_Settings position */
 function applyWriteProtection(xml: string, wp: WriteProtection | null): string {
-  let out = xml.replace(/<w:writeProtection[^>]*\/>/, '')
+  // same both-forms removal as applyProtection: a paired <w:writeProtection>
+  // is legal and used to survive, so clearing it did nothing and setting it
+  // left two zero-or-one elements behind
+  let out = xml.replace(
+    /<w:writeProtection(?=[\s/>])[^>]*?(?:\/\s*>|>\s*<\/w:writeProtection\s*>)/,
+    '',
+  )
   if (wp && (wp.recommended || wp.hash)) {
     const crypt = wp.hash
       ? ' w:cryptProviderType="rsaAES" w:cryptAlgorithmClass="hash" w:cryptAlgorithmType="typeAny"' +
@@ -2028,7 +3704,7 @@ function applyWriteProtection(xml: string, wp: WriteProtection | null): string {
         (wp.salt ? ` w:salt="${escapeXmlAttr(wp.salt)}"` : '')
       : ''
     const tag = `<w:writeProtection${wp.recommended ? ' w:recommended="1"' : ''}${crypt}/>`
-    out = out.replace(/(<w:settings[^>]*>)/, `$1${tag}`)
+    out = insertSettingsChild(out, 'writeProtection', tag)
   }
   return out
 }
@@ -2044,8 +3720,7 @@ function applyRemovePersonalInfo(xml: string, on: boolean): string {
     '',
   )
   if (!on) return out
-  const settingsName = prefix ? `${prefix}:settings` : 'settings'
-  return out.replace(new RegExp(`(<${regexEscape(settingsName)}\\b[^>]*>)`), `$1<${propertyName}/>`)
+  return insertSettingsChild(out, 'removePersonalInformation', `<${propertyName}/>`)
 }
 
 const WORDPROCESSINGML_NAMESPACES = [
@@ -2180,6 +3855,32 @@ function scrubPeopleMetadata(xml: string): string {
   return out
 }
 
+/** Story parts whose XML can carry w:moveFromRangeStart/End / w:moveToRangeStart/End pairs. */
+const MOVE_STORY_PART_RE = /^word\/(?:header|footer)[^/]*\.xml$/i
+
+/**
+ * Orphaned move-range markers are a package-level residue: the editor rebuilds
+ * an edited paragraph from its model (which does not model the range markers),
+ * while an untouched neighbouring paragraph keeps its original bytes including
+ * the end marker of the same range. Drop the markers whose counterpart is gone
+ * so Accept/Reject All never leaves a dangling range behind.
+ */
+async function cleanStoryMoveRanges(zip: JSZip, documentPath: string): Promise<void> {
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir || !/\.xml$/i.test(name)) continue
+    if (
+      name !== documentPath &&
+      !MOVE_STORY_PART_RE.test(name) &&
+      !/^word\/(?:footnotes|endnotes)\.xml$/i.test(name) &&
+      name !== 'word/glossary/document.xml'
+    )
+      continue
+    const xml = await entry.async('string')
+    const cleaned = cleanMoveRangeMarkers(xml)
+    if (cleaned.removed > 0) zip.file(name, cleaned.xml, { date: entry.date })
+  }
+}
+
 /**
  * Strict final-package scrub. It runs after generated and copy-through parts
  * have been assembled, so headers, footers, notes, glossary and people data all
@@ -2220,13 +3921,17 @@ export function removeHfReference(
   variant: 'default' | 'first' | 'even',
 ): string {
   return sectXml.replace(new RegExp(`<w:${kind}Reference\\b[^>]*/>`, 'g'), (tag) => {
-    const type = /w:type="([^"]+)"/.exec(tag)?.[1]
+    // Quote-agnostic, like hfReferenceType / onOffTagIn: a single-quoted
+    // w:type went unread here, so its undefined type matched isDefault and
+    // unlinking the default took the first/even references with it.
+    const m = /\bw:type=(?:"([^"]+)"|'([^']*)')/.exec(tag)
+    const type = m?.[1] ?? m?.[2]
     const isDefault = type === undefined || type === 'default' || type === 'odd'
     return (variant === 'default' ? isDefault : type === variant) ? '' : tag
   })
 }
 
-/** set or remove an on/off settings flag right after the settings root opens */
+/** set or remove an on/off settings flag at its CT_Settings position */
 function applySettingsFlag(xml: string, tag: string, on: boolean): string {
   // Match the start tag and an optional paired end tag. Matching only the
   // self-closing form left a paired element in place, so switching the flag ON
@@ -2234,31 +3939,81 @@ function applySettingsFlag(xml: string, tag: string, on: boolean): string {
   // zero-or-one element, which is schema-invalid; switching it OFF did nothing
   // at all. A producer that writes <w:mirrorMargins></w:mirrorMargins> is legal.
   const out = xml.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*>(?:<\\/${tag}>)?`), '')
-  return on ? out.replace(/(<w:settings[^>]*>)/, `$1<${tag}/>`) : out
+  if (!on) return out
+  return insertSettingsChild(out, tag.slice(tag.indexOf(':') + 1), `<${tag}/>`)
 }
 
-/** set or remove <w:evenAndOddHeaders/> right after the settings root opens */
+/** set (or with null remove) a w:val settings element at its CT_Settings position */
+function applySettingsVal(xml: string, localName: string, val: number | null): string {
+  const tag = `w:${localName}`
+  const out = xml.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*>(?:<\\/${tag}>)?`), '')
+  return val === null ? out : insertSettingsChild(out, localName, `<${tag} w:val="${val}"/>`)
+}
+
+/**
+ * Makes the document a mail-merge main document of that kind. A w:mailMerge
+ * the part already has keeps its data source and only changes its kind; a new
+ * one names no data source (the two children CT_MailMerge requires).
+ */
+function applyMailMergeMainType(xml: string, type: MailMergeMainType | null): string {
+  if (type === null)
+    return xml.replace(
+      /<w:mailMerge(?=[\s/>])[^>]*\/>|<w:mailMerge(?=[\s>])[\s\S]*?<\/w:mailMerge>/,
+      '',
+    )
+  const kind = `<w:mainDocumentType w:val="${type}"/>`
+  const open = /<w:mailMerge(?=[\s>])[^>/]*>/.exec(xml)
+  if (!open) {
+    const bare = xml.replace(/<w:mailMerge(?=[\s/>])[^>]*\/>/, '')
+    return insertSettingsChild(
+      bare,
+      'mailMerge',
+      `<w:mailMerge>${kind}<w:dataType w:val="textFile"/></w:mailMerge>`,
+    )
+  }
+  const at = open.index + open[0].length
+  const close = xml.indexOf('</w:mailMerge>', at)
+  const body = xml
+    .slice(at, close)
+    .replace(/<w:mainDocumentType(?=[\s/>])[^>]*>(?:<\/w:mainDocumentType>)?/, '')
+  return xml.slice(0, at) + kind + body + xml.slice(close)
+}
+
+/** set or remove <w:evenAndOddHeaders/> at its CT_Settings position */
 function applyEvenAndOddHeaders(xml: string, on: boolean): string {
   const out = xml.replace(/<w:evenAndOddHeaders(?=[\s/>])[^>]*>(?:<\/w:evenAndOddHeaders>)?/, '')
-  return on ? out.replace(/(<w:settings[^>]*>)/, '$1<w:evenAndOddHeaders/>') : out
+  return on ? insertSettingsChild(out, 'evenAndOddHeaders', '<w:evenAndOddHeaders/>') : out
 }
 
 /** Set, replace or remove <w:background> (must be the first child of w:document). */
 function applyPageColor(documentXml: string, color: string | null): string {
-  let xml = documentXml.replace(/<w:background[^>]*\/>/, '')
+  // Both spellings are valid OOXML: the background is written self-closing
+  // (<w:background w:color="..."/>) or as an element pair carrying a VML fill
+  // (<w:background ...><v:background .../></w:background>). Removing only the
+  // self-closing form left the paired copy behind, so a save emitted two
+  // w:background children; CT_Document admits one and Word then reports the
+  // file as corrupt. Strip the pair whole, VML child included, and re-emit the
+  // canonical self-closing form, for the same reason stripElement() does.
+  let xml = documentXml.replace(
+    /<w:background[^>]*\/>|<w:background[^>]*>[\s\S]*?<\/w:background>/g,
+    '',
+  )
   if (color) {
     xml = xml.replace(/(<w:document[^>]*>)/, `$1<w:background w:color="${escapeXmlAttr(color)}"/>`)
   }
   return xml
 }
 
+/**
+ * Highest rIdN already present in a .rels part, or 1000 when the part is
+ * absent (so a generated document starts well clear of Word's own ids).
+ */
 function maxRelId(relsXml: string | null): number {
   if (!relsXml) return 1000
   let max = 0
-  const re = /Id="rId(\d+)"/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(relsXml)) !== null) {
-    max = Math.max(max, parseInt(m[1], 10))
+  for (const match of relsXml.matchAll(RELATIONSHIP_ID_NUMBER)) {
+    const n = parseInt(match[2], 10)
+    if (n > max) max = n
   }
   return max
 }
@@ -2272,13 +4027,147 @@ function nextImageSeq(zip: JSZip): number {
   return max + 1
 }
 
+/** Highest wp:docPr/@id already in the document, 0 when it holds no drawing. */
+function maxDocPrId(documentXml: string): number {
+  let max = 0
+  // quote-agnostic: a writer that single-quotes its attributes still owns those ids
+  for (const m of documentXml.matchAll(DRAWING_DOCPR_ID)) max = Math.max(max, parseInt(m[2], 10))
+  return max
+}
+
+/**
+ * Allocator handing out w:bookmarkStart/@w:id values for one save, seeded above
+ * every id the part already holds. w:id is unique within the part, so a rebuilt
+ * bookmark that reused an id already in use made Word pair the two bookmarks
+ * wrongly and land a cross-reference on the wrong target.
+ */
+export function nextBookmarkIdAllocator(documentXml: string): (name: string) => number {
+  let next = maxBookmarkId(documentXml) + 1
+  return () => next++
+}
+
+/**
+ * Marks the paragraph mark of a whole inserted/deleted paragraph: the record
+ * rides `w:pPr/w:rPr` (`w:ins`/`w:del`, CT_ParaRPr's first elements), which
+ * is the shape Word's own Compare writes and every reader resolves — accept
+ * drops the paragraph, reject keeps it. An existing record of the same kind
+ * is left alone.
+ */
+function markParagraphRevision(paragraphXml: string, kind: 'ins' | 'del', attrs: string): string {
+  const record = `<w:${kind}${attrs}/>`
+  const selfClosed = /^<w:p\/>/.test(paragraphXml)
+  const open = selfClosed ? '<w:p>' : paragraphXml.slice(0, paragraphXml.indexOf('>') + 1)
+  const rest = selfClosed ? paragraphXml.slice('<w:p/>'.length) : paragraphXml.slice(open.length)
+  const pPrAt = rest.search(/<w:pPr(?:\s|>)/)
+  if (pPrAt !== -1) {
+    // already marked: a redline saved again must not grow a second record
+    const marked = new RegExp(`<w:rPr[\\s>]((?:(?!</w:rPr>)[\\s\\S])*)<w:${kind}[\\s/]`).test(rest)
+    if (marked) return paragraphXml
+  }
+  if (pPrAt === -1) {
+    return `${open}<w:pPr><w:rPr>${record}</w:rPr></w:pPr>${rest}`
+  }
+  const rPrAt = rest.indexOf('<w:rPr', pPrAt)
+  const pPrCloseAt = rest.indexOf('</w:pPr>', pPrAt)
+  if (rPrAt !== -1 && (pPrCloseAt === -1 || rPrAt < pPrCloseAt)) {
+    // CT_ParaRPr order: w:ins/w:del come first
+    const rPrOpenEnd = rest.indexOf('>', rPrAt) + 1
+    return rest.slice(0, rPrOpenEnd) + record + rest.slice(rPrOpenEnd)
+  }
+  // no rPr yet: it goes before a pPrChange if one is there (CT_PPr order),
+  // else right before the pPr closes
+  const changeAt = rest.indexOf('<w:pPrChange', pPrAt)
+  const at = changeAt !== -1 && (pPrCloseAt === -1 || changeAt < pPrCloseAt) ? changeAt : pPrCloseAt
+  if (at === -1) return `${open}<w:pPr><w:rPr>${record}</w:rPr></w:pPr>${rest}`
+  return open + rest.slice(0, at) + `<w:rPr>${record}</w:rPr>` + rest.slice(at)
+}
+
+/**
+ * Revision w:id must be unique across every annotation; Word keeps one counter
+ * for the whole package, so the seed sits above every id in every story part,
+ * not only document.xml.
+ */
+function nextRevisionIdAllocator(partsXml: string[], floor = 0): () => string {
+  let next = Math.max(9001, floor)
+  for (const xml of partsXml)
+    for (const m of xml.matchAll(/\bw:id\s*=\s*["'](\d+)["']/g))
+      next = Math.max(next, parseInt(m[1], 10) + 1)
+  return () => String(next++)
+}
+
+const STORY_PART_RE = /^word\/(?:header|footer|footnotes|endnotes|comments)\d*\.xml$/
+
+function storyPartsXml(zip: JSZip): Promise<string[]> {
+  return Promise.all(zip.file(STORY_PART_RE).map((f) => f.async('string')))
+}
+
+/** editor-recorded row/cell revisions leave w:id empty; the save mints one here */
+function fillRevisionIds(xml: string, allocate: () => string): string {
+  return xml.replace(
+    /(<w:(?:ins|del|cellIns|cellDel)\b[^>]*?\sw:id=)""/g,
+    (_, head) => `${head}"${allocate()}"`,
+  )
+}
+
+const RANGE_BOOKMARK = /<w:bookmark(Start|End) w:id="" w:name="([^"]*)"\/>/g
+
+/**
+ * The ends of range bookmarks (Run.rangeMark) are written without an id: each
+ * pair takes one above every id of the part. An end left without its other
+ * end, or a second start of a name, is dropped.
+ */
+export function pairRangeBookmarks(documentXml: string): string {
+  if (!documentXml.includes('w:id="" w:name="')) return documentXml
+  const open = new Map<string, number>()
+  const paired = new Map<string, number>()
+  let next = maxBookmarkId(documentXml) + 1
+  for (const m of documentXml.matchAll(RANGE_BOOKMARK)) {
+    const name = m[2]!
+    if (m[1] === 'Start') {
+      if (!open.has(name) && !paired.has(name)) open.set(name, m.index)
+    } else if (open.has(name) && !paired.has(name)) paired.set(name, next++)
+  }
+  const seen = new Set<string>()
+  return documentXml.replace(RANGE_BOOKMARK, (_tag, kind: string, name: string) => {
+    const id = paired.get(name)
+    const key = `${kind}:${name}`
+    if (id === undefined || seen.has(key)) return ''
+    seen.add(key)
+    return kind === 'Start'
+      ? `<w:bookmarkStart w:id="${id}" w:name="${name}"/>`
+      : `<w:bookmarkEnd w:id="${id}"/>`
+  })
+}
+
+/** Highest w:bookmarkStart/@w:id in the document, 0 when it holds no bookmark. */
+function maxBookmarkId(documentXml: string): number {
+  let max = 0
+  // quote-agnostic, and the end tag carries the same id as its start
+  for (const m of documentXml.matchAll(BOOKMARK_ID)) max = Math.max(max, parseInt(m[2], 10))
+  return max
+}
+
+/**
+ * Seed for the docPr sequence counter, which new pictures pre-increment to mint
+ * `DOCPR_ID_BASE + ++docPrSeq`. The media count says nothing about the ids the
+ * original producer used: seeded from it alone, a document with no GenOffice
+ * media always started at the base, so a save that inserted one picture next to
+ * an existing <wp:docPr id="9002"> emitted a second id 9002, and Word flags the
+ * duplicate drawing id for repair. Start above both floors instead.
+ */
+function nextDocPrSeq(zip: JSZip, documentXml: string): number {
+  return Math.max(nextImageSeq(zip), maxDocPrId(documentXml) - DOCPR_ID_BASE)
+}
+
 /**
  * Re-point a drawing paragraph's first <a:blip> at a new image relationship
  * (external r:link becomes embedded) and drop a stale <a:srcRect> crop — the
  * editor shows the full image, so a Word-authored crop window applied to the
  * swapped bytes would show an arbitrary region.
  */
-function retargetImageBlip(xml: string, rId: string): string {
+const SVG_BLIP_EMBED = /(<\w+:svgBlip\b[^>]*r:embed=")[^"]*(")/
+
+export function retargetImageBlip(xml: string, rId: string, svgRId?: string): string {
   const blip = /<a:blip\b[^>]*\/?>/.exec(xml)
   if (!blip) return xml
   let tag = blip[0]
@@ -2288,14 +4177,30 @@ function retargetImageBlip(xml: string, rId: string): string {
     tag = tag.replace(/r:embed="[^"]*"/, `r:embed="${rId}"`).replace(/\s+r:link="[^"]*"/, '')
   else if (/r:link="/.test(tag)) tag = tag.replace(/r:link="[^"]*"/, `r:embed="${rId}"`)
   else tag = tag.replace(/<a:blip\b/, `<a:blip r:embed="${rId}"`)
+  const out = (xml.slice(0, blip.index) + tag + xml.slice(blip.index + blip[0].length))
+    .replace(/<a:srcRect\b[^>]*\/>/, '')
+    // A non-default fill window would clip the swapped bytes the same way a
+    // crop would — reset it (the editor clears its imageFillRect in step)
+    .replace(/<a:fillRect\b[^>]+\/>/, '<a:fillRect/>')
+  if (svgRId) {
+    if (SVG_BLIP_EMBED.test(out)) return out.replace(SVG_BLIP_EMBED, `$1${svgRId}$2`)
+    // a bitmap picture that now is drawn from a vector: the blip gains the extension
+    const at = out.indexOf(tag, blip.index)
+    const after = at + tag.length
+    if (tag.endsWith('/>'))
+      return `${out.slice(0, after - 2)}><a:extLst>${svgBlipExt(svgRId)}</a:extLst></a:blip>${out.slice(after)}`
+    const close = out.indexOf('</a:blip>', after)
+    if (close < 0) return out
+    const inner = out.slice(after, close)
+    const list = inner.lastIndexOf('</a:extLst>')
+    return list >= 0
+      ? out.slice(0, after + list) + svgBlipExt(svgRId) + out.slice(after + list)
+      : `${out.slice(0, close)}<a:extLst>${svgBlipExt(svgRId)}</a:extLst>${out.slice(close)}`
+  }
   return (
-    (xml.slice(0, blip.index) + tag + xml.slice(blip.index + blip[0].length))
-      .replace(/<a:srcRect\b[^>]*\/>/, '')
-      // A non-default fill window would clip the swapped bytes the same way a
-      // crop would — reset it (the editor clears its imageFillRect in step)
-      .replace(/<a:fillRect\b[^>]+\/>/, '<a:fillRect/>')
-      // The replacement is always raster and Word prefers a leftover Office-2016
-      // <asvg:svgBlip> extension over the retargeted r:embed — drop the extension
+    out
+      // A raster replacement: Word prefers a leftover Office-2016 <asvg:svgBlip>
+      // extension over the retargeted r:embed — drop the extension
       .replace(/<a:ext\b[^>]*>\s*<\w+:svgBlip\b[\s\S]*?<\/a:ext>/, '')
       .replace(/<a:extLst>\s*<\/a:extLst>/, '')
   )
